@@ -28,7 +28,7 @@
   },
   "scripts": {
     "build": "pnpm run generate:api-types && tsup && cd frontend && pnpm run build",
-    "build:backend": "pnpm run generate:api-types && tsup",
+    "build:backend": "npm run generate:api-types && tsup",
     "build:frontend": "cd frontend && pnpm run build",
     "start": "node dist/index.js",
     "dev": "concurrently --kill-others \"pnpm run dev:backend\" \"pnpm run dev:frontend\"",
@@ -41,7 +41,7 @@
     "test:watch": "vitest",
     "test:integration": "vitest run --project integration",
     "test:build": "node scripts/smoke-test-build.mjs",
-    "prepublishOnly": "pnpm run build:backend"
+    "prepublishOnly": "npm run build:backend"
   },
   "engines": {
     "node": ">=22.5.0"
