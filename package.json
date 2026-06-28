@@ -1,6 +1,6 @@
 {
   "name": "@zz1996/dbhub-dameng",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mcpName": "io.github.zuozh11/dbhub-dameng",
   "description": "Local fork of DBHub with Dameng/DM8 database connector support",
   "repository": {
@@ -41,6 +41,7 @@
     "test:watch": "vitest",
     "test:integration": "vitest run --project integration",
     "test:build": "node scripts/smoke-test-build.mjs",
+    "verify:dameng": "tsx scripts/verify-dameng.mjs",
     "prepublishOnly": "npm run build:backend"
   },
   "engines": {

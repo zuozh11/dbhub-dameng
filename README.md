@@ -5,6 +5,10 @@
 > This package is a local Dameng/DM8 connector fork of Bytebase DBHub. Use
 > `npx -y @zz1996/dbhub-dameng --transport stdio --config ./dbhub.dameng.toml`
 > for Dameng MCP usage.
+>
+> Dameng DSN format: `dameng://user:password@host:5236/schema`. Prefer a
+> least-privilege read-only Dameng account for production or shared databases,
+> even when the `execute_sql` tool is configured with `readonly = true`.
 
 <p align="center">
 <a href="https://dbhub.ai/" target="_blank">
@@ -30,6 +34,7 @@
             |                  |    |              |    |                  |
             |  Copilot CLI     +--->+              +--->+    MariaDB       |
             |                  |    |              |    |                  |
+            |                  +--->+              +--->+    Dameng / DM8  |
             |                  |    |              |    |                  |
             +------------------+    +--------------+    +------------------+
                  MCP Clients           MCP Server             Databases
@@ -38,14 +43,14 @@
 DBHub is a zero-dependency, token efficient MCP server implementing the Model Context Protocol (MCP) server interface. This lightweight gateway allows MCP-compatible clients to connect to and explore different databases:
 
 - **Local Development First**: Zero dependency, token efficient with just two MCP tools to maximize context window
-- **Multi-Database**: PostgreSQL, MySQL, MariaDB, SQL Server, and SQLite through a single interface
+- **Multi-Database**: PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, and Dameng/DM8 through a single interface
 - **Multi-Connection**: Connect to multiple databases simultaneously with TOML configuration
 - **Guardrails**: Read-only mode, row limiting, and query timeout to prevent runaway operations
 - **Secure Access**: SSH tunneling and SSL/TLS encryption
 
 ## Supported Databases
 
-PostgreSQL, MySQL, SQL Server, MariaDB, and SQLite.
+PostgreSQL, MySQL, SQL Server, MariaDB, SQLite, and Dameng/DM8.
 
 ## MCP Tools
 
@@ -83,6 +88,41 @@ docker run --rm --init \
 
 ```bash
 npx @bytebase/dbhub@latest --transport http --port 8080 --dsn "postgres://user:password@localhost:5432/dbname?sslmode=disable"
+```
+
+**Dameng / DM8 fork:**
+
+```bash
+npx -y @zz1996/dbhub-dameng --transport stdio --config ./dbhub.dameng.toml
+```
+
+Minimal Dameng TOML configuration:
+
+```toml
+[[sources]]
+id = "dm8_readonly"
+description = "Dameng DM8 database for schema discovery and read-only SQL queries"
+dsn = "dameng://${DM8_USER}:${DM8_PASSWORD}@${DM8_HOST}:5236/${DM8_SCHEMA}"
+query_timeout = 30
+lazy = true
+
+[[tools]]
+name = "search_objects"
+source = "dm8_readonly"
+
+[[tools]]
+name = "execute_sql"
+source = "dm8_readonly"
+readonly = true
+max_rows = 100
+```
+
+To verify the local Dameng connector against a real DM8 instance without
+committing credentials, set `DAMENG_DSN` or point to a local TOML file:
+
+```bash
+DAMENG_DSN="dameng://user:password@host:5236/schema" pnpm verify:dameng
+pnpm verify:dameng -- --config ./dbhub.dameng.toml --source dm8_readonly
 ```
 
 **Demo Mode:**

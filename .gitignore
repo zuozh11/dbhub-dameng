@@ -16,6 +16,8 @@ out/
 
 # Environment & config
 dbhub.toml
+dbhub.dameng.toml
+.agents/
 docs/plans/
 docs/testing/
 .env
@@ -89,4 +91,4 @@ $RECYCLE.BIN/
 *.dll
 *.exe
 *.o
-*.so 
+*.so
