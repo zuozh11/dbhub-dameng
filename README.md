@@ -1,6 +1,11 @@
 > [!NOTE]  
 > Brought to you by [Bytebase](https://www.bytebase.com/), open-source database DevSecOps platform.
 
+> [!NOTE]
+> This package is a local Dameng/DM8 connector fork of Bytebase DBHub. Use
+> `npx -y @zuozh11/dbhub-dameng --transport stdio --config ./dbhub.dameng.toml`
+> for Dameng MCP usage.
+
 <p align="center">
 <a href="https://dbhub.ai/" target="_blank">
 <picture>

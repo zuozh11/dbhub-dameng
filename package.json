@@ -1,22 +1,31 @@
 {
-  "name": "dbhub",
-  "version": "0.22.6",
-  "mcpName": "io.github.bytebase/dbhub",
-  "description": "Minimal, token-efficient Database MCP Server for PostgreSQL, MySQL, SQL Server, SQLite, MariaDB, Dameng",
+  "name": "@zuozh11/dbhub-dameng",
+  "version": "0.1.0",
+  "mcpName": "io.github.zuozh11/dbhub-dameng",
+  "description": "Local fork of DBHub with Dameng/DM8 database connector support",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bytebase/dbhub.git"
+    "url": "git+https://github.com/zuozh11/dbhub-dameng.git"
+  },
+  "homepage": "https://github.com/zuozh11/dbhub-dameng#readme",
+  "bugs": {
+    "url": "https://github.com/zuozh11/dbhub-dameng/issues"
   },
   "main": "dist/index.js",
   "type": "module",
   "bin": {
-    "dbhub": "dist/index.js"
+    "dbhub-dameng": "dist/index.js"
   },
   "files": [
     "dist",
+    "dbhub.dameng.toml.example",
+    "docs/dameng-connector-plan.md",
     "LICENSE",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "pnpm run generate:api-types && tsup && cd frontend && pnpm run build",
     "build:backend": "pnpm run generate:api-types && tsup",
@@ -31,14 +40,21 @@
     "test:unit": "vitest run --project unit",
     "test:watch": "vitest",
     "test:integration": "vitest run --project integration",
-    "test:build": "node scripts/smoke-test-build.mjs"
+    "test:build": "node scripts/smoke-test-build.mjs",
+    "prepublishOnly": "pnpm run build:backend"
   },
   "engines": {
     "node": ">=22.5.0"
   },
   "packageManager": "pnpm@10.17.1",
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "mcp",
+    "database",
+    "dbhub",
+    "dameng",
+    "dm8"
+  ],
+  "author": "zuozh11",
   "license": "MIT",
   "dependencies": {
     "@iarna/toml": "^2.2.5",
