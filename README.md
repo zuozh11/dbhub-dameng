@@ -3,7 +3,7 @@
 
 > [!NOTE]
 > This package is a local Dameng/DM8 connector fork of Bytebase DBHub. Use
-> `npx -y @zuozh11/dbhub-dameng --transport stdio --config ./dbhub.dameng.toml`
+> `npx -y @zz1996/dbhub-dameng --transport stdio --config ./dbhub.dameng.toml`
 > for Dameng MCP usage.
 
 <p align="center">
