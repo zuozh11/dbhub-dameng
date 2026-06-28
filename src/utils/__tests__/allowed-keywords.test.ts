@@ -75,6 +75,12 @@ describe("isReadOnlySQL", () => {
       expect(isReadOnlySQL("SHOW TABLES", "sqlite")).toBe(false);
     });
 
+    it("should recognize Dameng catalog-friendly read-only statements", () => {
+      expect(isReadOnlySQL("SELECT * FROM SYS.ALL_TABLES", "dameng")).toBe(true);
+      expect(isReadOnlySQL("DESC MY_TABLE", "dameng")).toBe(true);
+      expect(isReadOnlySQL("DELETE FROM MY_TABLE", "dameng")).toBe(false);
+    });
+
     it("should reject standalone ANALYZE (updates statistics)", () => {
       expect(isReadOnlySQL("ANALYZE users", "postgres")).toBe(false);
       expect(isReadOnlySQL("ANALYZE", "mysql")).toBe(false);

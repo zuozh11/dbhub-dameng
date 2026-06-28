@@ -106,6 +106,11 @@ describe("Parameter Mapper", () => {
       expect(() => validateParameterStyle(sql, "mysql")).not.toThrow();
     });
 
+    it("should accept positional parameters for dameng", () => {
+      const sql = "SELECT * FROM users WHERE id = ?";
+      expect(() => validateParameterStyle(sql, "dameng")).not.toThrow();
+    });
+
     it("should accept named parameters for sqlserver", () => {
       const sql = "SELECT * FROM users WHERE id = @p1";
       expect(() => validateParameterStyle(sql, "sqlserver")).not.toThrow();

@@ -176,7 +176,7 @@ export function buildDSNFromEnvParams(): { dsn: string; source: string } | null 
   }
 
   // Validate supported database types
-  const supportedTypes = ['postgres', 'postgresql', 'mysql', 'mariadb', 'sqlserver', 'sqlite'];
+  const supportedTypes = ['postgres', 'postgresql', 'mysql', 'mariadb', 'sqlserver', 'sqlite', 'dameng', 'dm'];
   if (!supportedTypes.includes(dbType.toLowerCase())) {
     throw new Error(`Unsupported DB_TYPE: ${dbType}. Supported types: ${supportedTypes.join(', ')}`);
   }
@@ -195,6 +195,10 @@ export function buildDSNFromEnvParams(): { dsn: string; source: string } | null 
         break;
       case 'sqlserver':
         port = '1433';
+        break;
+      case 'dameng':
+      case 'dm':
+        port = '5236';
         break;
       case 'sqlite':
         // SQLite doesn't use host/port, handle differently
@@ -216,7 +220,12 @@ export function buildDSNFromEnvParams(): { dsn: string; source: string } | null 
   const encodedDbName = encodeURIComponent(dbNameStr);
 
   // Construct DSN
-  const protocol = dbType.toLowerCase() === 'postgresql' ? 'postgres' : dbType.toLowerCase();
+  const normalizedType = dbType.toLowerCase();
+  const protocol = normalizedType === 'postgresql'
+    ? 'postgres'
+    : normalizedType === 'dm'
+      ? 'dameng'
+      : normalizedType;
   const dsn = `${protocol}://${encodedUser}:${encodedPassword}@${dbHost}:${port}/${encodedDbName}`;
 
   return {

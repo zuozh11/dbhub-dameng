@@ -1,0 +1,19 @@
+# Example DBHub configuration for the local Dameng/DM8 fork.
+# Do not commit real credentials. Prefer environment variables.
+
+[[sources]]
+id = "dm8_dev"
+description = "Dameng DM8 development database. Read-only access for agent schema discovery and SQL queries."
+dsn = "dameng://${DM8_USER}:${DM8_PASSWORD}@${DM8_HOST}:5236/${DM8_SCHEMA}"
+query_timeout = 30
+lazy = true
+
+[[tools]]
+name = "execute_sql"
+source = "dm8_dev"
+readonly = true
+max_rows = 100
+
+[[tools]]
+name = "search_objects"
+source = "dm8_dev"

@@ -1,7 +1,7 @@
 /**
  * Type definition for supported database connector types
  */
-export type ConnectorType = "postgres" | "mysql" | "mariadb" | "sqlite" | "sqlserver";
+export type ConnectorType = "postgres" | "mysql" | "mariadb" | "sqlite" | "sqlserver" | "dameng";
 
 /**
  * Database Connector Interface
@@ -111,10 +111,11 @@ export interface DSNParser {
    * @param config - Optional database-specific configuration options
    * Example DSN formats:
    * - PostgreSQL: "postgres://user:password@localhost:5432/dbname?sslmode=disable"
-   * - MariaDB: "mariadb://user:password@localhost:3306/dbname"
-   * - MySQL: "mysql://user:password@localhost:3306/dbname"
-   * - SQLite: "sqlite:///path/to/database.db" or "sqlite:///:memory:"
-   */
+ * - MariaDB: "mariadb://user:password@localhost:3306/dbname"
+ * - MySQL: "mysql://user:password@localhost:3306/dbname"
+ * - SQLite: "sqlite:///path/to/database.db" or "sqlite:///:memory:"
+ * - Dameng: "dameng://user:password@localhost:5236/schema"
+ */
   parse(dsn: string, config?: ConnectorConfig): Promise<any>;
 
   /**

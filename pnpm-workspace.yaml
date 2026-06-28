@@ -2,6 +2,12 @@ packages:
   - '.'
   - 'frontend'
 
+allowBuilds:
+  cpu-features: true
+  esbuild: true
+  protobufjs: true
+  ssh2: true
+
 ignoredBuiltDependencies:
   - cpu-features
   - esbuild

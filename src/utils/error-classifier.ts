@@ -34,6 +34,7 @@ const AUTH_CODES: Record<ConnectorType, ReadonlyArray<string | number>> = {
   mariadb: ["ER_ACCESS_DENIED_ERROR", 1045, 1698],
   sqlserver: ["ELOGIN"],
   sqlite: [], // no network/auth layer
+  dameng: [-2501, -2504, "ELOGIN"],
 };
 
 function unreachableMessage(sourceId: string): string {

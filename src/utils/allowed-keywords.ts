@@ -14,6 +14,7 @@ export const allowedKeywords: Record<ConnectorType, string[]> = {
   // SQL Server has no native EXPLAIN statement; the connector translates a
   // leading `EXPLAIN` into a SET SHOWPLAN_XML request (see SQLServerConnector).
   sqlserver: ["select", "with", "explain"],
+  dameng: ["select", "with", "explain", "describe", "desc"],
 };
 
 /**
@@ -57,6 +58,7 @@ const mutatingPatterns: Record<ConnectorType, RegExp> = {
   mariadb: mutatingPatternWithReplace,
   sqlite: mutatingPatternWithReplace,
   sqlserver: mutatingPattern,
+  dameng: mutatingPattern,
 };
 
 const selectIntoPattern = /\bselect\b[\s\S]+\binto\b/i;
