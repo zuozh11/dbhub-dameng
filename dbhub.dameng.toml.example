@@ -5,6 +5,7 @@
 id = "dm8_dev"
 description = "Dameng DM8 development database. Read-only access for agent schema discovery and SQL queries."
 dsn = "dameng://${DM8_USER}:${DM8_PASSWORD}@${DM8_HOST}:5236/${DM8_SCHEMA}"
+connection_timeout = 5
 query_timeout = 30
 lazy = true
 

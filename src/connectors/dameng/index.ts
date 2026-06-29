@@ -20,13 +20,16 @@ interface DamengConnectionConfig {
   user: string;
   password: string;
   schema?: string;
+  poolAlias?: string;
   poolMin?: number;
   poolMax?: number;
+  queueRequests?: boolean;
   queueTimeout?: number;
   [key: string]: any;
 }
 
 type DamengPool = {
+  poolAlias?: string;
   getConnection(): Promise<DamengConnection>;
   close(force?: number): Promise<void>;
 };
@@ -105,6 +108,7 @@ export class DamengConnector implements Connector {
   private sourceId = "default";
   private defaultSchema: string | null = null;
   private queryTimeoutMs?: number;
+  private poolAlias: string | null = null;
 
   getId(): string {
     return this.sourceId;
@@ -115,14 +119,22 @@ export class DamengConnector implements Connector {
   }
 
   async connect(dsn: string, initScript?: string, config?: ConnectorConfig): Promise<void> {
+    let createdPool: DamengPool | null = null;
     try {
       const connectionConfig = await this.dsnParser.parse(dsn, config);
+      connectionConfig.poolAlias = this.buildPoolAlias();
       this.defaultSchema = connectionConfig.schema ?? null;
+      this.poolAlias = connectionConfig.poolAlias;
+      this.queryTimeoutMs = undefined;
       if (config?.queryTimeoutSeconds !== undefined) {
         this.queryTimeoutMs = config.queryTimeoutSeconds * 1000;
       }
 
-      this.pool = await dmdb.createPool(connectionConfig);
+      await this.closeRegisteredPool(connectionConfig.poolAlias);
+      await this.validateDirectConnection(connectionConfig);
+
+      createdPool = await dmdb.createPool(connectionConfig);
+      this.pool = createdPool;
       await this.withConnection(async (conn) => {
         await conn.execute("SELECT 1 AS OK", [], this.executeOptions());
         if (!this.defaultSchema) {
@@ -140,6 +152,13 @@ export class DamengConnector implements Connector {
         }
       });
     } catch (error) {
+      if (createdPool) {
+        await this.closePoolQuietly(createdPool);
+      } else if (this.poolAlias) {
+        await this.closeRegisteredPool(this.poolAlias);
+      }
+      this.pool = null;
+      this.poolAlias = null;
       console.error("Failed to connect to Dameng database:", error);
       throw error;
     }
@@ -147,8 +166,12 @@ export class DamengConnector implements Connector {
 
   async disconnect(): Promise<void> {
     if (this.pool) {
-      await this.pool.close(0);
+      await this.closePoolQuietly(this.pool);
       this.pool = null;
+    }
+    if (this.poolAlias) {
+      await this.closeRegisteredPool(this.poolAlias);
+      this.poolAlias = null;
     }
   }
 
@@ -432,6 +455,42 @@ export class DamengConnector implements Connector {
       ...(this.queryTimeoutMs !== undefined && { queryTimeout: this.queryTimeoutMs }),
       ...extra,
     };
+  }
+
+  private async validateDirectConnection(config: DamengConnectionConfig): Promise<void> {
+    let conn: DamengConnection | null = null;
+    try {
+      conn = await dmdb.getConnection(config.connectString);
+      await conn.execute("SELECT 1 AS OK", [], this.executeOptions());
+    } finally {
+      if (conn) {
+        await conn.close();
+      }
+    }
+  }
+
+  private buildPoolAlias(): string {
+    const safeSourceId = this.sourceId.replace(/[^a-zA-Z0-9_-]/g, "_") || "default";
+    return `dbhub_dameng_${safeSourceId}`;
+  }
+
+  private async closeRegisteredPool(poolAlias: string): Promise<void> {
+    if (!dmdb.pools?.has?.(poolAlias)) {
+      return;
+    }
+    const pool = dmdb.pools.get(poolAlias) as DamengPool;
+    await this.closePoolQuietly(pool);
+    dmdb.pools?.delete?.(poolAlias);
+  }
+
+  private async closePoolQuietly(pool: DamengPool): Promise<void> {
+    try {
+      await pool.close(0);
+    } catch {
+      if (pool.poolAlias) {
+        dmdb.pools?.delete?.(pool.poolAlias);
+      }
+    }
   }
 
   private async resolveSchema(schema?: string): Promise<string> {
