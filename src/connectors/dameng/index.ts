@@ -44,6 +44,16 @@ type DamengConnection = {
   release?: () => Promise<void>;
 };
 
+const DEFAULT_OPERATION_TIMEOUT_MS = 110_000;
+const RESOURCE_CLEANUP_TIMEOUT_MS = 2_000;
+
+class DamengOperationTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DamengOperationTimeoutError";
+  }
+}
+
 class DamengDSNParser implements DSNParser {
   async parse(dsn: string, config?: ConnectorConfig): Promise<DamengConnectionConfig> {
     if (!this.isValidDSN(dsn)) {
@@ -120,6 +130,11 @@ export class DamengConnector implements Connector {
   private sourceId = "default";
   private defaultSchema: string | null = null;
   private poolAlias: string | null = null;
+  private connectionConfig: DamengConnectionConfig | null = null;
+  private initScript: string | undefined;
+  private connectionTimeoutMs = 5_000;
+  private operationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
+  private reconnectingPool: Promise<void> | null = null;
 
   getId(): string {
     return this.sourceId;
@@ -136,6 +151,12 @@ export class DamengConnector implements Connector {
       connectionConfig.poolAlias = this.buildPoolAlias();
       this.defaultSchema = connectionConfig.schema ?? null;
       this.poolAlias = connectionConfig.poolAlias;
+      this.connectionTimeoutMs = config?.connectionTimeoutSeconds !== undefined
+        ? config.connectionTimeoutSeconds * 1000
+        : 5_000;
+      this.operationTimeoutMs = config?.queryTimeoutSeconds !== undefined
+        ? config.queryTimeoutSeconds * 1000
+        : DEFAULT_OPERATION_TIMEOUT_MS;
 
       await this.closeRegisteredPool(connectionConfig.poolAlias);
       await this.validateDirectConnection(connectionConfig);
@@ -143,9 +164,15 @@ export class DamengConnector implements Connector {
       createdPool = await dmdb.createPool(connectionConfig);
       this.pool = createdPool;
       await this.withConnection(async (conn) => {
-        await conn.execute("SELECT 1 AS OK", [], this.executeOptions());
+        await this.executeWithTimeout(
+          conn,
+          "SELECT 1 AS OK",
+          [],
+          this.executeOptions()
+        );
         if (!this.defaultSchema) {
-          const result = await conn.execute(
+          const result = await this.executeWithTimeout(
+            conn,
             "SELECT USER AS SCHEMA_NAME FROM DUAL",
             [],
             this.executeOptions()
@@ -154,10 +181,17 @@ export class DamengConnector implements Connector {
         }
         if (initScript) {
           for (const statement of splitSQLStatements(initScript, "dameng")) {
-            await conn.execute(statement, [], this.executeOptions({ autoCommit: true }));
+            await this.executeWithTimeout(
+              conn,
+              statement,
+              [],
+              this.executeOptions({ autoCommit: true })
+            );
           }
         }
       });
+      this.connectionConfig = connectionConfig;
+      this.initScript = initScript;
     } catch (error) {
       if (createdPool) {
         await this.closePoolQuietly(createdPool);
@@ -166,6 +200,8 @@ export class DamengConnector implements Connector {
       }
       this.pool = null;
       this.poolAlias = null;
+      this.connectionConfig = null;
+      this.initScript = undefined;
       console.error("Failed to connect to Dameng database:", error);
       throw error;
     }
@@ -180,6 +216,9 @@ export class DamengConnector implements Connector {
       await this.closeRegisteredPool(this.poolAlias);
       this.poolAlias = null;
     }
+    this.connectionConfig = null;
+    this.initScript = undefined;
+    this.reconnectingPool = null;
   }
 
   async getSchemas(): Promise<string[]> {
@@ -458,7 +497,8 @@ export class DamengConnector implements Connector {
           processedSQL,
           index === 0 ? parameters ?? [] : []
         );
-        const result = await conn.execute(
+        const result = await this.executeWithTimeout(
+          conn,
           boundSQL,
           this.toBindParams(bindValues),
           this.executeOptions({ autoCommit: true, maxRows: options.maxRows })
@@ -474,24 +514,152 @@ export class DamengConnector implements Connector {
 
   private async queryRows(sql: string, bindValues: any[] = []): Promise<any[]> {
     return this.withConnection(async (conn) => {
-      const result = await conn.execute(sql, this.toBindParams(bindValues), this.executeOptions());
+      const result = await this.executeWithTimeout(
+        conn,
+        sql,
+        this.toBindParams(bindValues),
+        this.executeOptions()
+      );
       return this.normalizeRows(result.rows ?? []);
     });
   }
 
   private async withConnection<T>(fn: (conn: DamengConnection) => Promise<T>): Promise<T> {
-    if (!this.pool) {
+    await this.ensurePool();
+    const pool = this.pool;
+    if (!pool) {
       throw new Error("Not connected to Dameng database");
     }
-    const conn = await this.pool.getConnection();
+
+    let conn: DamengConnection | null = null;
+    let shouldRelease = true;
     try {
+      conn = await this.withTimeout(
+        pool.getConnection(),
+        this.connectionTimeoutMs,
+        "Dameng connection acquisition"
+      );
       return await fn(conn);
-    } finally {
-      if (conn.release) {
-        await conn.release();
-      } else {
-        await conn.close();
+    } catch (error) {
+      if (error instanceof DamengOperationTimeoutError) {
+        shouldRelease = false;
+        this.markPoolUnhealthy(error.message);
       }
+      throw error;
+    } finally {
+      if (conn && shouldRelease) {
+        await this.releaseConnectionQuietly(conn);
+      }
+    }
+  }
+
+  private async ensurePool(): Promise<void> {
+    if (this.pool) {
+      return;
+    }
+    if (!this.connectionConfig) {
+      throw new Error("Not connected to Dameng database");
+    }
+    if (!this.reconnectingPool) {
+      this.reconnectingPool = this.reconnectPool();
+    }
+    try {
+      await this.reconnectingPool;
+    } finally {
+      this.reconnectingPool = null;
+    }
+  }
+
+  private async reconnectPool(): Promise<void> {
+    const config = this.connectionConfig;
+    if (!config) {
+      throw new Error("Not connected to Dameng database");
+    }
+
+    console.error(`Reconnecting Dameng source '${this.sourceId}' after pool reset...`);
+    await this.closeRegisteredPool(config.poolAlias ?? this.buildPoolAlias());
+    await this.validateDirectConnection(config);
+
+    const createdPool = await dmdb.createPool(config);
+    this.pool = createdPool;
+    this.poolAlias = config.poolAlias ?? null;
+
+    try {
+      await this.withConnection(async (conn) => {
+        await this.executeWithTimeout(conn, "SELECT 1 AS OK", [], this.executeOptions());
+        if (this.initScript) {
+          for (const statement of splitSQLStatements(this.initScript, "dameng")) {
+            await this.executeWithTimeout(
+              conn,
+              statement,
+              [],
+              this.executeOptions({ autoCommit: true })
+            );
+          }
+        }
+      });
+    } catch (error) {
+      await this.closePoolQuietly(createdPool);
+      this.pool = null;
+      throw error;
+    }
+  }
+
+  private executeWithTimeout(
+    conn: DamengConnection,
+    sql: string,
+    bindParams: any[] | Record<string, any>,
+    options: Record<string, any>
+  ): Promise<any> {
+    return this.withTimeout(
+      conn.execute(sql, bindParams, options),
+      this.operationTimeoutMs,
+      "Dameng SQL execution"
+    );
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return promise;
+    }
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new DamengOperationTimeoutError(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  private markPoolUnhealthy(reason: string): void {
+    const pool = this.pool;
+    this.pool = null;
+    console.error(`Resetting Dameng source '${this.sourceId}' pool: ${reason}`);
+    if (pool) {
+      void this.closePoolQuietly(pool);
+    }
+  }
+
+  private async releaseConnectionQuietly(conn: DamengConnection): Promise<void> {
+    try {
+      const release = conn.release ? conn.release() : conn.close();
+      await this.withTimeout(
+        release,
+        RESOURCE_CLEANUP_TIMEOUT_MS,
+        "Dameng connection release"
+      );
+    } catch (error) {
+      this.markPoolUnhealthy(
+        `failed to release connection: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
@@ -514,15 +682,19 @@ export class DamengConnector implements Connector {
         queueTimeout,
         ...directConfig
       } = config;
-      const directConn = await dmdb.getConnection({
-        ...directConfig,
-        connectString: directConnectString ?? config.connectString,
-      }) as DamengConnection;
+      const directConn = await this.withTimeout(
+        dmdb.getConnection({
+          ...directConfig,
+          connectString: directConnectString ?? config.connectString,
+        }) as Promise<DamengConnection>,
+        this.connectionTimeoutMs,
+        "Dameng direct connection"
+      );
       conn = directConn;
-      await conn.execute("SELECT 1 AS OK", [], this.executeOptions());
+      await this.executeWithTimeout(conn, "SELECT 1 AS OK", [], this.executeOptions());
     } finally {
       if (conn) {
-        await conn.close();
+        await this.releaseConnectionQuietly(conn);
       }
     }
   }
@@ -543,7 +715,7 @@ export class DamengConnector implements Connector {
 
   private async closePoolQuietly(pool: DamengPool): Promise<void> {
     try {
-      await pool.close(0);
+      await this.withTimeout(pool.close(0), RESOURCE_CLEANUP_TIMEOUT_MS, "Dameng pool close");
     } catch {
       if (pool.poolAlias) {
         dmdb.pools?.delete?.(pool.poolAlias);
