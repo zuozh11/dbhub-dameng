@@ -22,6 +22,14 @@ export type DatabaseObjectType = "schema" | "table" | "view" | "column" | "proce
  */
 export type DetailLevel = "names" | "summary" | "full";
 
+type SearchableConnector = Connector & {
+  searchTables?: (
+    pattern: string,
+    schema?: string,
+    limit?: number
+  ) => Promise<Array<{ name: string; schema: string }>>;
+};
+
 // Schema for search_objects tool (unified search and list)
 export const searchDatabaseObjectsSchema = {
   object_type: z
@@ -199,27 +207,33 @@ async function searchTables(
     if (results.length >= limit) break;
 
     try {
-      const tables = await connector.getTables(schemaName);
-      const matched = tables.filter((table: string) => regex.test(table));
+      const searchableConnector = connector as SearchableConnector;
+      const matched = searchableConnector.searchTables
+        ? await searchableConnector.searchTables(pattern, schemaName, limit - results.length)
+        : (await connector.getTables(schemaName))
+            .filter((table: string) => regex.test(table))
+            .map((name: string) => ({ name, schema: schemaName }));
 
-      for (const tableName of matched) {
+      for (const tableMatch of matched) {
         if (results.length >= limit) break;
+        const tableName = tableMatch.name;
+        const matchedSchema = tableMatch.schema;
 
         if (detailLevel === "names") {
           results.push({
             name: tableName,
-            schema: schemaName,
+            schema: matchedSchema,
           });
         } else if (detailLevel === "summary") {
           // Get column count and table comment for summary
           try {
-            const columns = await connector.getTableSchema(tableName, schemaName);
-            const rowCount = await getTableRowCount(connector, tableName, schemaName);
-            const comment = await getTableComment(connector, tableName, schemaName);
+            const columns = await connector.getTableSchema(tableName, matchedSchema);
+            const rowCount = await getTableRowCount(connector, tableName, matchedSchema);
+            const comment = await getTableComment(connector, tableName, matchedSchema);
 
             results.push({
               name: tableName,
-              schema: schemaName,
+              schema: matchedSchema,
               column_count: columns.length,
               row_count: rowCount,
               ...(comment ? { comment } : {}),
@@ -227,7 +241,7 @@ async function searchTables(
           } catch (error) {
             results.push({
               name: tableName,
-              schema: schemaName,
+              schema: matchedSchema,
               column_count: null,
               row_count: null,
             });
@@ -235,14 +249,14 @@ async function searchTables(
         } else {
           // full detail
           try {
-            const columns = await connector.getTableSchema(tableName, schemaName);
-            const indexes = await connector.getTableIndexes(tableName, schemaName);
-            const rowCount = await getTableRowCount(connector, tableName, schemaName);
-            const comment = await getTableComment(connector, tableName, schemaName);
+            const columns = await connector.getTableSchema(tableName, matchedSchema);
+            const indexes = await connector.getTableIndexes(tableName, matchedSchema);
+            const rowCount = await getTableRowCount(connector, tableName, matchedSchema);
+            const comment = await getTableComment(connector, tableName, matchedSchema);
 
             results.push({
               name: tableName,
-              schema: schemaName,
+              schema: matchedSchema,
               column_count: columns.length,
               row_count: rowCount,
               ...(comment ? { comment } : {}),
@@ -263,7 +277,7 @@ async function searchTables(
           } catch (error) {
             results.push({
               name: tableName,
-              schema: schemaName,
+              schema: matchedSchema,
               error: `Unable to fetch full details: ${(error as Error).message}`,
             });
           }
@@ -663,10 +677,12 @@ export function createSearchDatabaseObjectsToolHandler(sourceId?: string) {
 
       // Validate schema if provided
       if (schema) {
-        const schemas = await connector.getSchemas();
-        if (!schemas.includes(schema)) {
+        const exists = connector.schemaExists
+          ? await connector.schemaExists(schema)
+          : (await connector.getSchemas()).includes(schema);
+        if (!exists) {
           success = false;
-          errorMessage = `Schema '${schema}' does not exist. Available schemas: ${schemas.join(", ")}`;
+          errorMessage = `Schema '${schema}' does not exist`;
           return createToolErrorResponse(errorMessage, "SCHEMA_NOT_FOUND");
         }
       }

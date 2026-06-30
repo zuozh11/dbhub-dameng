@@ -17,12 +17,16 @@ import { splitSQLStatements, stripCommentsAndStrings } from "../../utils/sql-par
 
 interface DamengConnectionConfig {
   connectString: string;
+  directConnectString?: string;
   user: string;
   password: string;
   schema?: string;
   poolAlias?: string;
   poolMin?: number;
   poolMax?: number;
+  connectTimeout?: number;
+  sessionTimeout?: number;
+  socketTimeout?: number;
   queueRequests?: boolean;
   queueTimeout?: number;
   [key: string]: any;
@@ -55,26 +59,34 @@ class DamengDSNParser implements DSNParser {
       const schema = url.pathname ? decodeURIComponent(url.pathname.substring(1)) : undefined;
       const port = url.port ? parseInt(url.port, 10) : 5236;
 
-      const queryParams: string[] = [];
+      const queryParams: Record<string, string> = {};
+      const queryStringParts: string[] = [];
       url.forEachSearchParam((value, key) => {
-        queryParams.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+        queryParams[key] = value;
+        queryStringParts.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
       });
 
-      const connectString =
-        `dm://${encodeURIComponent(url.username)}:${encodeURIComponent(url.password)}` +
-        `@${url.hostname}:${port}${queryParams.length > 0 ? `?${queryParams.join("&")}` : ""}`;
-
       const connectionConfig: DamengConnectionConfig = {
-        connectString,
+        connectString:
+          `dm://${encodeURIComponent(url.username)}:${encodeURIComponent(url.password)}` +
+          `@${url.hostname}:${port}${queryStringParts.length > 0 ? `?${queryStringParts.join("&")}` : ""}`,
+        directConnectString: `${url.hostname}:${port}`,
         user: url.username,
         password: url.password,
         schema: schema || undefined,
         poolMin: 0,
         poolMax: 4,
+        ...queryParams,
       };
 
       if (config?.connectionTimeoutSeconds !== undefined) {
+        connectionConfig.connectTimeout = config.connectionTimeoutSeconds * 1000;
         connectionConfig.queueTimeout = config.connectionTimeoutSeconds * 1000;
+      }
+
+      if (config?.queryTimeoutSeconds !== undefined) {
+        connectionConfig.sessionTimeout = config.queryTimeoutSeconds;
+        connectionConfig.socketTimeout = config.queryTimeoutSeconds * 1000 + 1000;
       }
 
       return connectionConfig;
@@ -107,7 +119,6 @@ export class DamengConnector implements Connector {
   private pool: DamengPool | null = null;
   private sourceId = "default";
   private defaultSchema: string | null = null;
-  private queryTimeoutMs?: number;
   private poolAlias: string | null = null;
 
   getId(): string {
@@ -125,10 +136,6 @@ export class DamengConnector implements Connector {
       connectionConfig.poolAlias = this.buildPoolAlias();
       this.defaultSchema = connectionConfig.schema ?? null;
       this.poolAlias = connectionConfig.poolAlias;
-      this.queryTimeoutMs = undefined;
-      if (config?.queryTimeoutSeconds !== undefined) {
-        this.queryTimeoutMs = config.queryTimeoutSeconds * 1000;
-      }
 
       await this.closeRegisteredPool(connectionConfig.poolAlias);
       await this.validateDirectConnection(connectionConfig);
@@ -185,6 +192,18 @@ export class DamengConnector implements Connector {
     return rows.map((row) => this.rowValue(row, "SCHEMA_NAME")).filter(this.isPresent);
   }
 
+  async schemaExists(schema: string): Promise<boolean> {
+    const rows = await this.queryRows(
+      `
+      SELECT COUNT(*) AS CNT
+      FROM ALL_USERS
+      WHERE USERNAME = :1
+      `,
+      [this.normalizeIdentifier(schema)]
+    );
+    return Number(this.rowValue(rows[0], "CNT") ?? 0) > 0;
+  }
+
   async getDefaultSchema(): Promise<string | null> {
     return this.defaultSchema;
   }
@@ -201,6 +220,33 @@ export class DamengConnector implements Connector {
       [owner]
     );
     return rows.map((row) => this.rowValue(row, "TABLE_NAME")).filter(this.isPresent);
+  }
+
+  async searchTables(
+    pattern: string,
+    schema?: string,
+    limit = 100
+  ): Promise<Array<{ name: string; schema: string }>> {
+    const owner = await this.resolveSchema(schema);
+    const rowLimit = this.normalizeLimit(limit);
+    const rows = await this.queryRows(
+      `
+      SELECT TABLE_NAME
+      FROM (
+        SELECT TABLE_NAME
+        FROM ALL_TABLES
+        WHERE OWNER = :1
+          AND TABLE_NAME LIKE :2
+        ORDER BY TABLE_NAME
+      )
+      WHERE ROWNUM <= ${rowLimit}
+      `,
+      [owner, this.normalizeLikePattern(pattern)]
+    );
+    return rows
+      .map((row) => this.rowValue(row, "TABLE_NAME"))
+      .filter(this.isPresent)
+      .map((name) => ({ name, schema: owner }));
   }
 
   async getViews(schema?: string): Promise<string[]> {
@@ -452,7 +498,6 @@ export class DamengConnector implements Connector {
   private executeOptions(extra: Record<string, any> = {}): Record<string, any> {
     return {
       outFormat: dmdb.OUT_FORMAT_OBJECT,
-      ...(this.queryTimeoutMs !== undefined && { queryTimeout: this.queryTimeoutMs }),
       ...extra,
     };
   }
@@ -460,7 +505,20 @@ export class DamengConnector implements Connector {
   private async validateDirectConnection(config: DamengConnectionConfig): Promise<void> {
     let conn: DamengConnection | null = null;
     try {
-      conn = await dmdb.getConnection(config.connectString);
+      const {
+        directConnectString,
+        poolAlias,
+        poolMin,
+        poolMax,
+        queueRequests,
+        queueTimeout,
+        ...directConfig
+      } = config;
+      const directConn = await dmdb.getConnection({
+        ...directConfig,
+        connectString: directConnectString ?? config.connectString,
+      }) as DamengConnection;
+      conn = directConn;
       await conn.execute("SELECT 1 AS OK", [], this.executeOptions());
     } finally {
       if (conn) {
@@ -503,6 +561,14 @@ export class DamengConnector implements Connector {
 
   private normalizeIdentifier(identifier: string): string {
     return /[a-z]/.test(identifier) ? identifier.toUpperCase() : identifier;
+  }
+
+  private normalizeLikePattern(pattern: string): string {
+    return /[a-z]/.test(pattern) ? pattern.toUpperCase() : pattern;
+  }
+
+  private normalizeLimit(limit: number): number {
+    return Math.max(1, Math.min(1000, Math.floor(limit)));
   }
 
   private normalizeRows(rows: any[]): any[] {

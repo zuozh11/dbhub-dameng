@@ -158,6 +158,13 @@ export interface Connector {
   getSchemas(): Promise<string[]>;
 
   /**
+   * Check whether a schema exists without listing all schemas.
+   * Connectors may implement this when a targeted catalog lookup is cheaper
+   * than getSchemas().
+   */
+  schemaExists?(schema: string): Promise<boolean>;
+
+  /**
    * Get the schema that searches should default to when no schema is specified.
    *
    * Returns a single schema name when the connection is scoped to one (e.g. the
@@ -180,6 +187,13 @@ export interface Connector {
    * @returns Promise with array of table names (excludes views)
    */
   getTables(schema?: string): Promise<string[]>;
+
+  /**
+   * Optional fast path for pattern-based table search.
+   * Returns already-matched objects, with database-side pattern and limit
+   * application where supported.
+   */
+  searchTables?(pattern: string, schema?: string, limit?: number): Promise<Array<{ name: string; schema: string }>>;
 
   /**
    * Get all views in the database or in a specific schema
