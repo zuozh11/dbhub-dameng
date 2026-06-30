@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createSearchDatabaseObjectsToolHandler } from '../search-objects.js';
 import { ConnectorManager } from '../../connectors/manager.js';
-import type { Connector, ConnectorType, TableColumn, TableIndex } from '../../connectors/interface.js';
+import type { ColumnSearchResult, Connector, ConnectorType, TableColumn, TableIndex } from '../../connectors/interface.js';
 
 // Mock dependencies
 vi.mock('../../connectors/manager.js');
@@ -666,6 +666,49 @@ describe('search_database_objects tool', () => {
       const parsed = parseToolResponse(result);
       expect(parsed.data.count).toBe(1);
       expect(parsed.data.results).toEqual([{ name: 'email', table: 'users', schema: 'public' }]);
+    });
+
+    it('should use connector column search fast path when available', async () => {
+      const searchColumns = vi.fn<[], Promise<ColumnSearchResult[]>>().mockResolvedValue([
+        {
+          name: 'parent_id',
+          table: 'orders',
+          schema: 'public',
+          type: 'INTEGER',
+          nullable: false,
+          default: null,
+          description: 'Parent order',
+        },
+      ]);
+      (mockConnector as Connector & { searchColumns: typeof searchColumns }).searchColumns = searchColumns;
+
+      const handler = createSearchDatabaseObjectsToolHandler();
+      const result = await handler(
+        {
+          object_type: 'column',
+          pattern: '%parent%',
+          detail_level: 'summary',
+          limit: 100,
+        },
+        null
+      );
+
+      const parsed = parseToolResponse(result);
+      expect(parsed.data.results).toEqual([
+        {
+          name: 'parent_id',
+          table: 'orders',
+          schema: 'public',
+          type: 'INTEGER',
+          nullable: false,
+          default: null,
+          description: 'Parent order',
+        },
+      ]);
+      expect(searchColumns).toHaveBeenCalledWith('%parent%', 'public', undefined, 100);
+      expect(mockConnector.getTables).not.toHaveBeenCalled();
+      expect(mockConnector.getViews).not.toHaveBeenCalled();
+      expect(mockConnector.getTableSchema).not.toHaveBeenCalled();
     });
 
     it('should return column details in summary level', async () => {

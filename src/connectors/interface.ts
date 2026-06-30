@@ -39,6 +39,16 @@ export interface TableColumn {
   description: string | null;
 }
 
+export interface ColumnSearchResult {
+  name: string;
+  table: string;
+  schema: string;
+  type: string;
+  nullable: boolean;
+  default: string | null;
+  description?: string | null;
+}
+
 export interface TableIndex {
   index_name: string;
   column_names: string[];
@@ -194,6 +204,18 @@ export interface Connector {
    * application where supported.
    */
   searchTables?(pattern: string, schema?: string, limit?: number): Promise<Array<{ name: string; schema: string }>>;
+
+  /**
+   * Optional fast path for pattern-based column search.
+   * Returns already-matched columns, with database-side pattern/table/limit
+   * application where supported.
+   */
+  searchColumns?(
+    pattern: string,
+    schema?: string,
+    table?: string,
+    limit?: number
+  ): Promise<ColumnSearchResult[]>;
 
   /**
    * Get all views in the database or in a specific schema

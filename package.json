@@ -1,6 +1,6 @@
 {
   "name": "@zz1996/dbhub-dameng",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "mcpName": "io.github.zuozh11/dbhub-dameng",
   "description": "Local fork of DBHub with Dameng/DM8 database connector support",
   "repository": {

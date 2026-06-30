@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { ConnectorManager } from "../connectors/manager.js";
 import { createToolSuccessResponse, createToolErrorResponse } from "../utils/response-formatter.js";
-import type { Connector } from "../connectors/interface.js";
+import type { ColumnSearchResult, Connector } from "../connectors/interface.js";
 import { quoteQualifiedIdentifier } from "../utils/identifier-quoter.js";
 import {
   getEffectiveSourceId,
@@ -28,6 +28,12 @@ type SearchableConnector = Connector & {
     schema?: string,
     limit?: number
   ) => Promise<Array<{ name: string; schema: string }>>;
+  searchColumns?: (
+    pattern: string,
+    schema?: string,
+    table?: string,
+    limit?: number
+  ) => Promise<ColumnSearchResult[]>;
 };
 
 // Schema for search_objects tool (unified search and list)
@@ -417,6 +423,40 @@ async function searchColumns(
     if (results.length >= limit) break;
 
     try {
+      const searchableConnector = connector as SearchableConnector;
+      if (searchableConnector.searchColumns) {
+        const matchedColumns = await searchableConnector.searchColumns(
+          pattern,
+          schemaName,
+          tableFilter,
+          limit - results.length
+        );
+
+        for (const column of matchedColumns) {
+          if (results.length >= limit) break;
+
+          if (detailLevel === "names") {
+            results.push({
+              name: column.name,
+              table: column.table,
+              schema: column.schema,
+            });
+          } else {
+            results.push({
+              name: column.name,
+              table: column.table,
+              schema: column.schema,
+              type: column.type,
+              nullable: column.nullable,
+              default: column.default,
+              ...(column.description ? { description: column.description } : {}),
+            });
+          }
+        }
+
+        continue;
+      }
+
       // Get tables (and views) to search
       let tablesToSearch: string[];
       if (tableFilter) {

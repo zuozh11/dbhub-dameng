@@ -10,6 +10,7 @@ import {
   StoredProcedure,
   ExecuteOptions,
   ConnectorConfig,
+  ColumnSearchResult,
 } from "../interface.js";
 import { SafeURL } from "../../utils/safe-url.js";
 import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
@@ -286,6 +287,71 @@ export class DamengConnector implements Connector {
       .map((row) => this.rowValue(row, "TABLE_NAME"))
       .filter(this.isPresent)
       .map((name) => ({ name, schema: owner }));
+  }
+
+  async searchColumns(
+    pattern: string,
+    schema?: string,
+    table?: string,
+    limit = 100
+  ): Promise<ColumnSearchResult[]> {
+    const owner = await this.resolveSchema(schema);
+    const rowLimit = this.normalizeLimit(limit);
+    const bindValues = [
+      owner,
+      this.normalizeLikePattern(pattern),
+      ...(table ? [this.normalizeIdentifier(table)] : []),
+    ];
+    const tablePredicate = table ? "AND c.TABLE_NAME = :3" : "";
+    const rows = await this.queryRows(
+      `
+      SELECT COLUMN_NAME,
+             TABLE_NAME,
+             DATA_TYPE,
+             DATA_LENGTH,
+             DATA_PRECISION,
+             DATA_SCALE,
+             NULLABLE,
+             DATA_DEFAULT,
+             COMMENTS
+      FROM (
+        SELECT c.COLUMN_NAME,
+               c.TABLE_NAME,
+               c.DATA_TYPE,
+               c.DATA_LENGTH,
+               c.DATA_PRECISION,
+               c.DATA_SCALE,
+               c.NULLABLE,
+               c.DATA_DEFAULT,
+               cc.COMMENTS,
+               c.COLUMN_ID
+        FROM ALL_TAB_COLUMNS c
+        LEFT JOIN ALL_COL_COMMENTS cc
+          ON cc.OWNER = c.OWNER
+         AND cc.TABLE_NAME = c.TABLE_NAME
+         AND cc.COLUMN_NAME = c.COLUMN_NAME
+        WHERE c.OWNER = :1
+          AND c.COLUMN_NAME LIKE :2
+          ${tablePredicate}
+        ORDER BY c.TABLE_NAME, c.COLUMN_ID
+      )
+      WHERE ROWNUM <= ${rowLimit}
+      `,
+      bindValues
+    );
+
+    return rows.map((row) => {
+      const description = this.rowValue(row, "COMMENTS");
+      return {
+        name: this.rowValue(row, "COLUMN_NAME") ?? "",
+        table: this.rowValue(row, "TABLE_NAME") ?? "",
+        schema: owner,
+        type: this.formatDataType(row),
+        nullable: this.rowValue(row, "NULLABLE") === "Y",
+        default: this.rowValue(row, "DATA_DEFAULT") ?? null,
+        ...(description ? { description } : {}),
+      };
+    });
   }
 
   async getViews(schema?: string): Promise<string[]> {
