@@ -47,6 +47,8 @@ type DamengConnection = {
 
 const DEFAULT_OPERATION_TIMEOUT_MS = 110_000;
 const RESOURCE_CLEANUP_TIMEOUT_MS = 2_000;
+const CONNECT_RETRY_ATTEMPTS = 3;
+const CONNECT_RETRY_DELAY_MS = 500;
 
 class DamengOperationTimeoutError extends Error {
   constructor(
@@ -149,67 +151,86 @@ export class DamengConnector implements Connector {
   }
 
   async connect(dsn: string, initScript?: string, config?: ConnectorConfig): Promise<void> {
-    let createdPool: DamengPool | null = null;
-    try {
-      const connectionConfig = await this.dsnParser.parse(dsn, config);
-      connectionConfig.poolAlias = this.buildPoolAlias();
-      this.defaultSchema = connectionConfig.schema ?? null;
-      this.poolAlias = connectionConfig.poolAlias;
-      this.connectionTimeoutMs = config?.connectionTimeoutSeconds !== undefined
-        ? config.connectionTimeoutSeconds * 1000
-        : 5_000;
-      this.operationTimeoutMs = config?.queryTimeoutSeconds !== undefined
-        ? config.queryTimeoutSeconds * 1000
-        : DEFAULT_OPERATION_TIMEOUT_MS;
-      connectionConfig.connectTimeout ??= this.connectionTimeoutMs;
-      connectionConfig.queueTimeout ??= this.connectionTimeoutMs;
+    for (let attempt = 1; attempt <= CONNECT_RETRY_ATTEMPTS; attempt += 1) {
+      let createdPool: DamengPool | null = null;
+      try {
+        const connectionConfig = await this.dsnParser.parse(dsn, config);
+        connectionConfig.poolAlias = this.buildPoolAlias();
+        this.defaultSchema = connectionConfig.schema ?? null;
+        this.poolAlias = connectionConfig.poolAlias;
+        this.connectionTimeoutMs = config?.connectionTimeoutSeconds !== undefined
+          ? config.connectionTimeoutSeconds * 1000
+          : 5_000;
+        this.operationTimeoutMs = config?.queryTimeoutSeconds !== undefined
+          ? config.queryTimeoutSeconds * 1000
+          : DEFAULT_OPERATION_TIMEOUT_MS;
+        connectionConfig.connectTimeout ??= this.connectionTimeoutMs;
+        connectionConfig.queueTimeout ??= this.connectionTimeoutMs;
 
-      await this.closeRegisteredPool(connectionConfig.poolAlias);
-      await this.validateDirectConnection(connectionConfig);
+        await this.closeRegisteredPool(connectionConfig.poolAlias);
+        await this.validateDirectConnection(connectionConfig);
 
-      createdPool = await dmdb.createPool(connectionConfig);
-      this.pool = createdPool;
-      await this.withConnection(async (conn) => {
+        createdPool = await dmdb.createPool(connectionConfig);
+        this.pool = createdPool;
+        await this.withConnection((conn) => this.initializeSession(conn, initScript));
+        this.connectionConfig = connectionConfig;
+        this.initScript = initScript;
+        return;
+      } catch (error) {
+        if (createdPool) {
+          await this.closePoolQuietly(createdPool);
+        } else if (this.poolAlias) {
+          await this.closeRegisteredPool(this.poolAlias);
+        }
+        this.pool = null;
+        this.poolAlias = null;
+        this.connectionConfig = null;
+        this.initScript = undefined;
+
+        if (attempt < CONNECT_RETRY_ATTEMPTS && this.isRetryableConnectFailure(error)) {
+          console.error(
+            `Retrying Dameng source '${this.sourceId}' connection after transient failure ` +
+            `(${attempt}/${CONNECT_RETRY_ATTEMPTS}): ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+          await this.delay(CONNECT_RETRY_DELAY_MS * attempt);
+          continue;
+        }
+
+        console.error("Failed to connect to Dameng database:", error);
+        throw error;
+      }
+    }
+
+    throw new Error("Failed to connect to Dameng database");
+  }
+
+  private async initializeSession(conn: DamengConnection, initScript?: string): Promise<void> {
+    await this.executeWithTimeout(
+      conn,
+      "SELECT 1 AS OK",
+      [],
+      this.executeOptions()
+    );
+    if (!this.defaultSchema) {
+      const result = await this.executeWithTimeout(
+        conn,
+        "SELECT USER AS SCHEMA_NAME FROM DUAL",
+        [],
+        this.executeOptions()
+      );
+      this.defaultSchema = this.rowValue(result.rows?.[0], "SCHEMA_NAME") ?? null;
+    }
+    if (initScript) {
+      for (const statement of splitSQLStatements(initScript, "dameng")) {
         await this.executeWithTimeout(
           conn,
-          "SELECT 1 AS OK",
+          statement,
           [],
-          this.executeOptions()
+          this.executeOptions({ autoCommit: true })
         );
-        if (!this.defaultSchema) {
-          const result = await this.executeWithTimeout(
-            conn,
-            "SELECT USER AS SCHEMA_NAME FROM DUAL",
-            [],
-            this.executeOptions()
-          );
-          this.defaultSchema = this.rowValue(result.rows?.[0], "SCHEMA_NAME") ?? null;
-        }
-        if (initScript) {
-          for (const statement of splitSQLStatements(initScript, "dameng")) {
-            await this.executeWithTimeout(
-              conn,
-              statement,
-              [],
-              this.executeOptions({ autoCommit: true })
-            );
-          }
-        }
-      });
-      this.connectionConfig = connectionConfig;
-      this.initScript = initScript;
-    } catch (error) {
-      if (createdPool) {
-        await this.closePoolQuietly(createdPool);
-      } else if (this.poolAlias) {
-        await this.closeRegisteredPool(this.poolAlias);
       }
-      this.pool = null;
-      this.poolAlias = null;
-      this.connectionConfig = null;
-      this.initScript = undefined;
-      console.error("Failed to connect to Dameng database:", error);
-      throw error;
     }
   }
 
@@ -781,6 +802,37 @@ export class DamengConnector implements Connector {
       "获取连接请求等待超时",
       "连接池已达到最大连接数",
     ].some((item) => message.includes(item));
+  }
+
+  private isRetryableConnectFailure(error: unknown): boolean {
+    if (error instanceof DamengOperationTimeoutError) {
+      return [
+        "Dameng direct connection",
+        "Dameng connection acquisition",
+        "Dameng SQL execution",
+      ].includes(error.label);
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ECONNREFUSED",
+      "socket hang up",
+      "Socket timeout",
+      "connect timeout",
+      "Connection request timeout in queue",
+      "Pool cannot open more connections",
+      "网络通讯超时",
+      "网络通信异常",
+      "连接超时",
+      "获取连接请求等待超时",
+      "连接池已达到最大连接数",
+    ].some((item) => message.includes(item));
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private executeOptions(extra: Record<string, any> = {}): Record<string, any> {
