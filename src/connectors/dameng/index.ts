@@ -49,7 +49,10 @@ const DEFAULT_OPERATION_TIMEOUT_MS = 110_000;
 const RESOURCE_CLEANUP_TIMEOUT_MS = 2_000;
 
 class DamengOperationTimeoutError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    public readonly label: string
+  ) {
     super(message);
     this.name = "DamengOperationTimeoutError";
   }
@@ -158,6 +161,8 @@ export class DamengConnector implements Connector {
       this.operationTimeoutMs = config?.queryTimeoutSeconds !== undefined
         ? config.queryTimeoutSeconds * 1000
         : DEFAULT_OPERATION_TIMEOUT_MS;
+      connectionConfig.connectTimeout ??= this.connectionTimeoutMs;
+      connectionConfig.queueTimeout ??= this.connectionTimeoutMs;
 
       await this.closeRegisteredPool(connectionConfig.poolAlias);
       await this.validateDirectConnection(connectionConfig);
@@ -591,6 +596,24 @@ export class DamengConnector implements Connector {
   }
 
   private async withConnection<T>(fn: (conn: DamengConnection) => Promise<T>): Promise<T> {
+    try {
+      return await this.withConnectionAttempt(fn);
+    } catch (error) {
+      if (!this.isConnectionAcquisitionFailure(error)) {
+        throw error;
+      }
+
+      console.error(
+        `Retrying Dameng source '${this.sourceId}' after connection acquisition failure: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      await this.ensurePool();
+      return this.withConnectionAttempt(fn);
+    }
+  }
+
+  private async withConnectionAttempt<T>(fn: (conn: DamengConnection) => Promise<T>): Promise<T> {
     await this.ensurePool();
     const pool = this.pool;
     if (!pool) {
@@ -600,22 +623,39 @@ export class DamengConnector implements Connector {
     let conn: DamengConnection | null = null;
     let shouldRelease = true;
     try {
-      conn = await this.withTimeout(
-        pool.getConnection(),
-        this.connectionTimeoutMs,
-        "Dameng connection acquisition"
-      );
+      conn = await this.acquireConnectionWithTimeout(pool);
       return await fn(conn);
     } catch (error) {
       if (error instanceof DamengOperationTimeoutError) {
         shouldRelease = false;
         this.markPoolUnhealthy(error.message);
+      } else if (!conn && this.isConnectionAcquisitionFailure(error)) {
+        shouldRelease = false;
+        this.markPoolUnhealthy(error instanceof Error ? error.message : String(error));
       }
       throw error;
     } finally {
       if (conn && shouldRelease) {
         await this.releaseConnectionQuietly(conn);
       }
+    }
+  }
+
+  private async acquireConnectionWithTimeout(pool: DamengPool): Promise<DamengConnection> {
+    const acquisition = pool.getConnection();
+    try {
+      return await this.withTimeout(
+        acquisition,
+        this.connectionTimeoutMs,
+        "Dameng connection acquisition"
+      );
+    } catch (error) {
+      if (error instanceof DamengOperationTimeoutError) {
+        void acquisition
+          .then((conn) => this.releaseConnectionQuietly(conn))
+          .catch(() => undefined);
+      }
+      throw error;
     }
   }
 
@@ -692,7 +732,7 @@ export class DamengConnector implements Connector {
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new DamengOperationTimeoutError(`${label} timed out after ${timeoutMs}ms`));
+        reject(new DamengOperationTimeoutError(`${label} timed out after ${timeoutMs}ms`, label));
       }, timeoutMs);
     });
 
@@ -727,6 +767,20 @@ export class DamengConnector implements Connector {
         `failed to release connection: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private isConnectionAcquisitionFailure(error: unknown): boolean {
+    if (error instanceof DamengOperationTimeoutError) {
+      return error.label === "Dameng connection acquisition";
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      "Connection request timeout in queue",
+      "Pool cannot open more connections",
+      "获取连接请求等待超时",
+      "连接池已达到最大连接数",
+    ].some((item) => message.includes(item));
   }
 
   private executeOptions(extra: Record<string, any> = {}): Record<string, any> {
