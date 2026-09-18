@@ -5,29 +5,17 @@
 
 ## 使用
 
-Node.js >= 22.5。将 `dbhub.dameng.toml.example` 复制为本地 `dbhub.toml`，
-通过环境变量 `DAMENG_DSN` 提供连接串：
+安装、客户端配置，以及可直接交给 AI 的配置提示词，请阅读
+[README](https://github.com/zuozh11/dbhub-dameng/blob/main/README.md)。
+GitHub 首页与 npm 包使用同一份 README。
 
-```text
-dameng://user:password@host:5236/APP
-```
+## 实现范围
 
-账号、密码中的特殊字符需要 URL 编码。路径是 schema，名称与数据库保持一致，
-包括大小写。使用最小权限只读账号连接共享或生产库。
-
-```sh
-npx @zz1996/dbhub-dameng@latest --transport stdio --config ./dbhub.toml
-```
-
-- 驱动为固定版本 `dmdb`，采用原生连接池、参数绑定和行数限制。
-- 不增加连接重试、超时重建、后台恢复或元数据搜索加速。
+- 复用上游两个默认工具及搜索流程；不增加连接重试、超时重建或搜索加速。
+- `dmdb` 提供原生连接池、参数绑定与行数限制。
 - `connection_timeout`、`query_timeout` 分别传给驱动的 `connectTimeout`、`sessionTimeout`。
-- SQL 结果按语句返回，超过 `max_rows` 时附带 `truncated`。
-- 自定义工具使用 `?` 占位符；参数仅支持单语句。
-- 只读判断复用上游策略，不能代替数据库账号权限；函数副作用不由连接器保证隔离。
-- 本实验覆盖普通 SQL 查询和元数据浏览；不提供达梦 `explain_sql`、`health_check`，
-  不支持包含内部分号的匿名 PL/SQL 块。初始化脚本按上游惯例在启动时执行，
-  不应依赖它设置连接池每条连接的会话状态，schema 应在 DSN 中指定。
+- 自定义工具使用 `?` 占位符，参数仅支持单语句。
+- 初始化脚本只在启动时执行；每条连接的 schema 应通过 DSN 指定。
 
 ## 验证
 
@@ -52,13 +40,15 @@ GitHub 检查无需真实库凭据；真实 DM8 验证在本机显式运行。
 3. 全部通过后才将合并提交推送到本仓库 `main`，不强推。
 4. 准备发布目录，使用 npm OIDC 发布 `@zz1996/dbhub-dameng`。
 
-冲突、测试或构建失败时停止，不更新远端 `main`，通过 GitHub Actions 失败通知处理。
+冲突、测试或构建失败时停止，不更新远端 `main`，通过 GitHub Actions 失败状态定位问题。
 发布失败时保留已验证的合并结果，可重新运行；已发布版本会跳过。
+原生邮件通知取决于个人 Actions 设置和运行触发者，机器人触发的发布不保证通知仓库所有者。
 机器人推送不会触发新的 workflow；产生合并提交后显式再次触发本工作流，
 由新提交对应的运行发布，确保 npm provenance 指向实际构建的提交。
 这是检查后直接合并的最小流程，不创建自动审批 PR，也不需要长期 PAT。
 
-源码的 `package.json` 版本号、包名、上游 README 和上游发布工作流保持原样。
+源码的 `package.json` 版本号、包名和上游发布工作流保持原样。
+README 按本 fork 的使用方式维护，上游修改同一段时可能需要手动合并。
 仅打包时设置 fork 身份，版本为 `<上游版本>-dameng.<提交总数>`，发布到 `latest` 标签。
 例如 `1.2.5-dameng.620`；它是独立 fork 版本，不是 Bytebase 官方发行版。
 每次代码合并都会得到新版本，同一提交重跑使用同一个版本号。

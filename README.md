@@ -1,135 +1,172 @@
-> [!NOTE]  
-> Brought to you by [Bytebase](https://www.bytebase.com/), open-source database governance platform.
+# DBHub Dameng
 
-<p align="center">
- <a href="https://www.star-history.com/bytebase/dbhub">
-  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=bytebase/dbhub&type=trending&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=bytebase/dbhub&type=trending" />
-   <img alt="GitHub Trending Repository of the Day" src="https://api.star-history.com/badge?repo=bytebase/dbhub&type=trending" />
-  </picture>
- </a>
-</p>
+让 AI 直接连接达梦 DM8，查询数据、查看表结构和字段说明。
+基于 [Bytebase DBHub](https://github.com/bytebase/dbhub)，增加最小达梦适配。
+使用已发布的 npm 包即可，无需克隆仓库或编译源码。
 
-<p align="center">
-<a href="https://dbhub.ai/" target="_blank">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bytebase/dbhub/main/docs/images/logo/full-dark.svg" width="75%">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/bytebase/dbhub/main/docs/images/logo/full-light.svg" width="75%">
-  <img src="https://raw.githubusercontent.com/bytebase/dbhub/main/docs/images/logo/full-light.svg" width="75%" alt="DBHub Logo">
-</picture>
-</a>
-</p>
+默认只有两个 MCP 工具：
 
-```bash
-            +------------------+    +--------------+    +------------------+
-            |                  |    |              |    |                  |
-            |                  |    |              |    |                  |
-            |  Claude Desktop  +--->+              +--->+    PostgreSQL    |
-            |                  |    |              |    |                  |
-            |  Claude Code     +--->+              +--->+    SQL Server    |
-            |                  |    |              |    |                  |
-            |  Cursor          +--->+    DBHub     +--->+    SQLite        |
-            |                  |    |              |    |                  |
-            |  VS Code         +--->+              +--->+    MySQL         |
-            |                  |    |              |    |                  |
-            |  Copilot CLI     +--->+              +--->+    MariaDB       |
-            |                  |    |              |    |                  |
-            |                  |    |              |    |                  |
-            +------------------+    +--------------+    +------------------+
-                 MCP Clients           MCP Server             Databases
+| 工具 | 用途 |
+| --- | --- |
+| `search_objects` | 查找 schema、表、视图、字段、索引和存储过程 |
+| `execute_sql` | 执行 SQL；按下方配置只允许读取，最多返回 100 行 |
+
+## 最简单：把这份 README 和连接串交给 AI
+
+在能够读写本机项目文件的 AI 编程客户端中，发送下面这段话。
+将最后一行替换为自己的连接串；也可以提供已有本地连接配置文件的路径。
+
+```text
+请根据以下 README，直接帮我在当前项目配置 DBHub 达梦 MCP，并验证连接：
+https://github.com/zuozh11/dbhub-dameng/blob/main/README.md
+
+要求：
+1. 检查 Node.js >= 22.5，以及 npm/npx 是否可用。
+2. 使用 @zz1996/dbhub-dameng@latest，以 stdio 启动。
+3. 创建本机专用的 .agents/dbhub.dameng.toml，开启 readonly = true、max_rows = 100，
+   只启用 execute_sql 和 search_objects。不要执行初始化脚本。
+4. 将含真实连接串的文件排除出 Git；如果同名文件已被跟踪，改用仓库外的本地文件。
+   不要把密码写进 README、提交记录或最终回复。
+5. 检查当前客户端已有的 MCP 配置，只新增或更新 DBHub 条目，保留其他配置。
+   --config 使用配置文件的绝对路径。能识别客户端就直接配置，无法识别时再问我。
+6. 重连 MCP，确认两个工具可用，执行 SELECT 1 AS OK FROM DUAL，
+   再用 search_objects 查询当前 schema 下的一个表名；不要读取业务数据或执行写操作。
+   如果无法控制客户端重连，请明确告诉我需要在哪一步重连，不要把文件写好当成连接成功。
+7. 完成后说明配置文件位置、验证结果，以及是否还需要我重启客户端。
+
+我的数据库连接串：dameng://user:password@host:5236/APP
 ```
 
-DBHub is a minimal MCP server: token-efficient, zero-dependency, and just two tools by default with opt-in extras. This lightweight gateway allows MCP-compatible clients to connect to and explore different databases:
+如果只使用普通聊天网页，AI 可以生成配置，但需要你自己保存到本机并在 MCP 客户端中启用。
+真实连接信息仅提供给你信任的客户端；共享或生产库请使用最小权限只读账号。
 
-- **Minimal**: Zero dependency, token efficient with a minimal set of MCP tools to maximize context window
-- **Multi-Database**: PostgreSQL, MySQL, MariaDB, SQL Server, and SQLite through a single interface
-- **Multi-Connection**: Connect to multiple databases simultaneously with TOML configuration
-- **Guardrails**: Read-only mode, row limiting, and query timeout to prevent runaway operations
-- **Secure Access**: SSH tunneling and SSL/TLS encryption
+## 连接串怎么写
 
-> DBHub is the official example in the [Claude Code docs](https://code.claude.com/docs/en/mcp#example-query-your-postgresql-database) for connecting to PostgreSQL via MCP.
-
-## Token Efficiency
-
-DBHub loads just 2 tools by default at **1.4k tokens** — 13-14x fewer than alternatives — keeping the context window open for your actual work.
-
-| MCP Server | Default Config | Default Tools |
-|------------|---------------|--------------|
-| **DBHub** | **1.4k** | 2 (`execute_sql`, `search_objects`) |
-| MCP Toolbox | 19.0k | 28 |
-| Supabase MCP | 19.3k | all |
-
-## Use Cases
-
-- **Local Development**: Schema exploration, query validation, and data debugging with Claude Code, VS Code, Cursor, etc.
-- **Non-Technical Access**: Expose curated, read-only views to non-technical staff via Claude Desktop, VS Code, Cursor, etc.
-- **Multi-Database Consolidation**: Replace separate MCP servers for each database with a single DBHub process
-- **Production Troubleshooting**: Read-only diagnostics with guardrails against runaway queries
-
-## Supported Databases
-
-PostgreSQL, MySQL, SQL Server, MariaDB, and SQLite.
-
-## MCP Tools
-
-DBHub implements MCP tools for database operations:
-
-- **[execute_sql](https://dbhub.ai/tools/execute-sql)**: Execute SQL queries with transaction support and safety controls
-- **[search_objects](https://dbhub.ai/tools/search-objects)**: Search and explore database schemas, tables, columns, indexes, and procedures with progressive disclosure
-- **[explain_sql](https://dbhub.ai/tools/explain-sql)** (opt-in): Show a query's execution plan without running it
-- **[health_check](https://dbhub.ai/tools/health-check)** (opt-in): Report connection pool state and buffer cache hit ratio
-- **[Custom Tools](https://dbhub.ai/tools/custom-tools)**: Define reusable, parameterized SQL operations in your `dbhub.toml` configuration file
-
-## Workbench
-
-DBHub includes a [built-in web interface](https://dbhub.ai/workbench/overview) for interacting with your database tools. It provides a visual way to execute queries, run custom tools, and view request traces without requiring an MCP client.
-
-![workbench](https://raw.githubusercontent.com/bytebase/dbhub/main/docs/images/workbench/workbench.webp)
-
-## Installation
-
-```bash
-npx @bytebase/dbhub@latest --transport http --port 8080 --dsn "postgres://user:password@localhost:5432/dbname?sslmode=disable"
+```text
+dameng://用户名:密码@主机:5236/Schema名称
 ```
 
-Also available as:
+例如下面是虚构的配置：
 
-- [Docker image](https://dbhub.ai/installation#docker)
-- [MCP Bundle](https://dbhub.ai/mcpb) (one-click install, read-only)
-- [Claude Code plugin](https://dbhub.ai/claude-code-plugin)
-
-See the [Installation Guide](https://dbhub.ai/installation) for all options, [Command-Line Options](https://dbhub.ai/config/command-line) for parameters, and [Multi-Database Configuration](https://dbhub.ai/config/toml) for connecting several databases at once.
-
-## Development
-
-Requires Node.js >= 22.5.0 (DBHub uses the built-in `node:sqlite` module).
-
-```bash
-# Install dependencies
-pnpm install
-
-# Run in development mode
-pnpm dev
-
-# Build and run for production
-pnpm build && pnpm start --transport stdio --dsn "postgres://user:password@localhost:5432/dbname"
+```text
+dameng://reader:example_password@127.0.0.1:5236/APP
 ```
 
-See [Testing](.claude/skills/testing/SKILL.md) and [Debug](https://dbhub.ai/config/debug).
+- 默认端口为 `5236`。
+- 路径中的 `APP` 是 schema，不是数据库实例名；按数据库中的实际大小写填写。
+- 用户名、密码中的特殊字符要进行 URL 编码，例如 `@` → `%40`、`#` → `%23`、`/` → `%2F`。
+  已编码的连接串不要重复编码。
+- 启动 MCP 的电脑必须能够访问该地址；内网数据库可能需要先连接 VPN。
 
-## Contributors
+## 手动配置
 
-<a href="https://github.com/bytebase/dbhub/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=bytebase/dbhub" />
-</a>
+### 1. 准备 Node.js
 
-## Star History
+需要 Node.js **>= 22.5**，并能访问 npm registry：
 
-<a href="https://www.star-history.com/?repos=bytebase%2Fdbhub&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=bytebase/dbhub&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=bytebase/dbhub&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=bytebase/dbhub&type=date&legend=top-left" />
- </picture>
-</a>
+```sh
+node --version
+npm --version
+npx --version
+```
+
+### 2. 创建本机数据库配置
+
+创建 `.agents/dbhub.dameng.toml`，替换下面的示例连接串：
+
+```toml
+[[sources]]
+id = "default"
+dsn = "dameng://reader:example_password@127.0.0.1:5236/APP"
+
+[[tools]]
+name = "execute_sql"
+source = "default"
+readonly = true
+max_rows = 100
+
+[[tools]]
+name = "search_objects"
+source = "default"
+```
+
+将 `/.agents/dbhub.dameng.toml` 加入项目的 `.gitignore`，确保该文件未被 Git 跟踪。
+已被跟踪的文件不会因加入 `.gitignore` 自动停止跟踪，此时请改用仓库外的本地配置文件。
+
+也可以使用 `dsn = "${DAMENG_DSN}"`，由客户端向 MCP 进程传入环境变量。
+不要假设从桌面打开的客户端会继承终端里临时 `export` 的变量。
+
+### 3. 添加到 MCP 客户端
+
+以下示例中的 `/absolute/path/to/project/.agents/dbhub.dameng.toml`
+必须替换为上一步文件的**绝对路径**。已有配置请合并，不要覆盖整个文件。
+
+**使用 `mcpServers` JSON 格式的客户端：**
+
+将下面条目合并到客户端的 MCP 配置中；不同客户端的配置文件位置由客户端决定。
+
+```json
+{
+  "mcpServers": {
+    "dbhub": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "@zz1996/dbhub-dameng@latest",
+        "--transport", "stdio",
+        "--config", "/absolute/path/to/project/.agents/dbhub.dameng.toml"
+      ]
+    }
+  }
+}
+```
+
+**Codex：**
+
+将下面内容合并到项目的 `.codex/config.toml`（项目需受信任），
+或用户级的 `~/.codex/config.toml`：
+
+```toml
+[mcp_servers.dbhub]
+command = "npx"
+args = ["--yes", "@zz1996/dbhub-dameng@latest", "--transport", "stdio", "--config", "/absolute/path/to/project/.agents/dbhub.dameng.toml"]
+```
+
+配置位置和字段可参考 [Codex 官方 MCP 文档](https://developers.openai.com/zh-Hans/docs/extend/mcp)。
+Windows 上若客户端无法直接启动 `npx`，可将 `command` 改为 `npx.cmd`；
+TOML/JSON 中的 Windows 路径可以使用正斜杠，例如 `C:/projects/app/.agents/dbhub.dameng.toml`。
+
+### 4. 重连并验证
+
+在客户端重新连接 MCP，必要时重启客户端。第一次启动需要下载 npm 包。
+让 AI 执行：
+
+```text
+请用 execute_sql 执行 SELECT 1 AS OK FROM DUAL，
+再用 search_objects 查看当前 schema 的一个表名（object_type=table、detail_level=names、limit=1）。
+```
+
+看到 SQL 返回 `OK = 1`，且对象查询没有连接错误，即完成基本连通性验证。
+schema 中没有可见表时可以返回空列表。检索字段或索引时，应同时提供 `schema` 和 `table`。
+
+终端排查启动问题时，也可以直接运行：
+
+```sh
+npx --yes @zz1996/dbhub-dameng@latest --transport stdio --config /absolute/path/to/project/.agents/dbhub.dameng.toml
+```
+
+stdio 模式启动后等待 MCP 客户端请求是正常行为，这不是 SQL 交互终端；单纯启动不代表数据库查询已验证。
+
+## 更新与边界
+
+- 使用 `@latest` 的配置在重新启动 MCP 时获取当前版本；已经运行的进程不会热更新。
+- 需要固定版本时，将 `@latest` 换成明确的 npm 版本号。
+- 只读模式不能替代数据库权限，尤其不能隔离数据库函数内部的副作用。
+- 达梦版覆盖普通 SQL 与元数据浏览；不支持包含内部分号的匿名 PL/SQL 块，
+  暂不提供达梦的 `explain_sql`、`health_check`。
+
+[npm 包](https://www.npmjs.com/package/@zz1996/dbhub-dameng) ·
+[开发与自动发布说明](https://github.com/zuozh11/dbhub-dameng/blob/main/DAMENG.md) ·
+[上游 DBHub](https://github.com/bytebase/dbhub)
+
+本项目沿用上游 MIT 许可证，详见 [LICENSE](https://github.com/zuozh11/dbhub-dameng/blob/main/LICENSE)。

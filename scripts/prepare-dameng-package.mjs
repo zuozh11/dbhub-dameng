@@ -9,7 +9,7 @@ rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
 cpSync("dist", `${output}/dist`, { recursive: true });
 cpSync("LICENSE", `${output}/LICENSE`);
-cpSync("DAMENG.md", `${output}/README.md`);
+cpSync("README.md", `${output}/README.md`);
 cpSync("dbhub.dameng.toml.example", `${output}/dbhub.dameng.toml.example`);
 writeFileSync(
   `${output}/package.json`,
@@ -20,7 +20,7 @@ writeFileSync(
       version: `${pkg.version.split("-")[0]}-dameng.${revision}`,
       description: "DBHub with a minimal Dameng/DM8 connector",
       repository: { type: "git", url: "git+https://github.com/zuozh11/dbhub-dameng.git" },
-      homepage: "https://github.com/zuozh11/dbhub-dameng/blob/main/DAMENG.md",
+      homepage: "https://github.com/zuozh11/dbhub-dameng/blob/main/README.md",
       bugs: { url: "https://github.com/zuozh11/dbhub-dameng/issues" },
       mcpName: "io.github.zuozh11/dbhub-dameng",
       bin: { "dbhub-dameng": "dist/index.js" },
