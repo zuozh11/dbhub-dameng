@@ -186,6 +186,7 @@ export function getDatabaseTypeFromDSN(dsn: string): ConnectorType | undefined {
  */
 function protocolToConnectorType(protocol: string): ConnectorType | undefined {
   const mapping: Record<string, ConnectorType> = {
+    'dameng': 'dameng',
     'postgres': 'postgres',
     'postgresql': 'postgres',
     'mysql': 'mysql',
@@ -203,6 +204,7 @@ function protocolToConnectorType(protocol: string): ConnectorType | undefined {
  */
 export function getDefaultPortForType(type: ConnectorType): number | undefined {
   const ports: Record<ConnectorType, number | undefined> = {
+    'dameng': 5236,
     'postgres': 5432,
     'mysql': 3306,
     'mariadb': 3306,

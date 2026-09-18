@@ -186,6 +186,7 @@ function scanTokenSQLServer(sql: string, i: number): SQLToken {
 type TokenScanner = (sql: string, i: number) => SQLToken;
 
 const dialectScanners: Record<ConnectorType, TokenScanner> = {
+  dameng: scanTokenAnsi,
   postgres: scanTokenPostgres,
   mysql: scanTokenMySQL,
   mariadb: scanTokenMySQL,

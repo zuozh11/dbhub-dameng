@@ -92,4 +92,6 @@ $RECYCLE.BIN/
 *.dll
 *.exe
 *.o
-*.so 
+*.so
+# Fork publish staging
+.dameng-package/

@@ -11,6 +11,7 @@ import { stripCommentsAndStrings } from "./sql-parser.js";
  * Parameter placeholder styles for different database connectors
  */
 export const PARAMETER_STYLES = {
+  dameng: "positional", // ?, ?, ? (native dmdb binds)
   postgres: "numbered", // $1, $2, $3
   mysql: "positional", // ?, ?, ?
   mariadb: "positional", // ?, ?, ?

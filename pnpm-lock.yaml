@@ -106,6 +106,9 @@ importers:
       '@azure/identity':
         specifier: ^4.8.0
         version: 4.10.1
+      dmdb:
+        specifier: 1.0.52452
+        version: 1.0.52452
       mariadb:
         specifier: ^3.4.0
         version: 3.4.2
@@ -1828,6 +1831,18 @@ packages:
     resolution: {integrity: sha512-58lmxKSA4BNyLz+HHMUzlOEpg09FV+ev6ZMe3vJihgdxzgcwZ8VoEEPmALCZG9LmqfVoNMMKpttIYTVG6uDY7A==}
     engines: {node: '>=0.3.1'}
 
+  dmdb@1.0.52452:
+    resolution: {integrity: sha512-X1NHOxcTEZs2JdkmiK+MWHNlrUf8Q4BWM/yHXEIUKX1tzoVVeDRavCb7oKymrWkHGk9VXUGNg52yKJzTQXvNlA==}
+    engines: {node: '>= 12'}
+    peerDependencies:
+      snappy: ^7.2.0
+      snappyjs: ^0.7.0
+    peerDependenciesMeta:
+      snappy:
+        optional: true
+      snappyjs:
+        optional: true
+
   docker-compose@1.2.0:
     resolution: {integrity: sha512-wIU1eHk3Op7dFgELRdmOYlPYS4gP8HhH1ZmZa13QZF59y0fblzFDFmKPhyc05phCy2hze9OEvNZAsoljrs+72w==}
     engines: {node: '>= 6.0.0'}
@@ -2089,6 +2104,10 @@ packages:
 
   iconv-lite@0.4.24:
     resolution: {integrity: sha512-v3MXnZAcvnywkTUEZomIActle7RXXeedOR31wwl7VlyoXO4Qi9arvSenNQWne1TcRwhCL1HwLI21bEqdpj8/rA==}
+    engines: {node: '>=0.10.0'}
+
+  iconv-lite@0.5.2:
+    resolution: {integrity: sha512-kERHXvpSaB4aU3eANwidg79K8FlrN77m8G9V+0vOR3HYaRifrlwMEpT7ZBJqLSEIHnEgJTHcWK82wwLwwKwtag==}
     engines: {node: '>=0.10.0'}
 
   iconv-lite@0.6.3:
@@ -5455,6 +5474,11 @@ snapshots:
 
   diff@4.0.2: {}
 
+  dmdb@1.0.52452:
+    dependencies:
+      iconv-lite: 0.5.2
+    optional: true
+
   docker-compose@1.2.0:
     dependencies:
       yaml: 2.8.0
@@ -5778,6 +5802,11 @@ snapshots:
   iconv-lite@0.4.24:
     dependencies:
       safer-buffer: 2.1.2
+
+  iconv-lite@0.5.2:
+    dependencies:
+      safer-buffer: 2.1.2
+    optional: true
 
   iconv-lite@0.6.3:
     dependencies:

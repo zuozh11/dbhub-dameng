@@ -33,6 +33,7 @@ const AUTH_CODES: Record<ConnectorType, ReadonlyArray<string | number>> = {
   mysql: ["ER_ACCESS_DENIED_ERROR", 1045, 1698],
   mariadb: ["ER_ACCESS_DENIED_ERROR", 1045, 1698],
   sqlserver: ["ELOGIN"],
+  dameng: [-2501], // Invalid username or password
   sqlite: [], // no network/auth layer
 };
 

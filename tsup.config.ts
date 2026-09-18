@@ -20,6 +20,7 @@ export default defineConfig({
   // supported"). Cloud auth packages are externalized to keep their large
   // dependency trees out of the bundle.
   external: [
+    'dmdb',
     'pg',
     'mysql2',
     'mariadb',

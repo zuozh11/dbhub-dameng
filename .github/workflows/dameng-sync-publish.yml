@@ -1,0 +1,89 @@
+name: Sync upstream and publish Dameng
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm after validation
+        type: boolean
+        default: true
+
+concurrency:
+  group: dameng-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  id-token: write
+
+jobs:
+  sync-and-publish:
+    if: github.repository == 'zuozh11/dbhub-dameng' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Merge current upstream
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/bytebase/dbhub.git main
+          git merge --no-edit FETCH_HEAD
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:unit
+      - run: pnpm run build
+      - run: pnpm run test:build
+      - name: Verify Dameng bundle can load
+        run: |
+          node --input-type=module -e "import fs from 'node:fs'; const file = fs.readdirSync('dist').find(f => /^dameng-.*\.js$/.test(f)); if (!file) throw Error('Missing Dameng bundle'); await import('./dist/' + file);"
+      - name: Advance main after checks pass
+        run: |
+          git diff --exit-code
+          git push origin HEAD:main
+      # GITHUB_TOKEN pushes do not trigger workflows. Dispatch explicitly when
+      # HEAD changed so npm provenance refers to the commit actually built.
+      - name: Start release on the merged commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        run: |
+          if [ "$GITHUB_SHA" = "$(git rev-parse HEAD)" ]; then
+            echo "here=$REQUEST_PUBLISH" >> "$GITHUB_OUTPUT"
+          elif [ "$REQUEST_PUBLISH" = true ]; then
+            gh workflow run dameng-sync-publish.yml --repo "$GITHUB_REPOSITORY" --ref main -f publish=true
+          fi
+      - name: Prepare fork package
+        run: node scripts/prepare-dameng-package.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dameng-package
+          path: .dameng-package/
+          include-hidden-files: true
+      - name: Publish with npm trusted publishing
+        if: steps.release.outputs.here == 'true'
+        working-directory: .dameng-package
+        run: |
+          npm install --global npm@11
+          VERSION=$(node -p "require('./package.json').version")
+          npm view @zz1996/dbhub-dameng versions --json > published-versions.json
+          if node -e "const versions = require('./published-versions.json'); process.exit([].concat(versions).includes(process.argv[1]) ? 0 : 1)" "$VERSION"; then
+            echo "Already published: $VERSION"
+          else
+            npm publish --access public --tag latest --provenance
+          fi

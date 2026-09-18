@@ -7,6 +7,7 @@ import { stripCommentsAndStrings } from "./sql-parser.js";
  * but also other queries that are not destructive
  */
 export const allowedKeywords: Record<ConnectorType, string[]> = {
+  dameng: ["select", "with"],
   postgres: ["select", "with", "explain", "show"],
   mysql: ["select", "with", "explain", "show", "describe", "desc"],
   mariadb: ["select", "with", "explain", "show", "describe", "desc"],
@@ -171,6 +172,7 @@ const mutatingPatternSqlServer = new RegExp(
 
 /** Per-dialect mutating keyword pattern */
 const mutatingPatterns: Record<ConnectorType, RegExp> = {
+  dameng: mutatingPattern,
   postgres: mutatingPattern,
   mysql: mutatingPatternWithReplace,
   mariadb: mutatingPatternWithReplace,
