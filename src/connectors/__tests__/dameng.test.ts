@@ -88,7 +88,7 @@ describe("minimal Dameng connector", () => {
           DATA_TYPE: "VARCHAR",
           NULLABLE: "Y",
           DATA_DEFAULT: null,
-          COMMENTS: "Label",
+          DESCRIPTION: "Label",
         },
       ],
     });
@@ -101,7 +101,10 @@ describe("minimal Dameng connector", () => {
         description: "Label",
       },
     ]);
-    expect(execute.mock.calls.at(-1)?.[1]).toEqual(["MixedSchema", "MixedTable"]);
+    expect(execute.mock.calls.at(-1)?.[1]).toEqual({
+      schema: "MixedSchema",
+      table_name: "MixedTable",
+    });
   });
 
   it("uses upstream readonly policy for Dameng", () => {
@@ -120,5 +123,131 @@ describe("minimal Dameng connector", () => {
     await expect(connector.executeSQL("invalid SQL", {})).rejects.toThrow("invalid SQL");
     expect(getConnection.mock.calls.length).toBe(callsBefore + 1);
     expect(close).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Dameng Oracle-compatible features", () => {
+  async function connected() {
+    const connector = new DamengConnector();
+    await connector.connect("dameng://reader:password@localhost/APP");
+    execute.mockClear();
+    return connector;
+  }
+
+  it("keeps PL/SQL blocks intact, including alternative quotes and nested control flow", async () => {
+    const connector = await connected();
+    const block =
+      "DECLARE n INT; BEGIN n := 1; IF n = 1 THEN n := 2; END IF; BEGIN n := 3; END; END;";
+    await connector.executeSQL(`${block}\n/\nSELECT q'[a;b]' AS VALUE FROM DUAL;`, {});
+    expect(execute.mock.calls.map(([sql]) => sql)).toEqual([
+      block,
+      "SELECT q'[a;b]' AS VALUE FROM DUAL",
+    ]);
+    expect(execute.mock.calls[0][2]).toMatchObject({ autoCommit: true });
+  });
+
+  it("rejects blocks and dangerous package calls before reaching a readonly connection", async () => {
+    const connector = await connected();
+    for (const sql of [
+      "BEGIN DELETE FROM t; END;",
+      "SELECT DBMS_SQL.EXECUTE(1) FROM DUAL",
+      "SELECT 1 FROM DUAL; DELETE FROM t",
+    ]) {
+      await expect(connector.executeSQL(sql, { readonly: true })).rejects.toThrow("Read-only");
+    }
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("returns a native plan without executing the explained query", async () => {
+    const connector = await connected();
+    execute.mockResolvedValueOnce({ rows: [{ OPERATION: "NSET2" }] });
+    const result = await connector.executeSQL("-- inspect\nEXPLAIN SELECT 1 FROM DUAL;", {
+      readonly: true,
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith("EXPLAIN FOR SELECT 1 FROM DUAL", [], {
+      outFormat: 4002,
+    });
+    expect(result.resultSets[0].rows).toEqual([{ OPERATION: "NSET2" }]);
+  });
+
+  it("rejects bound EXPLAIN parameters without interpolating or submitting them", async () => {
+    const connector = await connected();
+    await expect(connector.executeSQL("EXPLAIN SELECT ? FROM DUAL", {}, [1])).rejects.toThrow(
+      "does not support bound parameters"
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "EXPLAIN ANALYZE SELECT 1 FROM DUAL",
+    "EXPLAIN DELETE FROM t",
+    "EXPLAIN FOR DELETE FROM t",
+    "EXPLAIN SELECT 1 FROM DUAL; SELECT 2 FROM DUAL",
+    "EXPLAIN AS saved_plan FOR SELECT 1 FROM DUAL",
+  ])("rejects unsafe or ambiguous plan request: %s", async (sql) => {
+    const connector = await connected();
+    await expect(connector.executeSQL(sql, {})).rejects.toThrow("EXPLAIN requires");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("does not report an empty native plan as success", async () => {
+    const connector = await connected();
+    execute.mockResolvedValueOnce({ rowsAffected: 0 });
+    await expect(connector.executeSQL("EXPLAIN SELECT 1 FROM DUAL", {})).rejects.toThrow(
+      "no execution plan"
+    );
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
+  it("reads routine parameters, return type and source through the shared catalog", async () => {
+    const connector = await connected();
+    execute
+      .mockResolvedValueOnce({ rows: [{ OBJECT_TYPE: "FUNCTION" }] })
+      .mockResolvedValueOnce({
+        rows: [
+          { POSITION: 0, ARGUMENT_NAME: null, DATA_TYPE: "INTEGER", IN_OUT: "OUT" },
+          { POSITION: 1, ARGUMENT_NAME: "inputValue", DATA_TYPE: "INTEGER", IN_OUT: "IN" },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ TEXT: "FUNCTION f" }, { TEXT: " RETURN INTEGER" }] });
+    expect(await connector.getStoredProcedureDetail("f", "MixedSchema")).toMatchObject({
+      procedure_name: "f",
+      procedure_type: "function",
+      language: "plsql",
+      parameter_list: "inputValue IN INTEGER",
+      return_type: "INTEGER",
+      definition: "FUNCTION f RETURN INTEGER",
+    });
+    expect(execute.mock.calls[0][1]).toEqual({ schema: "MixedSchema", name: "f" });
+  });
+
+  it("reports DM session and cache metrics using DM counter semantics", async () => {
+    const connector = await connected();
+    execute
+      .mockResolvedValueOnce({ rows: [{ TOTAL: 6, ACTIVE: 2, IDLE: 4, IDLE_IN_TRANSACTION: 1 }] })
+      .mockResolvedValueOnce({ rows: [{ PARA_VALUE: "2000" }] })
+      .mockResolvedValueOnce({ rows: [{ HITS: 80, MISSES: 20 }] });
+    const result = await connector.getHealthCheck();
+    expect(result.connections).toMatchObject({
+      total: 6,
+      active: 2,
+      idle: 4,
+      idleInTransaction: 1,
+      maxConnections: 2000,
+    });
+    expect(result.bufferCache).toEqual({ hitRatioPct: 80, blocksHit: 80, blocksRead: 20 });
+    expect(result.connections?.longestActiveQuerySeconds).toBeNull();
+  });
+
+  it("degrades unavailable health sections without inventing zero-valued metrics", async () => {
+    const connector = await connected();
+    execute
+      .mockRejectedValueOnce(new Error("no permission"))
+      .mockResolvedValueOnce({ rows: [{ HITS: 0, MISSES: 0 }] });
+    const result = await connector.getHealthCheck();
+    expect(result.connections).toBeUndefined();
+    expect(result.bufferCache?.hitRatioPct).toBeNull();
+    expect(result.notes).toContain("Session metrics unavailable: cannot read V$SESSIONS.");
   });
 });

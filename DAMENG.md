@@ -16,6 +16,17 @@ GitHub 首页与 npm 包使用同一份 README。
 - `connection_timeout`、`query_timeout` 分别传给驱动的 `connectTimeout`、`sessionTimeout`。
 - 自定义工具使用 `?` 占位符，参数仅支持单语句。
 - 初始化脚本只在启动时执行；每条连接的 schema 应通过 DSN 指定。
+- Oracle 与达梦共享 `OracleCatalog` 元数据查询及 PL/SQL 分句器；连接池、超时、
+  结果处理和诊断 SQL 仍由各自驱动负责。达梦对象名保持原样，Oracle 保留原有大小写折叠。
+- 支持 PL/SQL 块，但只读工具拒绝执行块；写入仍逐条自动提交，不承诺批次原子性。
+- 可选 `explain_sql` 使用 `EXPLAIN FOR` 返回计划，只允许单条读查询；
+  `dmdb` 在此路径不接受绑定参数，因此明确拒绝而不插值拼接参数。
+- 可选 `health_check` 查询 `V$SESSIONS`、`V$DM_INI`、`V$BUFFERPOOL`。
+  达梦 `N_LOGIC_READS` 是缓存命中次数，命中率按 `hits / (hits + misses)` 计算。
+  权限不足的部分返回说明，暂不支持的会话持续时间返回 `null`。
+- 对照依据：[达梦执行计划文档](https://eco.dameng.com/document/dm/zh-cn/pm/check-phrases)、
+  [动态管理视图](https://eco.dameng.com/document/dm/zh-cn/pm/dynamic-management.html)、
+  [缓存命中口径](https://eco.dameng.com/document/dm/zh-cn/pm/dbms_workload-package)。
 
 ## 验证
 
@@ -26,6 +37,8 @@ pnpm build
 pnpm test:build
 # 可选：明确指定本机配置，只读验证真实 DM8（不会执行 init_script）
 node scripts/verify-dameng.mjs /absolute/path/to/dbhub.toml [source-id]
+# 另外验证可选诊断工具（不会修改原配置）
+node scripts/verify-dameng.mjs /absolute/path/to/dbhub.toml [source-id] --extended
 ```
 
 GitHub 检查无需真实库凭据；真实 DM8 验证在本机显式运行。

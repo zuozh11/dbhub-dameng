@@ -162,8 +162,30 @@ stdio 模式启动后等待 MCP 客户端请求是正常行为，这不是 SQL �
 - 使用 `@latest` 的配置在重新启动 MCP 时获取当前版本；已经运行的进程不会热更新。
 - 需要固定版本时，将 `@latest` 换成明确的 npm 版本号。
 - 只读模式不能替代数据库权限，尤其不能隔离数据库函数内部的副作用。
-- 达梦版覆盖普通 SQL 与元数据浏览；不支持包含内部分号的匿名 PL/SQL 块，
-  暂不提供达梦的 `explain_sql`、`health_check`。
+- 支持普通 SQL、表/视图/字段/索引元数据，以及独立存储过程和函数的参数、返回类型与源码。
+- 支持包含内部分号的 PL/SQL 块；只读工具仍会拒绝执行块。写入模式沿用逐条自动提交，
+  多语句不是原子事务。自定义工具继续使用 `?` 占位符，绑定参数仅支持单语句。
+- `explain_sql` 和 `health_check` 可选启用，默认工具仍为两个。
+
+### 可选：执行计划和健康检查
+
+在现有 TOML 配置中追加（`source` 与对应数据源的 `id` 一致）：
+
+```toml
+[[tools]]
+name = "explain_sql"
+source = "default"
+
+[[tools]]
+name = "health_check"
+source = "default"
+```
+
+`explain_sql` 返回达梦原生执行计划，只接受单条 `SELECT` / `WITH`，不会执行目标查询；
+不支持 `ANALYZE`、绑定参数或保存命名计划。
+`health_check` 返回会话数量、连接上限和缓存命中指标；无权访问相关系统视图时，
+对应部分省略并附说明。当前不提供会话持续时间，这些字段为 `null`。
+无需为使用默认工具额外开放系统视图权限。
 
 [npm 包](https://www.npmjs.com/package/@zz1996/dbhub-dameng) ·
 [开发与自动发布说明](https://github.com/zuozh11/dbhub-dameng/blob/main/DAMENG.md) ·

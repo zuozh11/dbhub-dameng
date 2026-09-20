@@ -7,7 +7,7 @@ import { stripCommentsAndStrings } from "./sql-parser.js";
  * but also other queries that are not destructive
  */
 export const allowedKeywords: Record<ConnectorType, string[]> = {
-  dameng: ["select", "with"],
+  dameng: ["select", "with", "explain"],
   postgres: ["select", "with", "explain", "show"],
   mysql: ["select", "with", "explain", "show", "describe", "desc"],
   mariadb: ["select", "with", "explain", "show", "describe", "desc"],
@@ -169,6 +169,9 @@ export const escapeHatchFunctionKeywords: Partial<Record<ConnectorType, readonly
   ],
 };
 
+// Dameng exposes Oracle-compatible packages; share the same call-position guard.
+escapeHatchFunctionKeywords.dameng = escapeHatchFunctionKeywords.oracle;
+
 /**
  * What must follow an escape-hatch keyword for it to count as an invocation.
  * Functions are matched in call position (`name(`); Oracle's entries are
@@ -179,6 +182,7 @@ export const escapeHatchFunctionKeywords: Partial<Record<ConnectorType, readonly
 const escapeHatchCallSuffix: Partial<Record<ConnectorType, string>> = {
   oracle: "\\s*\\.\\s*[a-z_][a-z0-9_$#]*\\s*\\(",
 };
+escapeHatchCallSuffix.dameng = escapeHatchCallSuffix.oracle;
 const DEFAULT_CALL_SUFFIX = "\\s*\\(";
 
 const escapeHatchFunctionPatterns: Partial<Record<ConnectorType, RegExp>> = Object.fromEntries(

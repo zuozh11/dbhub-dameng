@@ -9,14 +9,17 @@ import {
   ExecuteOptions,
   SQLResult,
   SQLResultSet,
-  StoredProcedure,
-  TableColumn,
-  TableIndex,
+  HealthCheckResult,
 } from "../interface.js";
 import { SafeURL } from "../../utils/safe-url.js";
 import { closeQuietly } from "../../utils/resource-cleanup.js";
-import { splitSQLStatements } from "../../utils/sql-parser.js";
+import { splitPLSQLStatements, LEADING_SQL_NOISE } from "../../utils/sql-parser.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
+
+import { OracleCatalog } from "../oracle-catalog.js";
+import { computeHitRatioPct } from "../health-check-utils.js";
+import { isReadOnlySQL } from "../../utils/allowed-keywords.js";
+import { policyFromReadonly, sqlVerdict } from "../../utils/sql-access-policy.js";
 
 type CatalogRow = Record<string, any>;
 
@@ -43,6 +46,7 @@ class DamengDSNParser implements DSNParser {
       params.set("sessionTimeout", String(config.queryTimeoutSeconds));
     }
     return {
+      poolMax: config?.poolMaxConnections ?? 4,
       connectString:
         `dm://${encodeURIComponent(url.username)}:${encodeURIComponent(url.password)}` +
         `@${url.hostname}:${url.port || 5236}?${params}`,
@@ -50,7 +54,7 @@ class DamengDSNParser implements DSNParser {
   }
 }
 
-export class DamengConnector implements Connector {
+export class DamengConnector extends OracleCatalog implements Connector {
   id: ConnectorType = "dameng";
   name = "Dameng";
   dsnParser = new DamengDSNParser();
@@ -78,7 +82,7 @@ export class DamengConnector implements Connector {
         );
         this.defaultSchema = result.rows![0].SCHEMA_NAME;
         if (initScript) {
-          for (const sql of splitSQLStatements(initScript, "dameng")) {
+          for (const sql of splitPLSQLStatements(initScript, "dameng")) {
             await conn.execute(sql, [], { autoCommit: true });
           }
         }
@@ -110,149 +114,101 @@ export class DamengConnector implements Connector {
     }
   }
 
-  private async query(sql: string, parameters: unknown[] = []): Promise<CatalogRow[]> {
+  protected async query<T>(sql: string, parameters: Record<string, string> = {}): Promise<T[]> {
     return this.withConnection(async (conn) => {
-      const result = await conn.execute<CatalogRow>(sql, parameters, {
+      const result = await conn.execute<T>(sql, parameters, {
         outFormat: dmdb.OUT_FORMAT_OBJECT,
       });
       return result.rows ?? [];
     });
   }
 
-  private owner(schema?: string): string {
+  protected schemaOrDefault(schema?: string): string {
     const owner = schema ?? this.defaultSchema;
     if (!owner) throw new Error("No Dameng schema selected");
     return owner;
   }
 
   async getSchemas(): Promise<string[]> {
-    const rows = await this.query("SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME");
+    const rows = await this.query<CatalogRow>("SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME");
     return rows.map((row) => row.USERNAME);
   }
 
   async getTables(schema?: string): Promise<string[]> {
-    const rows = await this.query(
-      "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = ? ORDER BY TABLE_NAME",
-      [this.owner(schema)]
+    const rows = await this.query<CatalogRow>(
+      "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :schema ORDER BY TABLE_NAME",
+      { schema: this.schemaOrDefault(schema) }
     );
     return rows.map((row) => row.TABLE_NAME);
   }
 
-  async getViews(schema?: string): Promise<string[]> {
-    const rows = await this.query(
-      "SELECT VIEW_NAME FROM ALL_VIEWS WHERE OWNER = ? ORDER BY VIEW_NAME",
-      [this.owner(schema)]
-    );
-    return rows.map((row) => row.VIEW_NAME);
-  }
-
   async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    const rows = await this.query(
+    const rows = await this.query<CatalogRow>(
       `SELECT COUNT(*) AS CNT FROM ALL_OBJECTS
-       WHERE OWNER = ? AND OBJECT_NAME = ? AND OBJECT_TYPE IN ('TABLE', 'VIEW')`,
-      [this.owner(schema), tableName]
+       WHERE OWNER = :schema AND OBJECT_NAME = :name AND OBJECT_TYPE IN ('TABLE', 'VIEW')`,
+      { schema: this.schemaOrDefault(schema), name: tableName }
     );
     return Number(rows[0].CNT) > 0;
   }
 
-  async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
-    const rows = await this.query(
-      `SELECT c.COLUMN_NAME, c.DATA_TYPE, c.NULLABLE, c.DATA_DEFAULT, cc.COMMENTS
-       FROM ALL_TAB_COLUMNS c LEFT JOIN ALL_COL_COMMENTS cc
-         ON cc.OWNER = c.OWNER AND cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME
-       WHERE c.OWNER = ? AND c.TABLE_NAME = ? ORDER BY c.COLUMN_ID`,
-      [this.owner(schema), tableName]
-    );
-    return rows.map((row) => ({
-      column_name: row.COLUMN_NAME,
-      data_type: row.DATA_TYPE,
-      is_nullable: row.NULLABLE === "Y" ? "YES" : "NO",
-      column_default: row.DATA_DEFAULT ?? null,
-      description: row.COMMENTS ?? null,
-    }));
-  }
-
-  async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
-    const rows = await this.query(
-      `SELECT i.INDEX_NAME, i.UNIQUENESS, ic.COLUMN_NAME,
-              CASE WHEN c.CONSTRAINT_TYPE = 'P' THEN 1 ELSE 0 END AS IS_PRIMARY
-       FROM ALL_INDEXES i JOIN ALL_IND_COLUMNS ic
-         ON i.OWNER = ic.INDEX_OWNER AND i.INDEX_NAME = ic.INDEX_NAME
-       LEFT JOIN ALL_CONSTRAINTS c
-         ON c.OWNER = i.TABLE_OWNER AND c.TABLE_NAME = i.TABLE_NAME
-        AND c.INDEX_NAME = i.INDEX_NAME AND c.CONSTRAINT_TYPE = 'P'
-       WHERE i.TABLE_OWNER = ? AND i.TABLE_NAME = ? ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION`,
-      [this.owner(schema), tableName]
-    );
-    const indexes = new Map<string, TableIndex>();
-    for (const row of rows) {
-      let index = indexes.get(row.INDEX_NAME);
-      if (!index) {
-        index = {
-          index_name: row.INDEX_NAME,
-          column_names: [],
-          is_unique: row.UNIQUENESS === "UNIQUE",
-          is_primary: Number(row.IS_PRIMARY) === 1,
-        };
-        indexes.set(row.INDEX_NAME, index);
+  async getHealthCheck(): Promise<HealthCheckResult> {
+    if (!this.pool) throw new Error("Not connected to Dameng");
+    const result: HealthCheckResult = {};
+    const notes: string[] = [];
+    try {
+      const [row] = await this.query<CatalogRow>(
+        `SELECT COUNT(*) AS TOTAL,
+                SUM(CASE WHEN STATE = 'ACTIVE' THEN 1 ELSE 0 END) AS ACTIVE,
+                SUM(CASE WHEN STATE = 'IDLE' THEN 1 ELSE 0 END) AS IDLE,
+                SUM(CASE WHEN STATE = 'IDLE' AND TRX_ID <> 0 THEN 1 ELSE 0 END) AS IDLE_IN_TRANSACTION
+         FROM V$SESSIONS WHERE SESS_ID <> SESSID`
+      );
+      result.connections = {
+        total: Number(row.TOTAL),
+        active: Number(row.ACTIVE ?? 0),
+        idle: Number(row.IDLE ?? 0),
+        idleInTransaction: Number(row.IDLE_IN_TRANSACTION ?? 0),
+        maxConnections: null,
+        longestIdleInTransactionSeconds: null,
+        longestActiveQuerySeconds: null,
+      };
+      notes.push("Dameng session-duration metrics are unavailable; durations are null.");
+      try {
+        const [limit] = await this.query<CatalogRow>(
+          "SELECT PARA_VALUE FROM V$DM_INI WHERE PARA_NAME = 'MAX_SESSIONS'"
+        );
+        const ceiling = Number(limit?.PARA_VALUE);
+        result.connections.maxConnections = ceiling > 0 ? ceiling : null;
+      } catch {
+        notes.push("Connection limit unavailable: cannot read V$DM_INI.");
       }
-      index.column_names.push(row.COLUMN_NAME);
+    } catch {
+      notes.push("Session metrics unavailable: cannot read V$SESSIONS.");
     }
-    return [...indexes.values()];
-  }
-
-  async getStoredProcedures(
-    schema?: string,
-    routineType?: "procedure" | "function"
-  ): Promise<string[]> {
-    const rows = await this.query(
-      `SELECT OBJECT_NAME FROM ALL_OBJECTS WHERE OWNER = ?
-       AND OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION') ${routineType ? "AND OBJECT_TYPE = ?" : ""}
-       ORDER BY OBJECT_NAME`,
-      routineType ? [this.owner(schema), routineType.toUpperCase()] : [this.owner(schema)]
-    );
-    return rows.map((row) => row.OBJECT_NAME);
-  }
-
-  async getStoredProcedureDetail(procedureName: string, schema?: string): Promise<StoredProcedure> {
-    const owner = this.owner(schema);
-    const rows = await this.query(
-      `SELECT OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS WHERE OWNER = ? AND OBJECT_NAME = ?
-       AND OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION')`,
-      [owner, procedureName]
-    );
-    if (!rows.length) throw new Error(`Stored procedure '${procedureName}' not found`);
-    const source = await this.query(
-      "SELECT TEXT FROM ALL_SOURCE WHERE OWNER = ? AND NAME = ? ORDER BY LINE",
-      [owner, procedureName]
-    );
-    return {
-      procedure_name: rows[0].OBJECT_NAME,
-      procedure_type: rows[0].OBJECT_TYPE === "FUNCTION" ? "function" : "procedure",
-      language: "sql",
-      parameter_list: "",
-      definition: source.map((row) => row.TEXT).join(""),
-    };
-  }
-
-  async getTableRowCount(tableName: string, schema?: string): Promise<number | null> {
-    const rows = await this.query(
-      "SELECT NUM_ROWS FROM ALL_TABLES WHERE OWNER = ? AND TABLE_NAME = ?",
-      [this.owner(schema), tableName]
-    );
-    return rows[0]?.NUM_ROWS == null ? null : Number(rows[0].NUM_ROWS);
-  }
-
-  async getTableComment(tableName: string, schema?: string): Promise<string | null> {
-    const rows = await this.query(
-      "SELECT COMMENTS FROM ALL_TAB_COMMENTS WHERE OWNER = ? AND TABLE_NAME = ?",
-      [this.owner(schema), tableName]
-    );
-    return rows[0]?.COMMENTS ?? null;
+    try {
+      const [row] = await this.query<CatalogRow>(
+        "SELECT SUM(N_LOGIC_READS) AS HITS, SUM(N_PHY_READS) AS MISSES FROM V$BUFFERPOOL"
+      );
+      // DM counts cache hits in N_LOGIC_READS, unlike Oracle's total logical reads.
+      const hits = Number(row.HITS ?? 0),
+        misses = Number(row.MISSES ?? 0);
+      result.bufferCache = {
+        hitRatioPct: computeHitRatioPct(hits + misses, misses),
+        blocksHit: hits,
+        blocksRead: misses,
+      };
+    } catch {
+      notes.push("Buffer cache metrics unavailable: cannot read V$BUFFERPOOL.");
+    }
+    if (notes.length) result.notes = notes;
+    return result;
   }
 
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
-    const statements = splitSQLStatements(sql, "dameng");
+    const statements = splitPLSQLStatements(sql, "dameng");
+    if (options.readonly && sqlVerdict(policyFromReadonly(true), sql, "dameng") !== "allow") {
+      throw new Error("Read-only mode: statement is not allowed");
+    }
     if (parameters?.length && statements.length !== 1) {
       throw new Error("Parameters require a single Dameng statement");
     }
@@ -261,6 +217,28 @@ export class DamengConnector implements Connector {
     return this.withConnection(async (conn) => {
       const resultSets: SQLResultSet[] = [];
       for (const statement of statements) {
+        const afterNoise = statement.replace(LEADING_SQL_NOISE, "");
+        if (/^explain\b/i.test(afterNoise)) {
+          if (parameters?.length) {
+            throw new Error("Dameng EXPLAIN does not support bound parameters");
+          }
+          const inner = afterNoise.replace(/^explain\b\s*(?:for\b\s*)?/i, "");
+          // Only a single read statement can be explained. Never accept ANALYZE,
+          // named plans, PL/SQL, or DML through this diagnostic path.
+          if (
+            statements.length !== 1 ||
+            !/^(?:select|with)\b/i.test(inner.replace(LEADING_SQL_NOISE, "")) ||
+            !isReadOnlySQL(inner, "dameng")
+          ) {
+            throw new Error("EXPLAIN requires a single read statement (SELECT or WITH)");
+          }
+          const result = await conn.execute<CatalogRow>(`EXPLAIN FOR ${inner}`, [], {
+            outFormat: dmdb.OUT_FORMAT_OBJECT,
+          });
+          if (!result.rows?.length) throw new Error("Dameng returned no execution plan");
+          resultSets.push({ sql: statement, rows: result.rows, rowCount: result.rows.length });
+          continue;
+        }
         // dmdb sends maxRows to the server; no dialect-specific SQL rewrite needed.
         const result = await conn.execute<CatalogRow>(statement, parameters ?? [], {
           outFormat: dmdb.OUT_FORMAT_OBJECT,

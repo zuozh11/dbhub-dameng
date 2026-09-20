@@ -1,4 +1,5 @@
 import oracledb from "oracledb";
+import { OracleCatalog } from "../oracle-catalog.js";
 import {
   Connector,
   ConnectorType,
@@ -6,9 +7,6 @@ import {
   DSNParser,
   SQLResult,
   SQLResultSet,
-  TableColumn,
-  TableIndex,
-  StoredProcedure,
   ExecuteOptions,
   ConnectorConfig,
   HealthCheckResult,
@@ -19,6 +17,7 @@ import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
 import {
   LEADING_SQL_NOISE,
+  splitPLSQLStatements,
   blankCommentsAndStrings,
   stripCommentsAndStrings,
 } from "../../utils/sql-parser.js";
@@ -137,7 +136,7 @@ export class OracleDSNParser implements DSNParser {
  * (see foldIdentifier) so callers can pass the names they wrote in their DDL;
  * names are returned exactly as the catalog holds them.
  */
-export class OracleConnector implements Connector {
+export class OracleConnector extends OracleCatalog implements Connector {
   id: ConnectorType = "oracle";
   name = "Oracle";
   dsnParser = new OracleDSNParser();
@@ -148,21 +147,6 @@ export class OracleConnector implements Connector {
   private defaultSchema = "";
   // Source ID is set by ConnectorManager after cloning
   private sourceId: string = "default";
-
-  /**
-   * Leading keywords of a statement whose body is PL/SQL. Such a statement
-   * ends at the semicolon that closes its outermost BEGIN ... END, not at
-   * the first semicolon (see splitStatements).
-   */
-  private static readonly PLSQL_BODY =
-    /^(?:begin|declare|create\s+(?:or\s+replace\s+)?(?:(?:editionable|noneditionable)\s+)?(?:procedure|function|trigger))\b/i;
-
-  /**
-   * Package specs/bodies and type bodies: `IS ... END name;` with no BEGIN
-   * of their own at the top level, so the IS/AS opens the block.
-   */
-  private static readonly PLSQL_UNIT =
-    /^create\s+(?:or\s+replace\s+)?(?:(?:editionable|noneditionable)\s+)?(?:package(?:\s+body)?|type\s+body)\b/i;
 
   getId(): string {
     return this.sourceId;
@@ -239,7 +223,7 @@ export class OracleConnector implements Connector {
   }
 
   /** Run one catalog query on a short-lived pooled connection. */
-  private query<T>(sql: string, binds: oracledb.BindParameters = {}): Promise<T[]> {
+  protected query<T>(sql: string, binds: oracledb.BindParameters = {}): Promise<T[]> {
     return this.withConnection((connection) => OracleConnector.fetchRows<T>(connection, sql, binds));
   }
 
@@ -296,7 +280,11 @@ export class OracleConnector implements Connector {
     return /[A-Z]/.test(name) ? name : name.toUpperCase();
   }
 
-  private schemaOrDefault(schema?: string): string {
+  protected catalogIdentifier(name: string): string {
+    return OracleConnector.foldIdentifier(name);
+  }
+
+  protected schemaOrDefault(schema?: string): string {
     return schema ? OracleConnector.foldIdentifier(schema) : this.defaultSchema;
   }
 
@@ -341,18 +329,6 @@ export class OracleConnector implements Connector {
     }
   }
 
-  async getViews(schema?: string): Promise<string[]> {
-    try {
-      const rows = await this.query<{ VIEW_NAME: string }>(
-        `SELECT view_name FROM all_views WHERE owner = :schema ORDER BY view_name`,
-        { schema: this.schemaOrDefault(schema) }
-      );
-      return rows.map((row) => row.VIEW_NAME);
-    } catch (error) {
-      throw new Error(`Failed to get views: ${(error as Error).message}`);
-    }
-  }
-
   async tableExists(tableName: string, schema?: string): Promise<boolean> {
     try {
       const rows = await this.query<{ CNT: number }>(
@@ -362,159 +338,6 @@ export class OracleConnector implements Connector {
       return Number(rows[0]?.CNT ?? 0) > 0;
     } catch (error) {
       throw new Error(`Failed to check if table exists: ${(error as Error).message}`);
-    }
-  }
-
-  async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
-    try {
-      const rows = await this.query<{
-        COLUMN_NAME: string;
-        DATA_TYPE: string;
-        DATA_LENGTH: number | null;
-        CHAR_LENGTH: number | null;
-        DATA_PRECISION: number | null;
-        DATA_SCALE: number | null;
-        NULLABLE: string;
-        DATA_DEFAULT: string | null;
-        DESCRIPTION: string | null;
-      }>(
-        `SELECT c.column_name,
-                c.data_type,
-                c.data_length,
-                c.char_length,
-                c.data_precision,
-                c.data_scale,
-                c.nullable,
-                c.data_default,
-                cc.comments AS description
-         FROM all_tab_columns c
-         LEFT JOIN all_col_comments cc
-           ON cc.owner = c.owner
-          AND cc.table_name = c.table_name
-          AND cc.column_name = c.column_name
-         WHERE c.owner = :schema
-           AND c.table_name = :table_name
-         ORDER BY c.column_id`,
-        { schema: this.schemaOrDefault(schema), table_name: OracleConnector.foldIdentifier(tableName) }
-      );
-
-      return rows.map((row) => ({
-        column_name: row.COLUMN_NAME,
-        data_type: OracleConnector.formatDataType(row),
-        is_nullable: row.NULLABLE === "Y" ? "YES" : "NO",
-        // DATA_DEFAULT is a LONG that keeps the DDL's trailing whitespace.
-        column_default: row.DATA_DEFAULT?.trim() || null,
-        description: row.DESCRIPTION || null,
-      }));
-    } catch (error) {
-      throw new Error(`Failed to get schema for table ${tableName}: ${(error as Error).message}`);
-    }
-  }
-
-  /**
-   * Render a column's type the way it appears in DDL: `VARCHAR2(100)`,
-   * `NUMBER(10,2)`, `NUMBER`, `TIMESTAMP(6)`. Oracle's catalog splits these
-   * across several columns.
-   */
-  private static formatDataType(row: {
-    DATA_TYPE: string;
-    DATA_LENGTH: number | null;
-    CHAR_LENGTH: number | null;
-    DATA_PRECISION: number | null;
-    DATA_SCALE: number | null;
-  }): string {
-    const type = row.DATA_TYPE;
-    if (/^(?:N?VARCHAR2|N?CHAR|RAW)$/.test(type)) {
-      const length = type === "RAW" ? row.DATA_LENGTH : row.CHAR_LENGTH;
-      return length ? `${type}(${length})` : type;
-    }
-    if (type === "NUMBER") {
-      if (row.DATA_PRECISION === null) {
-        // NUMBER(*, s) (INTEGER is NUMBER(*, 0)) has no precision but a scale.
-        return row.DATA_SCALE === null ? type : `NUMBER(*,${row.DATA_SCALE})`;
-      }
-      return row.DATA_SCALE ? `NUMBER(${row.DATA_PRECISION},${row.DATA_SCALE})` : `NUMBER(${row.DATA_PRECISION})`;
-    }
-    if (type === "FLOAT" && row.DATA_PRECISION !== null) {
-      return `FLOAT(${row.DATA_PRECISION})`;
-    }
-    // TIMESTAMP(6), TIMESTAMP(6) WITH TIME ZONE, INTERVAL DAY(2) TO SECOND(6)
-    // already carry their precision in DATA_TYPE.
-    return type;
-  }
-
-  async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
-    try {
-      const rows = await this.query<{
-        INDEX_NAME: string;
-        UNIQUENESS: string;
-        IS_PRIMARY: number;
-        COLUMN_NAME: string;
-      }>(
-        `SELECT i.index_name,
-                i.uniqueness,
-                CASE WHEN pk.constraint_name IS NOT NULL THEN 1 ELSE 0 END AS is_primary,
-                ic.column_name
-         FROM all_indexes i
-         JOIN all_ind_columns ic
-           ON ic.index_owner = i.owner
-          AND ic.index_name = i.index_name
-         LEFT JOIN all_constraints pk
-           ON pk.owner = i.table_owner
-          AND pk.table_name = i.table_name
-          AND pk.constraint_type = 'P'
-          AND pk.index_owner = i.owner
-          AND pk.index_name = i.index_name
-         WHERE i.table_owner = :schema
-           AND i.table_name = :table_name
-         ORDER BY i.index_name, ic.column_position`,
-        { schema: this.schemaOrDefault(schema), table_name: OracleConnector.foldIdentifier(tableName) }
-      );
-
-      const indexMap = new Map<string, TableIndex>();
-      for (const row of rows) {
-        let index = indexMap.get(row.INDEX_NAME);
-        if (!index) {
-          index = {
-            index_name: row.INDEX_NAME,
-            column_names: [],
-            is_unique: row.UNIQUENESS === "UNIQUE",
-            is_primary: Number(row.IS_PRIMARY) === 1,
-          };
-          indexMap.set(row.INDEX_NAME, index);
-        }
-        index.column_names.push(row.COLUMN_NAME);
-      }
-      return Array.from(indexMap.values());
-    } catch (error) {
-      throw new Error(`Failed to get indexes for table ${tableName}: ${(error as Error).message}`);
-    }
-  }
-
-  async getTableComment(tableName: string, schema?: string): Promise<string | null> {
-    try {
-      const rows = await this.query<{ COMMENTS: string | null }>(
-        `SELECT comments FROM all_tab_comments WHERE owner = :schema AND table_name = :table_name`,
-        { schema: this.schemaOrDefault(schema), table_name: OracleConnector.foldIdentifier(tableName) }
-      );
-      return rows[0]?.COMMENTS || null;
-    } catch {
-      return null;
-    }
-  }
-
-  async getTableRowCount(tableName: string, schema?: string): Promise<number | null> {
-    try {
-      // Optimizer statistics; NULL until the table has been analyzed, which
-      // search_objects reports as an unknown count rather than a stale one.
-      const rows = await this.query<{ NUM_ROWS: number | null }>(
-        `SELECT num_rows FROM all_tables WHERE owner = :schema AND table_name = :table_name`,
-        { schema: this.schemaOrDefault(schema), table_name: OracleConnector.foldIdentifier(tableName) }
-      );
-      const numRows = rows[0]?.NUM_ROWS;
-      return numRows === null || numRows === undefined ? null : Number(numRows);
-    } catch {
-      return null;
     }
   }
 
@@ -613,90 +436,6 @@ export class OracleConnector implements Connector {
     }
 
     return result;
-  }
-
-  async getStoredProcedures(schema?: string, routineType?: "procedure" | "function"): Promise<string[]> {
-    try {
-      const typeFilter =
-        routineType === "function"
-          ? "object_type = 'FUNCTION'"
-          : routineType === "procedure"
-            ? "object_type = 'PROCEDURE'"
-            : "object_type IN ('PROCEDURE', 'FUNCTION')";
-      const rows = await this.query<{ OBJECT_NAME: string }>(
-        `SELECT object_name FROM all_objects WHERE owner = :schema AND ${typeFilter} ORDER BY object_name`,
-        { schema: this.schemaOrDefault(schema) }
-      );
-      return rows.map((row) => row.OBJECT_NAME);
-    } catch (error) {
-      throw new Error(`Failed to get stored procedures: ${(error as Error).message}`);
-    }
-  }
-
-  async getStoredProcedureDetail(procedureName: string, schema?: string): Promise<StoredProcedure> {
-    try {
-      const schemaToUse = this.schemaOrDefault(schema);
-      const name = OracleConnector.foldIdentifier(procedureName);
-
-      return await this.withConnection(async (connection) => {
-        const objects = await OracleConnector.fetchRows<{ OBJECT_TYPE: string }>(
-          connection,
-          `SELECT object_type
-           FROM all_objects
-           WHERE owner = :schema AND object_name = :name
-             AND object_type IN ('PROCEDURE', 'FUNCTION')`,
-          { schema: schemaToUse, name }
-        );
-        if (objects.length === 0) {
-          throw new Error(`Stored procedure '${procedureName}' not found in schema '${schemaToUse}'`);
-        }
-        const objectType = objects[0].OBJECT_TYPE;
-        const isFunction = objectType === "FUNCTION";
-
-        const [args, source] = await Promise.all([
-          // Standalone routines only (package_name IS NULL). Position 0 with
-          // no argument name is a function's return value.
-          OracleConnector.fetchRows<{
-            ARGUMENT_NAME: string | null;
-            POSITION: number;
-            IN_OUT: string;
-            DATA_TYPE: string | null;
-          }>(
-            connection,
-            `SELECT argument_name, position, in_out, data_type
-             FROM all_arguments
-             WHERE owner = :schema AND object_name = :name
-               AND package_name IS NULL AND data_level = 0
-             ORDER BY position`,
-            { schema: schemaToUse, name }
-          ),
-          OracleConnector.fetchRows<{ TEXT: string }>(
-            connection,
-            `SELECT text FROM all_source
-             WHERE owner = :schema AND name = :name AND type = :object_type
-             ORDER BY line`,
-            { schema: schemaToUse, name, object_type: objectType }
-          ),
-        ]);
-
-        const returnType = args.find((arg) => arg.POSITION === 0 && arg.ARGUMENT_NAME === null)?.DATA_TYPE;
-        const parameterList = args
-          .filter((arg) => arg.ARGUMENT_NAME !== null)
-          .map((arg) => `${arg.ARGUMENT_NAME} ${arg.IN_OUT} ${arg.DATA_TYPE ?? ""}`.trim())
-          .join(", ");
-
-        return {
-          procedure_name: name,
-          procedure_type: isFunction ? "function" : "procedure",
-          language: "plsql",
-          parameter_list: parameterList,
-          return_type: isFunction ? returnType ?? undefined : undefined,
-          definition: source.length > 0 ? source.map((row) => row.TEXT).join("") : undefined,
-        };
-      });
-    } catch (error) {
-      throw new Error(`Failed to get stored procedure details: ${(error as Error).message}`);
-    }
   }
 
   /**
@@ -807,72 +546,7 @@ export class OracleConnector implements Connector {
    * literal or comment counts.
    */
   static splitStatements(sql: string): string[] {
-    const blanked = blankCommentsAndStrings(sql, "oracle");
-    const statements: string[] = [];
-    // Whitespace and SQL*Plus `/` terminator lines between statements.
-    const boundary = /(?:\s|\/(?=[ \t]*(?:\r?\n|$)))*/y;
-    // Plain SQL ends at a `;` or a `/` line.
-    const plainEnd = /;|^[ \t]*\/[ \t]*$/gm;
-    // PL/SQL block-depth tokens. `begin`, `case` and `compound trigger` open
-    // depth; `end if` / `end loop` close constructs that never opened depth,
-    // so they are neutral; every other `end` (bare, `end case`, a compound
-    // trigger's `end before statement` & co.) closes one level.
-    const token = /\b(begin|case|end|compound\s+trigger)\b(?:\s+(if|loop|case))?|;|^[ \t]*\/[ \t]*$/gim;
-
-    const push = (start: number, end: number) => {
-      const text = sql.slice(start, end).trim();
-      if (text) statements.push(text);
-    };
-
-    let i = 0;
-    while (i < blanked.length) {
-      boundary.lastIndex = i;
-      i += boundary.exec(blanked)![0].length;
-      if (i >= blanked.length) break;
-      const start = i;
-
-      const rest = blanked.slice(i);
-      const isUnit = OracleConnector.PLSQL_UNIT.test(rest);
-      if (!isUnit && !OracleConnector.PLSQL_BODY.test(rest)) {
-        plainEnd.lastIndex = i;
-        const m = plainEnd.exec(blanked);
-        const end = m?.index ?? blanked.length;
-        push(start, end);
-        i = end + (m?.[0] === ";" ? 1 : 0);
-        continue;
-      }
-
-      // PL/SQL: ends at the `;` closing the outermost block (kept), or at a
-      // `/` line or end of input.
-      let depth = isUnit ? 1 : 0;
-      let opened = isUnit;
-      let end = blanked.length;
-      token.lastIndex = i;
-      let m: RegExpExecArray | null;
-      while ((m = token.exec(blanked)) !== null) {
-        if (m[0] === ";") {
-          if (opened && depth === 0) {
-            end = m.index + 1;
-            break;
-          }
-        } else if (m[1] === undefined) {
-          end = m.index; // `/` terminator line
-          break;
-        } else {
-          const keyword = m[1].toLowerCase();
-          const closes = m[2]?.toLowerCase();
-          if (keyword !== "end") {
-            depth++;
-            opened = true;
-          } else if (closes === undefined || closes === "case") {
-            depth--;
-          }
-        }
-      }
-      push(start, end);
-      i = end;
-    }
-    return statements;
+    return splitPLSQLStatements(sql, "oracle");
   }
 
   /**
