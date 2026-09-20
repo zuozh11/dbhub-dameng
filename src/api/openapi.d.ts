@@ -64,7 +64,7 @@ export interface components {
              * @example postgres
              * @enum {string}
              */
-            type: "postgres" | "mysql" | "mariadb" | "sqlserver" | "sqlite" | "dameng";
+            type: "postgres" | "mysql" | "mariadb" | "sqlserver" | "sqlite" | "oracle" | "dameng";
             /**
              * @description Database host (not present for SQLite)
              * @example localhost

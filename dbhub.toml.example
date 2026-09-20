@@ -207,6 +207,30 @@ dsn = "postgres://postgres:postgres@localhost:5432/myapp"
 # sslmode = "require"
 
 # ============================================================================
+# ORACLE
+# ============================================================================
+
+# The DSN path is the service name (e.g. FREEPDB1 on Oracle Free). Uses
+# node-oracledb Thin mode, so no Oracle Instant Client is needed.
+# [[sources]]
+# id = "local_oracle"
+# dsn = "oracle://app:secret@localhost:1521/FREEPDB1"
+# # Address an old-style SID instead of a service name:
+# # dsn = "oracle://app:secret@localhost:1521/?sid=ORCL"
+# # TCPS: sslmode=require (no certificate DN check) or verify-full (DN checked)
+# # dsn = "oracle://app:secret@db.example.com:2484/PROD?sslmode=verify-full"
+
+# Oracle - Individual parameters
+# [[sources]]
+# id = "local_oracle"
+# type = "oracle"
+# host = "localhost"
+# port = 1521
+# database = "FREEPDB1"   # service name
+# user = "app"
+# password = "secret"
+
+# ============================================================================
 # SQLITE (Local file or in-memory)
 # ============================================================================
 
@@ -248,11 +272,12 @@ dsn = "postgres://postgres:postgres@localhost:5432/myapp"
 
 # 'health_check' is opt-in only, like explain_sql. It reports operational
 # metrics (connection pool state, buffer cache hit ratio) for the source.
-# Currently implemented for PostgreSQL, MySQL, MariaDB, and SQL Server;
-# enabling it on other database types returns an "unsupported" error rather
-# than partial data. On MySQL/MariaDB, idle-in-transaction detection
+# Currently implemented for PostgreSQL, MySQL, MariaDB, SQL Server, and
+# Oracle; enabling it on other database types returns an "unsupported" error
+# rather than partial data. On MySQL/MariaDB, idle-in-transaction detection
 # additionally requires the PROCESS privilege; on SQL Server, both metrics
-# require VIEW SERVER STATE (VIEW DATABASE STATE on Azure SQL Database).
+# require VIEW SERVER STATE (VIEW DATABASE STATE on Azure SQL Database); on
+# Oracle, both require SELECT_CATALOG_ROLE (or SELECT ANY DICTIONARY).
 # Without the right grant, the tool still returns what it can and adds a
 # `notes` entry explaining the reduced visibility instead of failing
 # outright. Always read-only, no readonly/max_rows options of its own.
@@ -366,10 +391,11 @@ dsn = "postgres://postgres:postgres@localhost:5432/myapp"
 #   MySQL:       mysql://user:pass@host:3306/database
 #   MariaDB:     mariadb://user:pass@host:3306/database
 #   SQL Server:  sqlserver://user:pass@host:1433/database
+#   Oracle:      oracle://user:pass@host:1521/service_name  (or ?sid=ORCL)
 #   SQLite:      sqlite:///path/to/file.db  or  sqlite:///:memory:
 #
 # Default Ports:
-#   PostgreSQL: 5432 | MySQL/MariaDB: 3306 | SQL Server: 1433
+#   PostgreSQL: 5432 | MySQL/MariaDB: 3306 | SQL Server: 1433 | Oracle: 1521
 #
 # SSH Tunnel Options:
 #   ssh_host, ssh_port (default: 22), ssh_user
@@ -395,7 +421,7 @@ dsn = "postgres://postgres:postgres@localhost:5432/myapp"
 #   readonly = true    # Restrict to SELECT, SHOW, DESCRIBE, EXPLAIN (works for execute_sql and custom tools)
 #   max_rows = 1000    # Limit result set size (works for execute_sql and custom tools)
 #   explain_sql        # Opt-in tool (name = "explain_sql"); no readonly/max_rows options - always safe
-#   health_check       # Opt-in tool (name = "health_check"); PostgreSQL/MySQL/MariaDB/SQL Server for now, always safe
+#   health_check       # Opt-in tool (name = "health_check"); PostgreSQL/MySQL/MariaDB/SQL Server/Oracle for now, always safe
 #
 # Parameter Placeholders by Database:
 #   PostgreSQL:     $1, $2, $3

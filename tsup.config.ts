@@ -25,6 +25,7 @@ export default defineConfig({
     'mysql2',
     'mariadb',
     'mssql',
+    'oracledb',
     '@aws-sdk/credential-providers',
     '@aws-sdk/rds-signer',
     '@azure/identity',

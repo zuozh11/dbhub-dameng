@@ -209,7 +209,8 @@ function protocolToConnectorType(protocol: string): ConnectorType | undefined {
     'mysql': 'mysql',
     'mariadb': 'mariadb',
     'sqlserver': 'sqlserver',
-    'sqlite': 'sqlite'
+    'sqlite': 'sqlite',
+    'oracle': 'oracle'
   };
   return mapping[protocol];
 }
@@ -226,6 +227,7 @@ export function getDefaultPortForType(type: ConnectorType): number | undefined {
     'mysql': 3306,
     'mariadb': 3306,
     'sqlserver': 1433,
+    'oracle': 1521,
     'sqlite': undefined,
   };
   return ports[type];
