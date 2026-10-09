@@ -13,14 +13,20 @@ import {
   HealthCheckResult,
 } from "../interface.js";
 import { getMySQLFamilyHealthCheck } from "../mysql-family-health-check.js";
+import * as introspection from "../mysql-family-introspection.js";
+import type { MySQLFamilyQuery } from "../mysql-family-introspection.js";
 import { SafeURL } from "../../utils/safe-url.js";
 import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
 import { requireDatabaseInDSN, MissingDatabaseError } from "../../utils/dsn-database.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
 import { parseQueryResultSets } from "../../utils/multi-statement-result-parser.js";
 import { splitSQLStatements } from "../../utils/sql-parser.js";
-import { withReadOnlyTransaction, isClientSideTimeout } from "../../utils/readonly-transaction.js";
-import { quoteIdentifier } from "../../utils/identifier-quoter.js";
+import { withReadOnlyTransaction } from "../../utils/readonly-transaction.js";
+import {
+  CANCEL_QUERY_TIMEOUT_MS,
+  clientQueryTimeoutMs,
+  isClientSideTimeout,
+} from "../../utils/query-timeout.js";
 import { isTiDBVersion } from "../../utils/server-flavor.js";
 import { closeQuietly } from "../../utils/resource-cleanup.js";
 
@@ -154,10 +160,6 @@ export class MySQLConnector implements Connector {
   name = "MySQL";
   dsnParser = new MySQLDSNParser();
 
-  // Bounds the KILL QUERY cleanup call issued after a client-side query
-  // timeout; see killQuery.
-  private static readonly KILL_QUERY_TIMEOUT_MS = 5000;
-
   private pool: mysql.Pool | null = null;
   // Source ID is set by ConnectorManager after cloning
   private sourceId: string = "default";
@@ -179,9 +181,27 @@ export class MySQLConnector implements Connector {
       const connectionOptions = await this.dsnParser.parse(dsn, config);
       this.pool = mysql.createPool(connectionOptions);
 
-      // Store query timeout for per-query application
       if (config?.queryTimeoutSeconds !== undefined) {
-        this.queryTimeoutMs = config.queryTimeoutSeconds * 1000;
+        const queryTimeoutMs = Math.ceil(config.queryTimeoutSeconds * 1000);
+        // Client-side fallback, applied per query (see query-timeout.ts).
+        this.queryTimeoutMs = queryTimeoutMs;
+        // Server-side limit: have MySQL itself stop a read-only SELECT that
+        // runs past the limit, as PostgreSQL (statement_timeout) and MariaDB
+        // (max_statement_time) already do. It is a session variable, so it is
+        // set once on every new pool connection. mysql2 emits 'connection'
+        // with the callback-style connection before handing it to the first
+        // caller, so this SET is queued ahead of that caller's statement.
+        // max_execution_time does not cover writes or DDL; those stay bounded
+        // by the client-side fallback alone. A server without the variable
+        // (MySQL before 5.7.8) rejects the SET, which is ignored for the same
+        // reason: the fallback still applies.
+        const setServerLimit = `SET SESSION max_execution_time = ${queryTimeoutMs}`;
+        (this.pool as unknown as NodeJS.EventEmitter).on(
+          "connection",
+          (connection: { query(sql: string, callback: (err: unknown) => void): void }) => {
+            connection.query(setServerLimit, () => {});
+          }
+        );
       }
 
       // Test the connection and detect the server flavor in the same round trip.
@@ -207,455 +227,68 @@ export class MySQLConnector implements Connector {
     }
   }
 
-  async getSchemas(): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, schemas are equivalent to databases. Exclude server-level
-      // system databases so the list matches the user-facing schemas only
-      // (parity with the PostgreSQL connector, which hides pg_catalog et al.).
-      const [rows] = (await this.pool.query(`
-        SELECT SCHEMA_NAME
-        FROM INFORMATION_SCHEMA.SCHEMATA
-        WHERE SCHEMA_NAME NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys')
-        ORDER BY SCHEMA_NAME
-      `)) as [any[], any];
-
-      return rows.map((row) => row.SCHEMA_NAME);
-    } catch (error) {
-      console.error("Error getting schemas:", error);
-      throw error;
-    }
-  }
-
-  async getTables(schema?: string): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, if no schema is provided, use the current active database (DATABASE())
-      // MySQL uses the terms 'database' and 'schema' interchangeably
-      // The DATABASE() function returns the current database context
-      const schemaClause = schema ? "WHERE TABLE_SCHEMA = ?" : "WHERE TABLE_SCHEMA = DATABASE()";
-
-      const queryParams = schema ? [schema] : [];
-
-      // Get all tables from the specified schema or current database (excludes views)
-      const [rows] = (await this.pool.query(
-        `
-        SELECT TABLE_NAME
-        FROM INFORMATION_SCHEMA.TABLES
-        ${schemaClause}
-        AND TABLE_TYPE = 'BASE TABLE'
-        ORDER BY TABLE_NAME
-      `,
-        queryParams
-      )) as [any[], any];
-
-      return rows.map((row) => row.TABLE_NAME);
-    } catch (error) {
-      console.error("Error getting tables:", error);
-      throw error;
-    }
-  }
-
-  async getViews(schema?: string): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      const schemaClause = schema ? "WHERE TABLE_SCHEMA = ?" : "WHERE TABLE_SCHEMA = DATABASE()";
-      const queryParams = schema ? [schema] : [];
-
-      const [rows] = (await this.pool.query(
-        `
-        SELECT TABLE_NAME
-        FROM INFORMATION_SCHEMA.TABLES
-        ${schemaClause}
-        AND TABLE_TYPE = 'VIEW'
-        ORDER BY TABLE_NAME
-      `,
-        queryParams
-      )) as [any[], any];
-
-      return rows.map((row) => row.TABLE_NAME);
-    } catch (error) {
-      console.error("Error getting views:", error);
-      throw error;
-    }
-  }
-
-  async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, if no schema is provided, use the current active database
-      // DATABASE() function returns the name of the current database
-      const schemaClause = schema ? "WHERE TABLE_SCHEMA = ?" : "WHERE TABLE_SCHEMA = DATABASE()";
-
-      const queryParams = schema ? [schema, tableName] : [tableName];
-
-      const [rows] = (await this.pool.query(
-        `
-        SELECT COUNT(*) AS COUNT
-        FROM INFORMATION_SCHEMA.TABLES 
-        ${schemaClause} 
-        AND TABLE_NAME = ?
-      `,
-        queryParams
-      )) as [any[], any];
-
-      return rows[0].COUNT > 0;
-    } catch (error) {
-      console.error("Error checking if table exists:", error);
-      throw error;
-    }
-  }
-
-  async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, if no schema is provided, use the current active database
-      const schemaClause = schema ? "TABLE_SCHEMA = ?" : "TABLE_SCHEMA = DATABASE()";
-
-      const queryParams = schema ? [schema, tableName] : [tableName];
-
-      // Get information about indexes
-      const [indexRows] = (await this.pool.query(
-        `
-        SELECT 
-          INDEX_NAME,
-          COLUMN_NAME,
-          NON_UNIQUE,
-          SEQ_IN_INDEX
-        FROM 
-          INFORMATION_SCHEMA.STATISTICS 
-        WHERE 
-          ${schemaClause}
-          AND TABLE_NAME = ? 
-        ORDER BY 
-          INDEX_NAME, 
-          SEQ_IN_INDEX
-      `,
-        queryParams
-      )) as [any[], any];
-
-      // Process the results to group columns by index
-      const indexMap = new Map<
-        string,
-        {
-          columns: string[];
-          is_unique: boolean;
-          is_primary: boolean;
-        }
-      >();
-
-      for (const row of indexRows) {
-        const indexName = row.INDEX_NAME;
-        const columnName = row.COLUMN_NAME;
-        const isUnique = row.NON_UNIQUE === 0; // In MySQL, NON_UNIQUE=0 means the index is unique
-        const isPrimary = indexName === "PRIMARY";
-
-        if (!indexMap.has(indexName)) {
-          indexMap.set(indexName, {
-            columns: [],
-            is_unique: isUnique,
-            is_primary: isPrimary,
-          });
-        }
-
-        const indexInfo = indexMap.get(indexName)!;
-        indexInfo.columns.push(columnName);
-      }
-
-      // Convert the map to the expected TableIndex format
-      const results: TableIndex[] = [];
-      indexMap.forEach((indexInfo, indexName) => {
-        results.push({
-          index_name: indexName,
-          column_names: indexInfo.columns,
-          is_unique: indexInfo.is_unique,
-          is_primary: indexInfo.is_primary,
-        });
-      });
-
-      return results;
-    } catch (error) {
-      console.error("Error getting table indexes:", error);
-      throw error;
-    }
-  }
-
-  async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, schema is synonymous with database
-      // If no schema is provided, use the current database context via DATABASE() function
-      // This means tables will be retrieved from whatever database the connection is currently using
-      const schemaClause = schema ? "WHERE TABLE_SCHEMA = ?" : "WHERE TABLE_SCHEMA = DATABASE()";
-
-      const queryParams = schema ? [schema, tableName] : [tableName];
-
-      // Get table columns with comments
-      const [rows] = (await this.pool.query(
-        `
-        SELECT
-          COLUMN_NAME as column_name,
-          DATA_TYPE as data_type,
-          IS_NULLABLE as is_nullable,
-          COLUMN_DEFAULT as column_default,
-          COLUMN_COMMENT as description
-        FROM INFORMATION_SCHEMA.COLUMNS
-        ${schemaClause}
-        AND TABLE_NAME = ?
-        ORDER BY ORDINAL_POSITION
-      `,
-        queryParams
-      )) as [any[], any];
-
-      // Normalize empty string comments to null for token-efficient output
-      return rows.map((row: any) => ({
-        ...row,
-        description: row.description || null,
-      }));
-    } catch (error) {
-      console.error("Error getting table schema:", error);
-      throw error;
-    }
-  }
-
-  async getTableComment(tableName: string, schema?: string): Promise<string | null> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      const schemaClause = schema ? "WHERE TABLE_SCHEMA = ?" : "WHERE TABLE_SCHEMA = DATABASE()";
-      const queryParams = schema ? [schema, tableName] : [tableName];
-
-      const [rows] = (await this.pool.query(
-        `
-        SELECT TABLE_COMMENT
-        FROM INFORMATION_SCHEMA.TABLES
-        ${schemaClause}
-        AND TABLE_NAME = ?
-      `,
-        queryParams
-      )) as [any[], any];
-
-      if (rows.length > 0) {
-        return rows[0].TABLE_COMMENT || null;
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async getHealthCheck(): Promise<HealthCheckResult> {
+  /**
+   * Row-array query adapter over the pool for the shared MySQL-family
+   * introspection and health-check code. Throws when not connected, so the
+   * shared functions never see a missing pool. mysql2 resolves to
+   * [rows, fields]; only the rows are handed on.
+   */
+  private requireQuery(): MySQLFamilyQuery {
     if (!this.pool) {
       throw new Error("Not connected to database");
     }
     const pool = this.pool;
-    return getMySQLFamilyHealthCheck(async (sql) => {
-      const [rows] = (await pool.query(sql)) as [any[], any];
+    return async (sql, params) => {
+      const [rows] = (await (params === undefined ? pool.query(sql) : pool.query(sql, params))) as [
+        any[],
+        any,
+      ];
       return rows;
-    });
+    };
+  }
+
+  async getSchemas(): Promise<string[]> {
+    return introspection.getSchemas(this.requireQuery());
+  }
+
+  async getTables(schema?: string): Promise<string[]> {
+    return introspection.getTables(this.requireQuery(), schema);
+  }
+
+  async getViews(schema?: string): Promise<string[]> {
+    return introspection.getViews(this.requireQuery(), schema);
+  }
+
+  async tableExists(tableName: string, schema?: string): Promise<boolean> {
+    return introspection.tableExists(this.requireQuery(), tableName, schema);
+  }
+
+  async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
+    return introspection.getTableIndexes(this.requireQuery(), tableName, schema);
+  }
+
+  async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
+    return introspection.getTableSchema(this.requireQuery(), tableName, schema);
+  }
+
+  async getTableComment(tableName: string, schema?: string): Promise<string | null> {
+    return introspection.getTableComment(this.requireQuery(), tableName, schema);
+  }
+
+  async getHealthCheck(): Promise<HealthCheckResult> {
+    return getMySQLFamilyHealthCheck(this.requireQuery());
   }
 
   async getStoredProcedures(schema?: string, routineType?: "procedure" | "function"): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, if no schema is provided, use the current database context
-      const schemaClause = schema
-        ? "WHERE ROUTINE_SCHEMA = ?"
-        : "WHERE ROUTINE_SCHEMA = DATABASE()";
-
-      const queryParams: string[] = schema ? [schema] : [];
-
-      // Build optional routine type filter
-      let typeFilter = "";
-      if (routineType === "function") {
-        typeFilter = " AND ROUTINE_TYPE = 'FUNCTION'";
-      } else if (routineType === "procedure") {
-        typeFilter = " AND ROUTINE_TYPE = 'PROCEDURE'";
-      }
-
-      // Get stored procedures and/or functions
-      const [rows] = (await this.pool.query(
-        `
-        SELECT ROUTINE_NAME
-        FROM INFORMATION_SCHEMA.ROUTINES
-        ${schemaClause}${typeFilter}
-        ORDER BY ROUTINE_NAME
-      `,
-        queryParams
-      )) as [any[], any];
-
-      return rows.map((row) => row.ROUTINE_NAME);
-    } catch (error) {
-      console.error("Error getting stored procedures:", error);
-      throw error;
-    }
+    return introspection.getStoredProcedures(this.requireQuery(), schema, routineType);
   }
 
   async getStoredProcedureDetail(procedureName: string, schema?: string): Promise<StoredProcedure> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    try {
-      // In MySQL, if no schema is provided, use the current database context
-      const schemaClause = schema
-        ? "WHERE r.ROUTINE_SCHEMA = ?"
-        : "WHERE r.ROUTINE_SCHEMA = DATABASE()";
-
-      const queryParams = schema ? [schema, procedureName] : [procedureName];
-
-      // Get details of the stored procedure
-      const [rows] = (await this.pool.query(
-        `
-        SELECT 
-          r.ROUTINE_NAME AS procedure_name,
-          CASE 
-            WHEN r.ROUTINE_TYPE = 'PROCEDURE' THEN 'procedure'
-            ELSE 'function'
-          END AS procedure_type,
-          LOWER(r.ROUTINE_TYPE) AS routine_type,
-          r.ROUTINE_DEFINITION,
-          r.DTD_IDENTIFIER AS return_type,
-          (
-            SELECT GROUP_CONCAT(
-              CONCAT(p.PARAMETER_NAME, ' ', p.PARAMETER_MODE, ' ', p.DATA_TYPE)
-              ORDER BY p.ORDINAL_POSITION
-              SEPARATOR ', '
-            )
-            FROM INFORMATION_SCHEMA.PARAMETERS p
-            WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA
-            AND p.SPECIFIC_NAME = r.ROUTINE_NAME
-            AND p.PARAMETER_NAME IS NOT NULL
-          ) AS parameter_list
-        FROM INFORMATION_SCHEMA.ROUTINES r
-        ${schemaClause}
-        AND r.ROUTINE_NAME = ?
-      `,
-        queryParams
-      )) as [any[], any];
-
-      if (rows.length === 0) {
-        const schemaName = schema || "current schema";
-        throw new Error(`Stored procedure '${procedureName}' not found in ${schemaName}`);
-      }
-
-      const procedure = rows[0];
-
-      // If ROUTINE_DEFINITION is NULL, try to get the procedure body from mysql.proc
-      let definition = procedure.ROUTINE_DEFINITION;
-
-      try {
-        const schemaValue = schema || (await this.getCurrentSchema());
-
-        // For full definition - different approaches based on type
-        const quotedSchema = quoteIdentifier(schemaValue, "mysql");
-        const quotedProcName = quoteIdentifier(procedureName, "mysql");
-        if (procedure.procedure_type === "procedure") {
-          // Try to get the definition from SHOW CREATE PROCEDURE
-          try {
-            const [defRows] = (await this.pool.query(`
-              SHOW CREATE PROCEDURE ${quotedSchema}.${quotedProcName}
-            `)) as [any[], any];
-
-            if (defRows && defRows.length > 0) {
-              definition = defRows[0]["Create Procedure"];
-            }
-          } catch (err) {
-            console.error(`Error getting procedure definition with SHOW CREATE: ${err}`);
-          }
-        } else {
-          // Try to get the definition for functions
-          try {
-            const [defRows] = (await this.pool.query(`
-              SHOW CREATE FUNCTION ${quotedSchema}.${quotedProcName}
-            `)) as [any[], any];
-
-            if (defRows && defRows.length > 0) {
-              definition = defRows[0]["Create Function"];
-            }
-          } catch (innerErr) {
-            console.error(`Error getting function definition with SHOW CREATE: ${innerErr}`);
-          }
-        }
-
-        // Last attempt - try to get from information_schema.routines if not found yet
-        if (!definition) {
-          const [bodyRows] = (await this.pool.query(
-            `
-            SELECT ROUTINE_DEFINITION, ROUTINE_BODY 
-            FROM INFORMATION_SCHEMA.ROUTINES
-            WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ?
-          `,
-            [schemaValue, procedureName]
-          )) as [any[], any];
-
-          if (bodyRows && bodyRows.length > 0) {
-            if (bodyRows[0].ROUTINE_DEFINITION) {
-              definition = bodyRows[0].ROUTINE_DEFINITION;
-            } else if (bodyRows[0].ROUTINE_BODY) {
-              definition = bodyRows[0].ROUTINE_BODY;
-            }
-          }
-        }
-      } catch (error) {
-        // Ignore errors when getting definition - it's optional
-        console.error(`Error getting procedure/function details: ${error}`);
-      }
-
-      return {
-        procedure_name: procedure.procedure_name,
-        procedure_type: procedure.procedure_type,
-        language: "sql", // MySQL procedures are generally in SQL
-        parameter_list: procedure.parameter_list || "",
-        return_type: procedure.routine_type === "function" ? procedure.return_type : undefined,
-        definition: definition || undefined,
-      };
-    } catch (error) {
-      console.error("Error getting stored procedure detail:", error);
-      throw error;
-    }
+    return introspection.getStoredProcedureDetail(this.requireQuery(), procedureName, schema);
   }
 
-  // Helper method to get current schema (database) name
-  private async getCurrentSchema(): Promise<string> {
-    const [rows] = (await this.pool!.query("SELECT DATABASE() AS DB")) as [any[], any];
-    return rows[0].DB;
-  }
-
-  /**
-   * Default search scope = the database named in the DSN. DATABASE() returns
-   * null when the connection was opened without a database, in which case
-   * callers fall back to the full server-wide schema list.
-   */
   async getDefaultSchema(): Promise<string | null> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-    const [rows] = (await this.pool.query("SELECT DATABASE() AS DB")) as [any[], any];
-    return rows[0]?.DB ?? null;
+    return introspection.getDefaultSchema(this.requireQuery());
   }
 
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
@@ -666,11 +299,12 @@ export class MySQLConnector implements Connector {
     // Get a dedicated connection from the pool to ensure session consistency
     // This is critical for session-specific features like LAST_INSERT_ID()
     const conn = await this.pool.getConnection();
-    // Captured up front: once a timeout fires, mysql2's own connection.threadId
-    // getter still works, but reading it after the fact races the impending
-    // conn.destroy() below.
+    // Captured up front, before a timeout can lead to conn.destroy() below.
     const threadId = conn.threadId;
-    let isConnectionPoisoned = false;
+    let isConnectionDiscarded = false;
+    // The client-side deadline trails the server-side one (see query-timeout.ts).
+    const timeout =
+      this.queryTimeoutMs !== undefined ? clientQueryTimeoutMs(this.queryTimeoutMs) : undefined;
     try {
       // Engine-level read-only backstop (shared with MariaDB); see
       // withReadOnlyTransaction for the semantics and the TiDB caveat.
@@ -701,9 +335,9 @@ export class MySQLConnector implements Connector {
           // Pass parameters if provided, with optional query timeout
           let results: any;
           if (parameters && parameters.length > 0) {
-            results = await conn.query({ sql: processedSQL, timeout: this.queryTimeoutMs }, parameters);
+            results = await conn.query({ sql: processedSQL, timeout }, parameters);
           } else {
-            results = await conn.query({ sql: processedSQL, timeout: this.queryTimeoutMs });
+            results = await conn.query({ sql: processedSQL, timeout });
           }
 
           // MySQL2 returns results in format [rows, fields]
@@ -728,23 +362,20 @@ export class MySQLConnector implements Connector {
     } catch (error) {
       if (isClientSideTimeout(error)) {
         // mysql2's `timeout` option only aborts client-side: the statement
-        // keeps running on the server and this connection's command queue
-        // still thinks that statement is in flight (see isClientSideTimeout).
-        // Best-effort kill the server-side statement over a fresh connection
+        // keeps running on the server, and this connection's command queue
+        // still thinks that statement is in flight, so returning it to the
+        // pool would silently block whichever caller draws it next. Per
+        // mysql2's own documented contract, a timed-out connection must be
+        // destroyed, not reused. Destroy it first, so its pool slot is free
+        // for the kill below, then best-effort kill the server-side statement
         // so the timeout actually frees whatever the query was holding.
-        isConnectionPoisoned = true;
+        isConnectionDiscarded = true;
+        conn.destroy();
         await this.killQuery(threadId);
       }
       throw error;
     } finally {
-      if (isConnectionPoisoned) {
-        // The command queue on this connection is stuck behind the timed-out
-        // statement's still-pending server response; returning it to the pool
-        // would silently block whichever caller draws it next. Per mysql2's
-        // own documented contract, a timed-out connection must be destroyed,
-        // not reused.
-        conn.destroy();
-      } else {
+      if (!isConnectionDiscarded) {
         conn.release();
       }
     }
@@ -756,10 +387,8 @@ export class MySQLConnector implements Connector {
    * queue is stuck behind the abandoned statement (see isClientSideTimeout)
    * and cannot itself be used to send KILL QUERY.
    *
-   * Bounded by its own short timeout, independent of the user's (possibly
-   * long or unset) query_timeout — KILL QUERY is metadata-only and should
-   * return almost immediately on a healthy server, so cleanup must not stall
-   * indefinitely if it doesn't.
+   * Bounded by its own short timeout (CANCEL_QUERY_TIMEOUT_MS), independent
+   * of the user's query_timeout.
    */
   private async killQuery(threadId: number): Promise<void> {
     if (!this.pool) return;
@@ -767,7 +396,7 @@ export class MySQLConnector implements Connector {
     let killerPoisoned = false;
     try {
       killer = await this.pool.getConnection();
-      await killer.query({ sql: `KILL QUERY ${threadId}`, timeout: MySQLConnector.KILL_QUERY_TIMEOUT_MS });
+      await killer.query({ sql: `KILL QUERY ${threadId}`, timeout: CANCEL_QUERY_TIMEOUT_MS });
     } catch (error) {
       // Unconfirmed cancellation: the statement may still be running on the
       // server. Nothing more to do from here — the caller already sees the

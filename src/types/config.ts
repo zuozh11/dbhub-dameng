@@ -13,6 +13,13 @@ export interface SSHConfig {
   ssh_key?: string;
   ssh_passphrase?: string;
   /**
+   * Internal, not a TOML option: set when `ssh_key` was picked up from `~/.ssh/config`
+   * while resolving `--ssh-host`, so it is not mistaken for an explicitly configured key.
+   */
+  ssh_key_discovered?: boolean;
+  /** Path to an SSH agent socket (overrides SSH_AUTH_SOCK for this source) */
+  ssh_agent?: string;
+  /**
    * ProxyJump configuration for multi-hop SSH connections.
    * Comma-separated list of jump hosts: "jump1.example.com,user@jump2.example.com:2222"
    */
@@ -54,7 +61,7 @@ export interface SourceConfig extends ConnectionParams, SSHConfig {
   description?: string; // Human-readable description of this data source
   dsn?: string;
   connection_timeout?: number; // Connection timeout in seconds
-  query_timeout?: number; // Query timeout in seconds (PostgreSQL, MySQL, MariaDB, SQL Server)
+  query_timeout?: number; // Query timeout in seconds (all but SQLite). PostgreSQL/MySQL/MariaDB enforce it on the server, with a client-side fallback (see utils/query-timeout.ts)
   pool_max_connections?: number; // Maximum PostgreSQL connections per source (1-1000)
   init_script?: string; // Optional SQL script to run on connection (for demo mode or initialization)
   lazy?: boolean; // Defer connection until first query (default: false)

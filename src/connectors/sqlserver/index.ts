@@ -20,13 +20,9 @@ import { SafeURL } from "../../utils/safe-url.js";
 import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
 import { LEADING_SQL_NOISE, splitSQLStatements, stripCommentsAndStrings } from "../../utils/sql-parser.js";
-import {
-  sqlServerDynamicSqlKeywords,
-  sqlServerDynamicSqlPattern,
-  sqlServerPassThroughKeywords,
-  sqlServerPassThroughPattern,
-} from "../../utils/allowed-keywords.js";
 import { closeQuietly } from "../../utils/resource-cleanup.js";
+import { assertNoReadOnlyEscapes, bindParameters } from "./request-helpers.js";
+import { explainAnalyzeQuery, explainQuery, parseExplainPrefix } from "./explain.js";
 
 /**
  * SQL Server DSN parser
@@ -191,20 +187,6 @@ export class SQLServerConnector implements Connector {
   private config?: sql.config;
   // Source ID is set by ConnectorManager after cloning
   private sourceId: string = "default";
-
-  /** Boolean spellings PostgreSQL accepts for an EXPLAIN option. */
-  private static readonly EXPLAIN_ON = /^(?:true|on|1)$/i;
-  private static readonly EXPLAIN_OFF = /^(?:false|off|0)$/i;
-
-  /**
-   * One option inside `EXPLAIN (...)`: a name, then optionally a value written
-   * either space-separated as PostgreSQL spells it (`ANALYZE false`) or with an
-   * equals sign, which the read-only classifier also accepts (`ANALYZE = 0`).
-   */
-  private static readonly EXPLAIN_OPTION = /^([A-Za-z_]+)(?:(?:\s*=\s*|\s+)(\S+))?$/;
-
-  /** A disabling boolean directly after a bare `EXPLAIN ANALYZE`. */
-  private static readonly EXPLAIN_BARE_DISABLED = /^(?:=\s*)?(?:false|off|0)\b/i;
 
   getId(): string {
     return this.sourceId;
@@ -734,7 +716,7 @@ export class SQLServerConnector implements Connector {
   }
 
   async executeSQL(sqlQuery: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
-    if (!this.connection) {
+    if (!this.connection || !this.config) {
       throw new Error("Not connected to SQL Server database");
     }
 
@@ -748,29 +730,56 @@ export class SQLServerConnector implements Connector {
     // that form maps to SET STATISTICS XML instead (see explainAnalyzeQuery).
     const afterNoise = sqlQuery.replace(LEADING_SQL_NOISE, "");
     if (/^explain\b/i.test(afterNoise)) {
-      const { analyze, query } = SQLServerConnector.parseExplainPrefix(
+      const { analyze, query } = parseExplainPrefix(
         afterNoise.slice("explain".length).trim()
       );
       return analyze
-        ? this.explainAnalyzeQuery(query, options, parameters)
-        : this.explainQuery(query, options.readonly, parameters);
+        ? explainAnalyzeQuery(this.config, query, options, parameters)
+        : explainQuery(this.config, query, options.readonly, parameters);
     }
 
     try {
-      // Apply maxRows limit (with a truncation probe row) to SELECT queries if specified
-      let processedSQL = sqlQuery;
-      let probeApplied = false;
-      if (options.maxRows) {
-        const rewrite = SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
-          sqlQuery,
-          options.maxRows
-        );
-        processedSQL = rewrite.sql;
-        probeApplied = rewrite.probeApplied;
-      }
       // Computed once and threaded into buildResultSets below (directly, or via
       // executeReadOnly) rather than re-derived from SQL text on every call.
-      const isSingleStatement = splitSQLStatements(processedSQL, "sqlserver").length === 1;
+      const statements = splitSQLStatements(sqlQuery, "sqlserver");
+      const isSingleStatement = statements.length === 1;
+
+      // Apply maxRows limit (with a truncation probe row) to every row-returning
+      // statement of the batch, so a SELECT after the leading statement is capped
+      // too. A single statement is rewritten in place so its text (trailing
+      // semicolon, surrounding whitespace) reaches the server as written.
+      // The splitter drops the batch's final semicolon, which a trailing MERGE
+      // requires, so it is put back when the source had one.
+      let processedSQL = sqlQuery;
+      if (options.maxRows) {
+        const maxRows = options.maxRows;
+        if (isSingleStatement) {
+          processedSQL = SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sqlQuery, maxRows).sql;
+        } else {
+          // Reconstructed semicolons go on their own line: the splitter trims
+          // each segment, so one that ends in a `--` line comment would
+          // otherwise swallow a semicolon placed on the same line.
+          const terminator = sqlQuery.trimEnd().endsWith(";") ? "\n;" : "";
+          // The splitter cannot tell a batch statement from a semicolon-
+          // terminated statement inside a module body (T-SQL has no body
+          // quoting), and a CREATE/ALTER PROCEDURE/FUNCTION/TRIGGER body runs
+          // to the end of the batch. Rewriting from there on would bake TOP
+          // into the stored definition, so segments from the first module
+          // definition onward are sent as written.
+          const moduleStart = statements.findIndex((statement) =>
+            SQLServerConnector.MODULE_DEFINITION.test(stripCommentsAndStrings(statement, "sqlserver"))
+          );
+          const rewritable = moduleStart === -1 ? statements.length : moduleStart;
+          processedSQL =
+            statements
+              .map((statement, i) =>
+                i < rewritable
+                  ? SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(statement, maxRows).sql
+                  : statement
+              )
+              .join("\n;\n") + terminator;
+        }
+      }
 
       // Engine-level read-only enforcement: SQL Server has no
       // BEGIN TRANSACTION READ ONLY, so we wrap in a transaction and
@@ -782,7 +791,6 @@ export class SQLServerConnector implements Connector {
           parameters,
           isSingleStatement ? sqlQuery : undefined,
           options.maxRows,
-          probeApplied
         );
       }
 
@@ -802,7 +810,7 @@ export class SQLServerConnector implements Connector {
         }
       );
 
-      SQLServerConnector.bindParameters(request, parameters);
+      bindParameters(request, parameters);
 
       const result = await request.query(processedSQL);
 
@@ -810,12 +818,8 @@ export class SQLServerConnector implements Connector {
         result.recordsets,
         result.rowsAffected,
         isSingleStatement ? sqlQuery : undefined,
+        options.maxRows,
       );
-      // The TOP probe rewrite applies to the batch's leading SELECT, whose
-      // rows land in the first result set.
-      if (resultSets.length > 0) {
-        SQLRowLimiter.flagTruncation(resultSets[0], options.maxRows, probeApplied);
-      }
       return {
         resultSets,
         ...(messages.length > 0 ? { messages } : {}),
@@ -847,19 +851,43 @@ export class SQLServerConnector implements Connector {
    * multi-statement batch there's no reliable way to say which source
    * statement a given recordset (or the trailing writes set) came from.
    */
+  /** A segment that opens a module whose body extends to the end of the batch. */
+  private static readonly MODULE_DEFINITION =
+    /^\s*(?:create|alter)\s+(?:or\s+alter\s+)?(?:proc|procedure|function|trigger)\b/i;
+
+  /**
+   * Builds one result set per recordset. With `maxRows`, every set is capped:
+   * a statement the TOP/FETCH probe rewrite reached returns at most
+   * maxRows + 1 rows, and more than maxRows rows means the cap fired, so the
+   * probe row is dropped and the set flagged truncated. The same check also
+   * bounds result sets the rewrite could not reach (a stored procedure's
+   * output, say): those are trimmed to maxRows and flagged the same way. A
+   * statement whose own TOP/FETCH is within the cap never exceeds maxRows
+   * rows, so it is never flagged. Recordsets do not map 1:1 onto statements
+   * (a SELECT ... INTO returns none, an EXEC may return several), which is
+   * why the check is per result set rather than per rewritten statement.
+   */
   private static buildResultSets(
     recordsets: any,
     rowsAffected: number[] | undefined,
     sourceSql: string | undefined,
+    maxRows?: number,
   ): SQLResultSet[] {
     const sets: SQLResultSet[] = (recordsets ?? []).map((recordset: any) => {
       const rows = recordset ?? [];
       return { rows, rowCount: rows.length };
     });
 
+    // Rows the SELECTs returned are counted before any probe row is dropped
+    // below: rowsAffected counts that row too, so trimming first would make it
+    // look like a write and append a spurious empty result set.
     const totalAffected = (rowsAffected ?? []).reduce((total, count) => total + (count ?? 0), 0);
     const accountedFor = sets.reduce((total, set) => total + set.rowCount, 0);
     const writesOnly = totalAffected - accountedFor;
+
+    for (const set of sets) {
+      SQLRowLimiter.flagTruncation(set, maxRows, true);
+    }
 
     if (sets.length === 0) {
       sets.push({ rows: [], rowCount: totalAffected });
@@ -878,91 +906,6 @@ export class SQLServerConnector implements Connector {
   }
 
   /**
-   * Bind positional parameters as @p1, @p2, ... inferring the SQL Server type
-   * from each JavaScript value. Shared by every execution path so they cannot
-   * drift in how a given value is typed.
-   *
-   * Works for `batch` as well as `query`: node-mssql prepends the matching
-   * DECLARE/SET statements when the request is a batch.
-   */
-  private static bindParameters(request: sql.Request, parameters?: any[]): void {
-    if (!parameters || parameters.length === 0) {
-      return;
-    }
-
-    parameters.forEach((param, index) => {
-      const paramName = `p${index + 1}`;
-      if (typeof param === 'string') {
-        request.input(paramName, sql.VarChar, param);
-      } else if (typeof param === 'number') {
-        if (Number.isInteger(param)) {
-          request.input(paramName, sql.Int, param);
-        } else {
-          request.input(paramName, sql.Float, param);
-        }
-      } else if (typeof param === 'boolean') {
-        request.input(paramName, sql.Bit, param);
-      } else if (param === null || param === undefined) {
-        request.input(paramName, sql.VarChar, param);
-      } else if (Array.isArray(param)) {
-        // For arrays, convert to JSON string
-        request.input(paramName, sql.VarChar, JSON.stringify(param));
-      } else {
-        // For objects, convert to JSON string
-        request.input(paramName, sql.VarChar, JSON.stringify(param));
-      }
-    });
-  }
-
-  /**
-   * Reject the constructs that escape SQL Server's read-only guards, for use by
-   * both read-only execution paths.
-   *
-   * - Dynamic SQL (sqlServerDynamicSqlKeywords): can carry hidden COMMIT/ROLLBACK
-   *   inside string literals that stripCommentsAndStrings removes
-   * - Pass-through data sources (sqlServerPassThroughKeywords): execute on a
-   *   remote or ad-hoc source, so a local rollback never reaches them
-   * - COMMIT/ROLLBACK, when `transactionControl` is set: would end the wrapping
-   *   transaction, letting writes persist. Only meaningful for the transaction
-   *   path; the EXPLAIN path opens no transaction of its own.
-   *
-   * Both keyword lists are imported from the read-only classifier rather than
-   * redeclared, so the classifier and these backstops cannot drift apart.
-   *
-   * Note the COMMIT/ROLLBACK check is SQL Server-only by design. MySQL/MariaDB
-   * wrap batches in a transaction too, but there `commit`, `prepare` and
-   * `execute` are absent from their allow-lists in allowedKeywords, and
-   * execute-sql.ts requires every split statement to pass the classifier — so a
-   * transaction-control statement can never reach their backstop.
-   */
-  private assertNoReadOnlyEscapes(
-    sqlText: string,
-    { transactionControl = false }: { transactionControl?: boolean } = {},
-  ): void {
-    const cleaned = stripCommentsAndStrings(sqlText, "sqlserver").toLowerCase();
-
-    if (transactionControl && /\b(?:commit|rollback)\b/.test(cleaned)) {
-      throw new Error(
-        "Read-only mode: transaction control statements (COMMIT, ROLLBACK) are not allowed",
-      );
-    }
-    if (sqlServerDynamicSqlPattern.test(cleaned)) {
-      throw new Error(
-        `Read-only mode: dynamic SQL execution (${sqlServerDynamicSqlKeywords
-          .map((k) => k.toUpperCase())
-          .join(", ")}) is not allowed`,
-      );
-    }
-    if (sqlServerPassThroughPattern.test(cleaned)) {
-      throw new Error(
-        `Read-only mode: pass-through data sources (${sqlServerPassThroughKeywords
-          .map((k) => k.toUpperCase())
-          .join(", ")}) are not allowed`,
-      );
-    }
-  }
-
-  /**
    * Execute a query inside a transaction that always rolls back, preventing
    * any modifications from persisting. SQL Server has no native READ ONLY
    * transaction mode, so this is the defense-in-depth backstop behind the
@@ -978,9 +921,8 @@ export class SQLServerConnector implements Connector {
     // multi-statement batches, where attribution would be a guess.
     sourceSql: string | undefined,
     maxRows: number | undefined,
-    probeApplied: boolean,
   ): Promise<SQLResult> {
-    this.assertNoReadOnlyEscapes(processedSQL, { transactionControl: true });
+    assertNoReadOnlyEscapes(processedSQL, { transactionControl: true });
 
     const transaction = new sql.Transaction(this.connection!);
     await transaction.begin();
@@ -999,7 +941,7 @@ export class SQLServerConnector implements Connector {
       },
     );
 
-    SQLServerConnector.bindParameters(request, parameters);
+    bindParameters(request, parameters);
 
     let result;
     let queryFailed = false;
@@ -1023,332 +965,14 @@ export class SQLServerConnector implements Connector {
       result.recordsets,
       result.rowsAffected,
       sourceSql,
+      maxRows,
     );
-    // The TOP probe rewrite applies to the batch's leading SELECT, whose rows
-    // land in the first result set.
-    if (resultSets.length > 0) {
-      SQLRowLimiter.flagTruncation(resultSets[0], maxRows, probeApplied);
-    }
     return {
       resultSets,
       ...(messages.length > 0 ? { messages } : {}),
     };
   }
 
-  /**
-   * Return the estimated execution plan for a query using SHOWPLAN_XML.
-   *
-   * SHOWPLAN_XML compiles the statement and returns its plan without executing
-   * it, but it has two constraints: `SET SHOWPLAN_XML ON` must be the only
-   * statement in its batch, and the setting is session scoped. The shared pool
-   * hands out a fresh connection per request() and an open transaction
-   * suppresses SHOWPLAN, so neither can carry the setting to a follow-up query.
-   *
-   * We therefore run the SET / query pair on a short-lived, single-connection
-   * pool built from the same config. The dedicated session keeps SHOWPLAN state
-   * off the shared pool, so a concurrent query can never land on a connection
-   * with SHOWPLAN enabled (which would return a plan instead of its results).
-   */
-  private async explainQuery(
-    innerQuery: string,
-    readonly?: boolean,
-    parameters?: any[]
-  ): Promise<SQLResult> {
-    // Validate against comment/string-stripped SQL so comment-only input counts
-    // as empty and a SET SHOWPLAN can't hide behind comments.
-    const cleaned = stripCommentsAndStrings(innerQuery, "sqlserver").trim();
-    if (!cleaned) {
-      throw new Error("EXPLAIN requires a statement to analyze");
-    }
-
-    // EXPLAIN is routed here before the read-only branch in executeSQL, so it
-    // opens no rolling-back transaction. SHOWPLAN_XML compiles without
-    // executing, but that single session toggle would otherwise be the whole
-    // guarantee — apply the same escape checks as executeReadOnly. Skipped
-    // outside read-only mode, where explaining an EXEC is legitimate.
-    if (readonly) {
-      this.assertNoReadOnlyEscapes(innerQuery);
-    }
-
-    // Defense in depth: the SET SHOWPLAN session toggle is what makes EXPLAIN
-    // non-executing, so the explained statement must not disable it. SQL Server
-    // already rejects `SET SHOWPLAN_* OFF` alongside other statements in a
-    // batch, but enforcing it here keeps the read-only guarantee self-contained.
-    if (/\bset\s+showplan/i.test(cleaned)) {
-      throw new Error("EXPLAIN does not support SET SHOWPLAN statements");
-    }
-
-    if (!this.config) {
-      throw new Error("Not connected to SQL Server database");
-    }
-
-    const explainPool = new sql.ConnectionPool({
-      ...this.config,
-      pool: { ...this.config.pool, max: 1, min: 1 },
-    });
-
-    try {
-      await explainPool.connect();
-      // max:1 + sequential awaits guarantee both batches hit the same session.
-      await explainPool.request().batch("SET SHOWPLAN_XML ON");
-
-      // The parameters belong on the statement being explained, not on the
-      // toggle. node-mssql turns them into DECLARE/SET, which SHOWPLAN compiles
-      // without executing — so the plan is the one for a parameterized query,
-      // estimated from density rather than from the literal values.
-      const planRequest = explainPool.request();
-      SQLServerConnector.bindParameters(planRequest, parameters);
-      const planResult = await planRequest.batch(innerQuery);
-
-      // The plan is returned as the single column of the first row.
-      const planRow = planResult.recordset?.[0];
-      const planXml = planRow ? Object.values(planRow)[0] : null;
-      return {
-        resultSets: [
-          {
-            rows: planXml != null ? [{ plan: planXml }] : [],
-            rowCount: planXml != null ? 1 : 0,
-          },
-        ],
-      };
-    } catch (error) {
-      throw new Error(`Failed to explain query: ${(error as Error).message}`);
-    } finally {
-      await explainPool.close();
-    }
-  }
-
-  /**
-   * Splits the modifiers between EXPLAIN and its statement, covering the same
-   * forms the read-only classifier recognises (see utils/allowed-keywords.ts):
-   * `ANALYZE`, `ANALYZE VERBOSE`, `(ANALYZE)`, `(ANALYZE, BUFFERS)`,
-   * `(ANALYZE false)`.
-   *
-   * Only ANALYZE carries a meaning here — it selects STATISTICS XML over
-   * SHOWPLAN_XML. The rest are PostgreSQL planner knobs with no SQL Server
-   * counterpart, so they are refused by name: silently dropping an option would
-   * quietly hand back something other than what was asked for.
-   */
-  private static parseExplainPrefix(afterExplain: string): { analyze: boolean; query: string } {
-    // Parenthesized list: (ANALYZE, ...) <statement>
-    if (afterExplain.startsWith("(")) {
-      const close = afterExplain.indexOf(")");
-      if (close < 0) {
-        throw new Error("EXPLAIN option list is missing its closing ')'");
-      }
-
-      let analyze = false;
-      for (const part of afterExplain.slice(1, close).split(",")) {
-        const token = part.trim();
-        if (!token) continue;
-
-        const parsed = SQLServerConnector.EXPLAIN_OPTION.exec(token);
-        if (!parsed) {
-          throw new Error(
-            `EXPLAIN option '${token}' is not supported on SQL Server — only ANALYZE is.`
-          );
-        }
-
-        const name = parsed[1];
-        if (!/^analyze$/i.test(name)) {
-          throw new Error(
-            `EXPLAIN option '${name}' is not supported on SQL Server — only ANALYZE is.`
-          );
-        }
-
-        const value = parsed[2];
-        if (value === undefined || SQLServerConnector.EXPLAIN_ON.test(value)) {
-          analyze = true;
-        } else if (SQLServerConnector.EXPLAIN_OFF.test(value)) {
-          analyze = false;
-        } else {
-          throw new Error(`EXPLAIN option 'ANALYZE' expects a boolean, got '${value}'.`);
-        }
-      }
-
-      return { analyze, query: afterExplain.slice(close + 1).trim() };
-    }
-
-    // Bare form: [ANALYZE [VERBOSE]] <statement>
-    const analyzeKeyword = /^analyze\b/i.exec(afterExplain);
-    if (!analyzeKeyword) {
-      return { analyze: false, query: afterExplain };
-    }
-
-    const rest = afterExplain.slice(analyzeKeyword[0].length).trim();
-
-    // PostgreSQL only takes a boolean in the parenthesized form, but the
-    // read-only classifier reads a disabling value here too — `ANALYZE false`,
-    // `ANALYZE = 0` — as a plain EXPLAIN. Left unhandled, the two layers
-    // disagree in the dangerous direction: the classifier waives the DML check
-    // for what it believes is a non-executing statement, while this path routes
-    // to the one that executes.
-    const disabled = SQLServerConnector.EXPLAIN_BARE_DISABLED.exec(rest);
-    if (disabled) {
-      return { analyze: false, query: rest.slice(disabled[0].length).trim() };
-    }
-
-    const trailing = /^([A-Za-z_]+)\b/.exec(rest);
-    if (trailing && /^verbose$/i.test(trailing[1])) {
-      throw new Error(
-        "EXPLAIN option 'VERBOSE' is not supported on SQL Server — only ANALYZE is."
-      );
-    }
-
-    return { analyze: true, query: rest };
-  }
-
-  /**
-   * Run a statement under SET STATISTICS XML and return its *actual* execution
-   * plan — the Postgres `EXPLAIN ANALYZE` contract.
-   *
-   * SHOWPLAN_XML (plain EXPLAIN) compiles without executing, so its plan carries
-   * only estimates. STATISTICS XML runs the statement, so the plan reports real
-   * row counts and execution counts. The flip side is that this path is *not*
-   * inherently read-only the way explainQuery is, so under `options.readonly` the
-   * statement runs inside a transaction that always rolls back.
-   *
-   * The dedicated single-connection pool serves the same purpose as in
-   * explainQuery: the STATISTICS XML session toggle must never leak onto a
-   * shared pool connection, where a concurrent query would inherit it.
-   */
-  private async explainAnalyzeQuery(
-    innerQuery: string,
-    options: ExecuteOptions,
-    parameters?: any[]
-  ): Promise<SQLResult> {
-    // Validate against comment/string-stripped SQL so comment-only input counts
-    // as empty and a SET STATISTICS can't hide behind comments.
-    const cleaned = stripCommentsAndStrings(innerQuery, "sqlserver").trim();
-    if (!cleaned) {
-      throw new Error("EXPLAIN ANALYZE requires a statement to analyze");
-    }
-
-    // Defense in depth: the SET STATISTICS XML toggle is what yields the plan,
-    // so the analyzed statement must not disable it or swap in SHOWPLAN — the
-    // latter would suppress execution, and the actual counts with it.
-    if (/\bset\s+statistics\b/i.test(cleaned)) {
-      throw new Error("EXPLAIN ANALYZE does not support SET STATISTICS statements");
-    }
-    if (/\bset\s+showplan\b/i.test(cleaned)) {
-      throw new Error("EXPLAIN ANALYZE does not support SET SHOWPLAN statements");
-    }
-
-    // Unlike plain EXPLAIN, this path executes, and its only read-only guard is
-    // the application-level rollback below — so the escapes matter more here,
-    // not less. transactionControl is set because that rollback is a real
-    // transaction a COMMIT could close, which is not true of explainQuery.
-    if (options.readonly) {
-      this.assertNoReadOnlyEscapes(innerQuery, { transactionControl: true });
-    }
-
-    if (!this.config) {
-      throw new Error("Not connected to SQL Server database");
-    }
-
-    const explainPool = new sql.ConnectionPool({
-      ...this.config,
-      pool: { ...this.config.pool, max: 1, min: 1 },
-    });
-
-    try {
-      await explainPool.connect();
-      // max:1 + sequential awaits guarantee every batch hits the same session.
-      await explainPool.request().batch("SET STATISTICS XML ON");
-
-      let planResult: sql.IResult<any>;
-      if (options.readonly) {
-        planResult = await SQLServerConnector.batchRolledBack(
-          explainPool,
-          innerQuery,
-          parameters
-        );
-      } else {
-        const planRequest = explainPool.request();
-        SQLServerConnector.bindParameters(planRequest, parameters);
-        planResult = await planRequest.batch(innerQuery);
-      }
-
-      const planXml = SQLServerConnector.extractPlanXml(planResult);
-      return {
-        resultSets: [
-          {
-            rows: planXml != null ? [{ plan: planXml }] : [],
-            rowCount: planXml != null ? 1 : 0,
-          },
-        ],
-      };
-    } catch (error) {
-      // Named apart from the plain EXPLAIN path: this one ran the statement, so
-      // a failure here can mean the statement itself failed mid-execution.
-      throw new Error(`Failed to explain analyze query: ${(error as Error).message}`);
-    } finally {
-      await explainPool.close();
-    }
-  }
-
-  /**
-   * Run a batch inside a transaction that is always rolled back, so EXPLAIN
-   * ANALYZE can report a real plan without letting the statement's writes stick.
-   */
-  private static async batchRolledBack(
-    pool: sql.ConnectionPool,
-    innerQuery: string,
-    parameters?: any[]
-  ): Promise<sql.IResult<any>> {
-    const transaction = new sql.Transaction(pool);
-    await transaction.begin();
-
-    let queryFailed = false;
-    try {
-      const request = new sql.Request(transaction);
-      SQLServerConnector.bindParameters(request, parameters);
-      return await request.batch(innerQuery);
-    } catch (error) {
-      queryFailed = true;
-      throw error;
-    } finally {
-      try {
-        await transaction.rollback();
-      } catch (rollbackError) {
-        // A failed query already aborted the transaction, so a rollback error
-        // there is expected noise. After a *successful* query it means the
-        // writes may still be live — that must surface.
-        if (!queryFailed) {
-          throw new Error(
-            `Read-only rollback failed — data may have been modified: ${(rollbackError as Error).message}`
-          );
-        }
-      }
-    }
-  }
-
-  /**
-   * Pull the ShowPlanXML document out of a STATISTICS XML result.
-   *
-   * STATISTICS XML interleaves each statement's plan with that statement's own
-   * result sets, so the plan sits at no fixed index — and `recordset` (singular)
-   * would hand back the statement's data instead. Scan from the end for the
-   * first single-column row holding a plan document.
-   */
-  private static extractPlanXml(result: sql.IResult<any>): string | null {
-    const recordsets = (result.recordsets ?? []) as unknown as any[][];
-
-    for (let i = recordsets.length - 1; i >= 0; i--) {
-      const firstRow = recordsets[i]?.[0];
-      if (!firstRow) continue;
-
-      const values = Object.values(firstRow);
-      if (values.length !== 1) continue;
-
-      const value = values[0];
-      if (typeof value === "string" && value.includes("<ShowPlanXML")) {
-        return value;
-      }
-    }
-
-    return null;
-  }
 }
 
 // Create and register the connector

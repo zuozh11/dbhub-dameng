@@ -32,8 +32,8 @@ When using TOML configuration, DBHub automatically watches `dbhub.toml` for chan
 
 1. DBHub detects file changes and waits 500ms (debounce) to handle editors that write in multiple steps
 2. The new configuration is parsed and validated — if invalid, existing connections are preserved
-3. All database connections are disconnected and reconnected with the new configuration
-4. If reconnection fails, DBHub automatically rolls back to the previous working configuration
+3. The new source list is compared with the running one, and only what changed is applied: new `[[sources]]` entries are connected, removed ones are disconnected, and edited ones are reconnected. Sources that did not change keep serving queries throughout
+4. If a changed source fails to connect, that source alone is rolled back to its previous configuration; a new source that fails to connect is skipped. The other sources are unaffected
 
 ```
 # Edit dbhub.toml while DBHub is running — changes apply automatically
@@ -255,6 +255,11 @@ Sources define database connections. Each source represents a database that DBHu
   another AWS identity. When `aws_profile` is omitted, the AWS SDK default
   credential chain is used.
 
+  PostgreSQL fetches a fresh token whenever it opens a new connection, so
+  established connections are never rotated. MySQL and MariaDB refresh their
+  pool before the token expires. If credentials have expired (e.g. an AWS SSO
+  session), run `aws sso login --profile <profile>` and retry the request.
+
   ```toml
   [[sources]]
   id = "production"
@@ -299,6 +304,18 @@ Sources define database connections. Each source represents a database that DBHu
   Query timeout in seconds. The maximum time to wait for a query to complete before timing out.
 
   Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle (not applicable to SQLite).
+
+  On PostgreSQL, MySQL and MariaDB the limit is applied on the database server, so a timed-out statement stops running there and the connection stays usable:
+
+  | Database | Server-side setting | Covers |
+  |----------|---------------------|--------|
+  | PostgreSQL | `statement_timeout` | All statements |
+  | MySQL | `max_execution_time` | Read-only `SELECT` statements |
+  | MariaDB | `max_statement_time` | All statements |
+
+  A client-side fallback fires 5 seconds after `query_timeout` for statements the server did not stop, such as a MySQL write or a statement on a connection whose session setting was changed. DBHub then discards that connection and attempts to cancel the statement on the server over a separate connection. The cancellation is best-effort: if it fails or the server does not honor it, the statement may keep running until the server finishes it.
+
+  The largest accepted value is 2147478 seconds (about 24 days), the longest fallback deadline a Node.js timer can represent.
 
   ```toml
   [[sources]]
@@ -436,7 +453,9 @@ Sources define database connections. Each source represents a database that DBHu
 <ParamField path="sslkey" type="string">
   Path to the PEM private key for `sslcert`. The key must be **unencrypted** (an encrypted key is rejected at startup; `sslpassword` is not supported). DER-encoded keys are not accepted.
 
-  Keep the key file private (`chmod 0600`); DBHub reads it once at startup and never logs its contents.
+  Keep the key file private (`chmod 0600`); DBHub never logs its contents.
+
+  Both files are read at startup (a missing file or an encrypted key fails startup) and then re-read each time a new connection is opened, matching libpq. Short-lived client certificates that are reissued on a timer are picked up without a restart: replace the files in place (an atomic rename is safest) and the next connection presents the new pair. If a file cannot be read when a connection is opened, that connection fails with an error naming the file, and the next one retries. The same applies to `sslrootcert`.
 
   Supports `~/` path expansion.
 
@@ -601,7 +620,7 @@ Sources define database connections. Each source represents a database that DBHu
 ### SSH Tunnel Options
 
 <ParamField path="ssh_*" type="group">
-  SSH tunnel configuration for connecting to databases through bastion/jump hosts. Available fields: `ssh_host`, `ssh_port`, `ssh_user`, `ssh_password`, `ssh_key`, `ssh_passphrase`, `ssh_proxy_jump`.
+  SSH tunnel configuration for connecting to databases through bastion/jump hosts. Available fields: `ssh_host`, `ssh_port`, `ssh_user`, `ssh_password`, `ssh_key`, `ssh_passphrase`, `ssh_agent`, `ssh_proxy_jump`.
 
   ```toml
   [[sources]]
@@ -614,10 +633,13 @@ Sources define database connections. Each source represents a database that DBHu
   ssh_user = "ubuntu"
   ssh_key = "~/.ssh/id_rsa"  # File path or base64-encoded key
   ssh_passphrase = "my_key_passphrase"  # Optional
+  # ssh_agent = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"  # SSH agent socket (instead of ssh_key)
   ssh_proxy_jump = "jump1.example.com,admin@jump2.internal:2222"
   ```
 
   `ssh_key` accepts either a file path or a base64-encoded private key. DBHub automatically detects the format.
+
+  `ssh_agent` is the path to an SSH agent socket (ssh-agent, the 1Password SSH agent, etc.). When it is unset, DBHub falls back to the `SSH_AUTH_SOCK` environment variable. With an agent available, `ssh_key` and `ssh_password` are optional; if they are set, they are tried before the agent. The agent is offered to every host in a `ssh_proxy_jump` chain. A configured socket that does not exist fails the connection.
 
   See [Command-Line Options - SSH Tunnel](/config/command-line#ssh-tunnel-options) for complete documentation and examples.
 </ParamField>
@@ -913,6 +935,7 @@ default = 10
 | `ssh_password` | string | ❌ | SSH password |
 | `ssh_key` | string | ❌ | SSH private key path or base64-encoded key |
 | `ssh_passphrase` | string | ❌ | SSH key passphrase |
+| `ssh_agent` | string | ❌ | SSH agent socket path (default: `SSH_AUTH_SOCK`) |
 | `ssh_proxy_jump` | string | ❌ | ProxyJump hosts |
 
 ### Tool Options

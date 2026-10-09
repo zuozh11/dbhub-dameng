@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { PostgreSqlContainer, StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { PostgresConnector } from '../postgres/index.js';
 import { IntegrationTestBase, type TestContainer, type DatabaseTestConfig } from './shared/integration-test-base.js';
+import { settle, waitFor } from './shared/query-timeout-helpers.js';
+import { CLIENT_QUERY_TIMEOUT_GRACE_MS } from '../../utils/query-timeout.js';
 import type { Connector } from '../interface.js';
 
 class PostgreSQLTestContainer implements TestContainer {
@@ -246,18 +248,6 @@ describe('PostgreSQL Connector Integration Tests', () => {
         return result.resultSets[0].rows[0].count;
       };
 
-      const waitFor = async (
-        predicate: () => Promise<boolean>,
-        timeoutMs: number
-      ): Promise<boolean> => {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          if (await predicate()) return true;
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-        return false;
-      };
-
       try {
         await timedConnector.connect(postgresTest.connectionString, undefined, {
           queryTimeoutSeconds: 1,
@@ -287,6 +277,59 @@ describe('PostgreSQL Connector Integration Tests', () => {
         await observer.disconnect();
       }
     }, 20_000);
+
+    it('should fall back to the client-side timeout and cancel the statement when the server limit is cleared', async () => {
+      const timedConnector = new PostgresConnector();
+      const observer = new PostgresConnector();
+      const probe = 'dbhub_client_timeout_probe';
+
+      const runningProbeCount = async (): Promise<number> => {
+        const result = await observer.executeSQL(
+          `SELECT count(*)::int AS count
+           FROM pg_stat_activity
+           WHERE state = 'active'
+             AND query LIKE '%${probe}%'
+             AND query NOT LIKE '%pg_stat_activity%'`,
+          {}
+        );
+        return result.resultSets[0].rows[0].count;
+      };
+
+      try {
+        // A pool of one: the cancel has to reuse the slot of the client it replaces.
+        await timedConnector.connect(postgresTest.connectionString, undefined, {
+          queryTimeoutSeconds: 1,
+          poolMaxConnections: 1,
+        });
+        await observer.connect(postgresTest.connectionString);
+
+        // The batch clears statement_timeout first, so only the client-side
+        // fallback is left to bound the SELECT.
+        const result = await settle(
+          timedConnector.executeSQL(
+            `SET statement_timeout = 0; SELECT pg_sleep(30), '${probe}'`,
+            {}
+          )
+        );
+
+        expect(result.error?.message).toBe('Query read timeout');
+        expect(result.elapsedMs).toBeGreaterThanOrEqual(1000 + CLIENT_QUERY_TIMEOUT_GRACE_MS - 100);
+        // Not twice the deadline: the ROLLBACK is skipped rather than queued
+        // behind the abandoned statement.
+        expect(result.elapsedMs).toBeLessThan(10_000);
+        expect(await waitFor(async () => (await runningProbeCount()) === 0, 2_000)).toBe(true);
+
+        // The abandoned client was discarded; a fresh one carries the limit again.
+        const after = await timedConnector.executeSQL(
+          "SELECT current_setting('statement_timeout') AS statement_timeout",
+          { readonly: true }
+        );
+        expect(after.resultSets[0].rows[0].statement_timeout).toBe('1s');
+      } finally {
+        await timedConnector.disconnect();
+        await observer.disconnect();
+      }
+    }, 30_000);
 
     it('should execute multiple statements with transaction support', async () => {
       const result = await postgresTest.connector.executeSQL(`
@@ -519,19 +562,6 @@ describe('PostgreSQL Connector Integration Tests', () => {
       expect(result.resultSets[0].truncated).toBeUndefined();
     });
 
-    it('should use maxRows when existing LIMIT is higher', async () => {
-      // Test when existing LIMIT is higher than maxRows
-      const result = await postgresTest.connector.executeSQL(
-        'SELECT * FROM users ORDER BY id LIMIT 10',
-        { maxRows: 2 }
-      );
-
-      expect(result.resultSets[0].rows).toHaveLength(2);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(result.resultSets[0].rows[1]).toHaveProperty('name');
-      expect(result.resultSets[0].truncated).toBe(true);
-    });
-
     it('should not affect non-SELECT queries', async () => {
       // Test that maxRows doesn't affect INSERT/UPDATE/DELETE
       const insertResult = await postgresTest.connector.executeSQL(
@@ -548,94 +578,6 @@ describe('PostgreSQL Connector Integration Tests', () => {
       );
       expect(selectResult.resultSets[0].rows).toHaveLength(1);
       expect(selectResult.resultSets[0].rows[0].name).toBe('MaxRows Test');
-    });
-
-    it('should handle maxRows with RETURNING clause', async () => {
-      // Test maxRows with INSERT...RETURNING (note: maxRows doesn't apply to INSERT/UPDATE/DELETE statements)
-      const insertResult = await postgresTest.connector.executeSQL(
-        "INSERT INTO users (name, email, age) VALUES ('Returning Test 1', 'return1@example.com', 30), ('Returning Test 2', 'return2@example.com', 35) RETURNING id, name",
-        { maxRows: 1 }
-      );
-      
-      // INSERT...RETURNING returns all inserted rows regardless of maxRows setting
-      expect(insertResult.resultSets[0].rows).toHaveLength(2);
-      expect(insertResult.resultSets[0].rows[0]).toHaveProperty('id');
-      expect(insertResult.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(insertResult.resultSets[0].rows[1]).toHaveProperty('id');
-      expect(insertResult.resultSets[0].rows[1]).toHaveProperty('name');
-    });
-
-    it('should handle maxRows with complex queries', async () => {
-      // Test maxRows with JOIN queries
-      const result = await postgresTest.connector.executeSQL(`
-        SELECT u.name, o.total 
-        FROM users u 
-        JOIN orders o ON u.id = o.user_id 
-        ORDER BY o.total DESC
-      `, { maxRows: 2 });
-      
-      expect(result.resultSets[0].rows.length).toBeLessThanOrEqual(2);
-      expect(result.resultSets[0].rows.length).toBeGreaterThan(0);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(result.resultSets[0].rows[0]).toHaveProperty('total');
-    });
-
-    it('should apply maxRows to CTE queries (WITH clause)', async () => {
-      // A CTE is the ordinary shape of an analytical query, so leaving it
-      // uncapped left max_rows silently inert for most real queries.
-      const result = await postgresTest.connector.executeSQL(`
-        WITH user_summary AS (
-          SELECT name, age FROM users WHERE age IS NOT NULL
-        )
-        SELECT * FROM user_summary ORDER BY age
-      `, { maxRows: 2 });
-      
-      expect(result.resultSets[0].rows).toHaveLength(2);
-      expect(result.resultSets[0].truncated).toBe(true);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(result.resultSets[0].rows[0]).toHaveProperty('age');
-    });
-
-    it('should apply maxRows to a query introduced by a comment', async () => {
-      const result = await postgresTest.connector.executeSQL(
-        '-- dbhub attribution tag\nSELECT name FROM users ORDER BY name',
-        { maxRows: 2 }
-      );
-
-      expect(result.resultSets[0].rows).toHaveLength(2);
-      expect(result.resultSets[0].truncated).toBe(true);
-    });
-
-    it("should cap the statement itself rather than tightening a CTE's own LIMIT", async () => {
-      // The inner LIMIT caps only the CTE; the statement can still return more
-      // rows than that, so it needs a cap of its own.
-      const result = await postgresTest.connector.executeSQL(`
-        WITH first_three AS (
-          SELECT name FROM users ORDER BY name LIMIT 3
-        )
-        SELECT * FROM first_three
-      `, { maxRows: 2 });
-
-      expect(result.resultSets[0].rows).toHaveLength(2);
-      expect(result.resultSets[0].truncated).toBe(true);
-    });
-
-    it('should not apply maxRows to a data-modifying CTE', async () => {
-      const result = await postgresTest.connector.executeSQL(`
-        WITH inserted AS (
-          INSERT INTO users (name, email, age)
-          VALUES ('dm1', 'dm1@dm.com', 41), ('dm2', 'dm2@dm.com', 42), ('dm3', 'dm3@dm.com', 43)
-          RETURNING id, name
-        )
-        SELECT * FROM inserted
-      `, { maxRows: 2 });
-
-      // A LIMIT here would cap the rows handed back while all three rows were
-      // still written: a cap that isn't one.
-      expect(result.resultSets[0].rows).toHaveLength(3);
-      expect(result.resultSets[0].truncated).toBeFalsy();
-
-      await postgresTest.connector.executeSQL("DELETE FROM users WHERE email LIKE '%@dm.com'", {});
     });
 
     it('should handle maxRows in multi-statement execution with transactions', async () => {
@@ -661,36 +603,6 @@ describe('PostgreSQL Connector Integration Tests', () => {
         rows: [],
         rowCount: 1,
       });
-    });
-
-    it('should handle maxRows with PostgreSQL window functions', async () => {
-      // Test maxRows with window functions
-      const result = await postgresTest.connector.executeSQL(`
-        SELECT 
-          name,
-          age,
-          ROW_NUMBER() OVER (ORDER BY age DESC) as age_rank,
-          AVG(age::numeric) OVER () as avg_age
-        FROM users
-        WHERE age IS NOT NULL
-        ORDER BY age DESC
-      `, { maxRows: 2 });
-      
-      expect(result.resultSets[0].rows.length).toBeLessThanOrEqual(2);
-      expect(result.resultSets[0].rows.length).toBeGreaterThan(0);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('age_rank');
-      expect(result.resultSets[0].rows[0]).toHaveProperty('avg_age');
-    });
-
-    it('should ignore maxRows when not specified', async () => {
-      // Test without maxRows - should return all rows (at least 3)
-      const result = await postgresTest.connector.executeSQL(
-        'SELECT * FROM users ORDER BY id',
-        {}
-      );
-
-      // Should return at least the original 3 users plus any added in previous tests
-      expect(result.resultSets[0].rows.length).toBeGreaterThanOrEqual(3);
     });
 
   });

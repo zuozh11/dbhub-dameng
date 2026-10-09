@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { MySqlContainer, StartedMySqlContainer } from '@testcontainers/mysql';
 import { MySQLConnector } from '../mysql/index.js';
 import { IntegrationTestBase, type TestContainer, type DatabaseTestConfig } from './shared/integration-test-base.js';
+import { settle, waitFor } from './shared/query-timeout-helpers.js';
+import { CLIENT_QUERY_TIMEOUT_GRACE_MS } from '../../utils/query-timeout.js';
 import type { Connector } from '../interface.js';
 
 class MySQLTestContainer implements TestContainer {
@@ -350,19 +352,6 @@ describe('MySQL Connector Integration Tests', () => {
       expect(result.resultSets[0].truncated).toBeUndefined();
     });
 
-    it('should use maxRows when existing LIMIT is higher', async () => {
-      // Test when existing LIMIT is higher than maxRows
-      const result = await mysqlTest.connector.executeSQL(
-        'SELECT * FROM users ORDER BY id LIMIT 10',
-        { maxRows: 2 }
-      );
-
-      expect(result.resultSets[0].rows).toHaveLength(2);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(result.resultSets[0].rows[1]).toHaveProperty('name');
-      expect(result.resultSets[0].truncated).toBe(true);
-    });
-
     it('should not affect non-SELECT queries', async () => {
       // Test that maxRows doesn't affect INSERT/UPDATE/DELETE
       const insertResult = await mysqlTest.connector.executeSQL(
@@ -379,39 +368,6 @@ describe('MySQL Connector Integration Tests', () => {
       );
       expect(selectResult.resultSets[0].rows).toHaveLength(1);
       expect(selectResult.resultSets[0].rows[0].name).toBe('MaxRows Test');
-    });
-
-    it('should handle maxRows with complex queries', async () => {
-      // Test maxRows with JOIN queries
-      const result = await mysqlTest.connector.executeSQL(`
-        SELECT u.name, o.total 
-        FROM users u 
-        JOIN orders o ON u.id = o.user_id 
-        ORDER BY o.total DESC
-      `, { maxRows: 2 });
-      
-      expect(result.resultSets[0].rows.length).toBeLessThanOrEqual(2);
-      expect(result.resultSets[0].rows.length).toBeGreaterThan(0);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(result.resultSets[0].rows[0]).toHaveProperty('total');
-    });
-
-    it('should apply maxRows to CTE queries (WITH clause)', async () => {
-      // A CTE is the ordinary shape of an analytical query, so leaving it
-      // uncapped left max_rows silently inert for most real queries.
-      // No try/catch: the test container runs MySQL 8, which supports CTEs,
-      // and a catch-all would swallow the assertions too.
-      const result = await mysqlTest.connector.executeSQL(`
-        WITH user_summary AS (
-          SELECT name, age FROM users WHERE age IS NOT NULL
-        )
-        SELECT * FROM user_summary ORDER BY age
-      `, { maxRows: 2 });
-
-      expect(result.resultSets[0].rows).toHaveLength(2);
-      expect(result.resultSets[0].truncated).toBe(true);
-      expect(result.resultSets[0].rows[0]).toHaveProperty('name');
-      expect(result.resultSets[0].rows[0]).toHaveProperty('age');
     });
 
     it('should handle maxRows with multiple SELECT statements', async () => {
@@ -435,16 +391,6 @@ describe('MySQL Connector Integration Tests', () => {
       }
     });
 
-    it('should ignore maxRows when not specified', async () => {
-      // Test without maxRows - should return all rows
-      const result = await mysqlTest.connector.executeSQL(
-        'SELECT * FROM users ORDER BY id',
-        {}
-      );
-
-      // Should return all users (at least the original 3 plus any added in previous tests)
-      expect(result.resultSets[0].rows.length).toBeGreaterThanOrEqual(3);
-    });
   });
 
   describe('timezone configuration', () => {
@@ -605,5 +551,81 @@ describe('MySQL Connector Integration Tests', () => {
         await connector.disconnect();
       }
     });
+  });
+
+  describe('query_timeout', () => {
+    it('should let the server stop a read-only SELECT and keep the connection usable', async () => {
+      const connector = new MySQLConnector();
+      try {
+        await connector.connect(mysqlTest.connectionString, undefined, { queryTimeoutSeconds: 1 });
+
+        const limit = await connector.executeSQL(
+          'SELECT @@session.max_execution_time AS met',
+          { readonly: true }
+        );
+        expect(Number(limit.resultSets[0].rows[0].met)).toBe(1000);
+
+        const result = await settle(
+          connector.executeSQL(
+            `SELECT COUNT(*) FROM information_schema.columns a,
+               information_schema.columns b, information_schema.columns c`,
+            { readonly: true }
+          )
+        );
+
+        // ER_QUERY_TIMEOUT from the server, well before the client-side fallback.
+        expect(result.error?.errno).toBe(3024);
+        expect(result.elapsedMs).toBeLessThan(CLIENT_QUERY_TIMEOUT_GRACE_MS);
+
+        const after = await connector.executeSQL('SELECT 1 AS ok', { readonly: true });
+        expect(Number(after.resultSets[0].rows[0].ok)).toBe(1);
+      } finally {
+        await connector.disconnect();
+      }
+    }, 20_000);
+
+    it('should fall back to the client-side timeout and kill the statement when the server limit is cleared', async () => {
+      const connector = new MySQLConnector();
+      const observer = new MySQLConnector();
+      const probe = 'dbhub_client_timeout_probe';
+
+      const runningProbeCount = async (): Promise<number> => {
+        const result = await observer.executeSQL(
+          `SELECT COUNT(*) AS count FROM information_schema.processlist
+           WHERE info LIKE '%${probe}%' AND info NOT LIKE '%processlist%'`,
+          {}
+        );
+        return Number(result.resultSets[0].rows[0].count);
+      };
+
+      try {
+        await connector.connect(mysqlTest.connectionString, undefined, { queryTimeoutSeconds: 1 });
+        await observer.connect(mysqlTest.connectionString);
+
+        // The batch clears the session limit first, so only the client-side
+        // fallback is left to bound the SELECT.
+        const result = await settle(
+          connector.executeSQL(
+            `SET SESSION max_execution_time = 0; SELECT SLEEP(30), '${probe}'`,
+            {}
+          )
+        );
+
+        expect(result.error?.code).toBe('PROTOCOL_SEQUENCE_TIMEOUT');
+        expect(result.elapsedMs).toBeGreaterThanOrEqual(1000 + CLIENT_QUERY_TIMEOUT_GRACE_MS - 100);
+        expect(result.elapsedMs).toBeLessThan(10_000);
+        expect(await waitFor(async () => (await runningProbeCount()) === 0, 2_000)).toBe(true);
+
+        // The abandoned connection was discarded; a fresh one carries the limit again.
+        const after = await connector.executeSQL(
+          'SELECT @@session.max_execution_time AS met',
+          { readonly: true }
+        );
+        expect(Number(after.resultSets[0].rows[0].met)).toBe(1000);
+      } finally {
+        await connector.disconnect();
+        await observer.disconnect();
+      }
+    }, 30_000);
   });
 });

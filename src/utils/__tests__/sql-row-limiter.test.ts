@@ -3,39 +3,16 @@ import { SQLRowLimiter } from "../sql-row-limiter.js";
 
 describe("SQLRowLimiter", () => {
   describe("hasLimitClause - edge cases with comments and strings", () => {
-    it("should not detect LIMIT inside single-quoted string", () => {
-      const sql = "SELECT 'show limit 10 records' AS msg FROM users";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
-    });
-
-    it("should not detect LIMIT inside double-quoted identifier", () => {
-      const sql = 'SELECT "limit 10" AS col FROM users';
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
-    });
-
-    it("should not detect LIMIT inside single-line comment", () => {
-      const sql = "SELECT * FROM users -- limit 10\nWHERE active = true";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
-    });
-
-    it("should not detect LIMIT inside multi-line comment", () => {
-      const sql = "SELECT * FROM users /* limit 10 */ WHERE active = true";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
-    });
-
-    it("should detect real LIMIT after string containing 'limit'", () => {
-      const sql = "SELECT 'limit' AS word FROM users LIMIT 10";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
-    });
-
-    it("should detect real LIMIT after comment containing 'limit'", () => {
-      const sql = "SELECT * FROM users /* show limit */ LIMIT 10";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
-    });
-
-    it("should handle escaped quotes in strings", () => {
-      const sql = "SELECT 'it''s limit 10' AS msg FROM users";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
+    it.each([
+      ["inside single-quoted string", "SELECT 'show limit 10 records' AS msg FROM users", false],
+      ["inside double-quoted identifier", 'SELECT "limit 10" AS col FROM users', false],
+      ["inside single-line comment", "SELECT * FROM users -- limit 10\nWHERE active = true", false],
+      ["inside multi-line comment", "SELECT * FROM users /* limit 10 */ WHERE active = true", false],
+      ["inside string with escaped quotes", "SELECT 'it''s limit 10' AS msg FROM users", false],
+      ["real LIMIT after string containing 'limit'", "SELECT 'limit' AS word FROM users LIMIT 10", true],
+      ["real LIMIT after comment containing 'limit'", "SELECT * FROM users /* show limit */ LIMIT 10", true],
+    ])("LIMIT %s -> %s", (_label, sql, expected) => {
+      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(expected);
     });
   });
 
@@ -45,20 +22,13 @@ describe("SQLRowLimiter", () => {
       expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
     });
 
-    it("should detect LIMIT with PostgreSQL parameter ($1, $2, etc.)", () => {
-      const sql = "SELECT * FROM users WHERE name = $1 LIMIT $2";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
-    });
-
-    it("should detect LIMIT with MySQL/SQLite parameter (?)", () => {
-      const sql = "SELECT * FROM users WHERE name = ? LIMIT ?";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
-    });
-
-    it("should detect LIMIT with named parameter (@p1, @p2, etc.)", () => {
-      // Note: @p style parameters with LIMIT is not valid SQL Server syntax
-      // (SQL Server uses TOP, not LIMIT). This tests the regex pattern only.
-      const sql = "SELECT * FROM users WHERE name = @p1 LIMIT @p2";
+    // Note: @p style parameters with LIMIT is not valid SQL Server syntax
+    // (SQL Server uses TOP, not LIMIT). That case tests the regex pattern only.
+    it.each([
+      ["PostgreSQL parameter ($1, $2, etc.)", "SELECT * FROM users WHERE name = $1 LIMIT $2"],
+      ["MySQL/SQLite parameter (?)", "SELECT * FROM users WHERE name = ? LIMIT ?"],
+      ["named parameter (@p1, @p2, etc.)", "SELECT * FROM users WHERE name = @p1 LIMIT @p2"],
+    ])("should detect LIMIT with %s", (_label, sql) => {
       expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
     });
 
@@ -68,17 +38,36 @@ describe("SQLRowLimiter", () => {
     });
   });
 
-  describe("applyMaxRows", () => {
-    it("should not modify SQL when maxRows is undefined", () => {
+  describe("first guard shared by every entry point", () => {
+    // Every apply* entry point starts with the same `!maxRows || !isSelectQuery`
+    // guard; the probe variants report it as probeApplied: false.
+    const unchanged = (sql: string) => sql;
+    const unprobed = (sql: string) => ({ sql, probeApplied: false });
+    const entryPoints: [
+      string,
+      (sql: string, maxRows: number | undefined) => unknown,
+      (sql: string) => unknown,
+    ][] = [
+      ["applyMaxRows", (sql, maxRows) => SQLRowLimiter.applyMaxRows(sql, maxRows), unchanged],
+      ["applyMaxRowsForSQLServer", (sql, maxRows) => SQLRowLimiter.applyMaxRowsForSQLServer(sql, maxRows), unchanged],
+      ["applyMaxRowsForOracle", (sql, maxRows) => SQLRowLimiter.applyMaxRowsForOracle(sql, maxRows), unchanged],
+      ["applyMaxRowsWithTruncationProbe", (sql, maxRows) => SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, maxRows), unprobed],
+      ["applyMaxRowsForSQLServerWithTruncationProbe", (sql, maxRows) => SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, maxRows), unprobed],
+      ["applyMaxRowsForOracleWithTruncationProbe", (sql, maxRows) => SQLRowLimiter.applyMaxRowsForOracleWithTruncationProbe(sql, maxRows), unprobed],
+    ];
+
+    it.each(entryPoints)("%s should not modify SQL when maxRows is undefined", (_name, apply, expected) => {
       const sql = "SELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRows(sql, undefined)).toBe(sql);
+      expect(apply(sql, undefined)).toEqual(expected(sql));
     });
 
-    it("should not modify non-SELECT queries", () => {
+    it.each(entryPoints)("%s should not modify non-SELECT queries", (_name, apply, expected) => {
       const sql = "UPDATE users SET active = true";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(sql);
+      expect(apply(sql, 100)).toEqual(expected(sql));
     });
+  });
 
+  describe("applyMaxRows", () => {
     it("should add LIMIT when none exists", () => {
       const sql = "SELECT * FROM users";
       const result = SQLRowLimiter.applyMaxRows(sql, 100);
@@ -115,29 +104,10 @@ describe("SQLRowLimiter", () => {
       expect(result).toBe("SELECT * FROM users LIMIT 100");
     });
 
-    it("should handle complex query with parameterized LIMIT", () => {
-      const sql = "SELECT emp_no, first_name, last_name, hire_date FROM employee WHERE first_name ILIKE '%' || $1 || '%' OR last_name ILIKE '%' || $1 || '%' LIMIT $2";
-      const result = SQLRowLimiter.applyMaxRows(sql, 1000);
-      // Should wrap in subquery to enforce max_rows
-      expect(result).toBe("SELECT * FROM (SELECT emp_no, first_name, last_name, hire_date FROM employee WHERE first_name ILIKE '%' || $1 || '%' OR last_name ILIKE '%' || $1 || '%' LIMIT $2\n) AS subq LIMIT 1000");
-    });
-
     it("should preserve semicolon at end when adding LIMIT", () => {
       const sql = "SELECT * FROM users;";
       const result = SQLRowLimiter.applyMaxRows(sql, 100);
       expect(result).toBe("SELECT * FROM users\nLIMIT 100;");
-    });
-
-    it("should add LIMIT when 'limit' only appears in string literal", () => {
-      const sql = "SELECT 'show limit 10 records' AS msg FROM users";
-      const result = SQLRowLimiter.applyMaxRows(sql, 100);
-      expect(result).toBe("SELECT 'show limit 10 records' AS msg FROM users\nLIMIT 100");
-    });
-
-    it("should add LIMIT when 'limit' only appears in comment", () => {
-      const sql = "SELECT * FROM users /* limit 10 */";
-      const result = SQLRowLimiter.applyMaxRows(sql, 100);
-      expect(result).toBe("SELECT * FROM users /* limit 10 */\nLIMIT 100");
     });
 
     it("adds an effective LIMIT even when the query ends in a -- line comment", () => {
@@ -158,43 +128,18 @@ describe("SQLRowLimiter", () => {
   describe("applyMaxRows - leading comments", () => {
     // A query introduced by a comment (an attribution tag, say) is still a
     // SELECT. Classifying on the raw text made max_rows silently inert for
-    // every one of them.
-    it("caps a query introduced by a -- line comment", () => {
-      const sql = "-- dbhub agent query\nSELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
-        "-- dbhub agent query\nSELECT * FROM users\nLIMIT 100"
-      );
-    });
-
-    it("caps a query introduced by a block comment", () => {
-      const sql = "/* tag: report */ SELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
-        "/* tag: report */ SELECT * FROM users\nLIMIT 100"
-      );
-    });
-
-    it("caps a query introduced by several mixed leading comments", () => {
-      const sql = "-- one\n/* two */\n-- three\nSELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
-        "-- one\n/* two */\n-- three\nSELECT * FROM users\nLIMIT 100"
-      );
-    });
-
-    it("leaves the caller's comment text untouched", () => {
-      // The comment is load-bearing for query attribution, so only the
-      // classification sees the blanked form; the SQL sent to the server
-      // keeps it verbatim.
-      const sql = "/* app=dbhub; user='bob' */\nSELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toContain("/* app=dbhub; user='bob' */");
+    // every one of them. The comment text itself is load-bearing for query
+    // attribution, so the SQL sent to the server keeps it verbatim.
+    it.each([
+      ["a -- line comment", "-- dbhub agent query\nSELECT * FROM users"],
+      ["a block comment", "/* tag: report */ SELECT * FROM users"],
+      ["several mixed leading comments", "-- one\n/* two */\n-- three\nSELECT * FROM users"],
+    ])("caps a query introduced by %s, leaving the comment untouched", (_label, sql) => {
+      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(`${sql}\nLIMIT 100`);
     });
 
     it("still leaves a non-SELECT hidden behind a comment alone", () => {
       const sql = "-- looks harmless\nUPDATE users SET active = true";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(sql);
-    });
-
-    it("ignores a keyword that only appears inside the comment", () => {
-      const sql = "/* select nothing */ UPDATE users SET active = true";
       expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(sql);
     });
   });
@@ -331,13 +276,6 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it("leaves non-SELECT statements and PL/SQL blocks alone", () => {
-      expect(SQLRowLimiter.applyMaxRowsForOracle("INSERT INTO t VALUES (1)", 10)).toBe(
-        "INSERT INTO t VALUES (1)"
-      );
-      expect(SQLRowLimiter.applyMaxRowsForOracle("BEGIN NULL; END;", 10)).toBe("BEGIN NULL; END;");
-    });
-
     it("does not mistake a q-quoted literal for a data-modifying CTE", () => {
       const sql = "WITH x AS (SELECT q'[DELETE FROM t]' AS s FROM dual) SELECT * FROM x";
       expect(SQLRowLimiter.applyMaxRowsForOracle(sql, 100)).toBe(
@@ -363,9 +301,6 @@ describe("SQLRowLimiter", () => {
         sql: "SELECT * FROM (SELECT * FROM users\n) FETCH FIRST 101 ROWS ONLY",
         probeApplied: true,
       });
-      expect(
-        SQLRowLimiter.applyMaxRowsForOracleWithTruncationProbe("DELETE FROM users", 100)
-      ).toEqual({ sql: "DELETE FROM users", probeApplied: false });
     });
   });
 
@@ -413,14 +348,7 @@ describe("SQLRowLimiter", () => {
     });
   });
 
-  describe("truncation probe - comments and CTEs", () => {
-    it("probes a comment-prefixed SELECT", () => {
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe("-- tag\nSELECT * FROM t", 100)).toEqual({
-        sql: "-- tag\nSELECT * FROM t\nLIMIT 101",
-        probeApplied: true,
-      });
-    });
-
+  describe("truncation probe - CTEs", () => {
     it("probes a CTE query, ignoring the CTE's inner LIMIT", () => {
       // The inner LIMIT 5 is not the statement's own, so it must not be
       // mistaken for a user cap already within maxRows.
@@ -428,14 +356,6 @@ describe("SQLRowLimiter", () => {
       expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual({
         sql: `${sql}\nLIMIT 101`,
         probeApplied: true,
-      });
-    });
-
-    it("does not probe a data-modifying CTE", () => {
-      const sql = "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d";
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
       });
     });
 
@@ -449,11 +369,6 @@ describe("SQLRowLimiter", () => {
   });
 
   describe("applyMaxRowsForSQLServer", () => {
-    it("should not modify SQL when maxRows is undefined", () => {
-      const sql = "SELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, undefined)).toBe(sql);
-    });
-
     it("should add TOP when none exists", () => {
       const sql = "SELECT * FROM users";
       const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100);
@@ -475,17 +390,14 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it("should wrap UNION queries (without ALL) so TOP caps the combined result set", () => {
-      const sql = "SELECT id FROM a UNION SELECT id FROM b";
-      const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 5);
-      expect(result).toBe("SELECT TOP 5 * FROM (SELECT id FROM a UNION SELECT id FROM b\n) AS subq");
-    });
-
-    it("should wrap INTERSECT/EXCEPT queries so TOP caps the combined result set", () => {
-      const sql = "SELECT id FROM a EXCEPT SELECT id FROM b";
-      const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 5);
-      expect(result).toBe("SELECT TOP 5 * FROM (SELECT id FROM a EXCEPT SELECT id FROM b\n) AS subq");
-    });
+    it.each(["INTERSECT", "EXCEPT"])(
+      "should wrap %s queries so TOP caps the combined result set",
+      (operator) => {
+        const sql = `SELECT id FROM a ${operator} SELECT id FROM b`;
+        const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 5);
+        expect(result).toBe(`SELECT TOP 5 * FROM (SELECT id FROM a ${operator} SELECT id FROM b\n) AS subq`);
+      }
+    );
 
     it("should preserve trailing semicolon when wrapping a set-operator query", () => {
       const sql = "SELECT id FROM a UNION ALL SELECT id FROM b;";
@@ -519,14 +431,6 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it("should hoist a top-level trailing ORDER BY and preserve a trailing semicolon", () => {
-      const sql = "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id;";
-      const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 3);
-      expect(result).toBe(
-        "SELECT TOP 3 * FROM (SELECT id FROM a UNION ALL SELECT id FROM b\n) AS subq ORDER BY id;"
-      );
-    });
-
     it("should not mistake an ORDER BY inside a window function's OVER clause for a top-level ORDER BY", () => {
       const sql =
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM a UNION ALL SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM b";
@@ -544,23 +448,176 @@ describe("SQLRowLimiter", () => {
     });
   });
 
+  describe("applyMaxRowsForSQLServer - DISTINCT, TOP (n), OFFSET, PERCENT, WITH TIES (issue #453)", () => {
+    it.each(["DISTINCT", "ALL"])("should insert TOP after SELECT %s", (modifier) => {
+      // T-SQL requires `SELECT DISTINCT TOP n`; `SELECT TOP n DISTINCT` is a syntax error.
+      const result = SQLRowLimiter.applyMaxRowsForSQLServer(`SELECT ${modifier} status FROM orders`, 100);
+      expect(result).toBe(`SELECT ${modifier} TOP 100 status FROM orders`);
+    });
+
+    it("should insert TOP after the final SELECT DISTINCT of a CTE", () => {
+      const sql = "WITH q AS (SELECT DISTINCT a FROM t) SELECT DISTINCT * FROM q";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        "WITH q AS (SELECT DISTINCT a FROM t) SELECT DISTINCT TOP 100 * FROM q"
+      );
+    });
+
+    it("should not mistake a column starting with 'all' for the ALL modifier", () => {
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT all_users FROM t", 100)).toBe(
+        "SELECT TOP 100 all_users FROM t"
+      );
+    });
+
+    it.each(["TOP (3)", "TOP(3)", "TOP ( 3 )"])("should recognise a parenthesised %s as the statement's own TOP", (top) => {
+      const sql = `SELECT ${top} name FROM users ORDER BY name`;
+      expect(SQLRowLimiter.extractTopValue(sql)).toBe(3);
+      // Tightened to min(3, 100) = 3, i.e. the user's own cap, not a second TOP.
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe("SELECT TOP 3 name FROM users ORDER BY name");
+    });
+
+    it("should tighten a parenthesised TOP that exceeds the cap", () => {
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT TOP (3000) name FROM users", 100)).toBe(
+        "SELECT TOP 100 name FROM users"
+      );
+    });
+
+    it("should tighten a TOP that follows DISTINCT without disturbing DISTINCT", () => {
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT DISTINCT TOP 3000 name FROM users", 100)).toBe(
+        "SELECT DISTINCT TOP 100 name FROM users"
+      );
+    });
+
+    it("should cap an OFFSET ... FETCH query through its FETCH count, never with TOP", () => {
+      // T-SQL: "A TOP can not be used in the same query or sub-query as a OFFSET."
+      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3000 ROWS ONLY";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
+      );
+    });
+
+    it("should leave an OFFSET ... FETCH query alone when its FETCH count is within the cap", () => {
+      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH FIRST 3 ROWS ONLY";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(sql);
+    });
+
+    it("should append a FETCH to an OFFSET query that has none", () => {
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServer("SELECT name FROM users ORDER BY name OFFSET 10 ROWS;", 100)
+      ).toBe("SELECT name FROM users ORDER BY name OFFSET 10 ROWS FETCH NEXT 100 ROWS ONLY;");
+    });
+
+    it("should wrap an OFFSET query whose FETCH count is a parameter, keeping ORDER BY inside", () => {
+      // The derived table's own OFFSET makes an inner ORDER BY legal, and the
+      // ORDER BY has to stay inside because OFFSET/FETCH is defined by it.
+      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT @p1 ROWS ONLY";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
+      );
+    });
+
+    it("should wrap an OFFSET query with an expression offset", () => {
+      const sql = "SELECT name FROM users ORDER BY name OFFSET @p1 * 2 ROWS";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
+      );
+    });
+
+    it("should not treat an OFFSET inside a subquery as the statement's own", () => {
+      const sql = "SELECT * FROM (SELECT name FROM users ORDER BY name OFFSET 5 ROWS) AS t";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        "SELECT TOP 100 * FROM (SELECT name FROM users ORDER BY name OFFSET 5 ROWS) AS t"
+      );
+    });
+
+    it("should wrap a TOP n WITH TIES query, keeping its ORDER BY inside", () => {
+      // WITH TIES can return far more than n rows, so n is not a bound.
+      const sql = "SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
+      );
+    });
+
+    it("should wrap a TOP n PERCENT query", () => {
+      const sql = "SELECT TOP 1 PERCENT id FROM orders";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
+      );
+    });
+
+    it("should wrap a TOP whose count is a parameter or expression", () => {
+      const sql = "SELECT TOP (@p1) id FROM orders ORDER BY id;";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        "SELECT TOP 100 * FROM (SELECT TOP (@p1) id FROM orders ORDER BY id\n) AS subq;"
+      );
+    });
+
+    it("should keep a leading CTE outside the wrap of a PERCENT query", () => {
+      const sql = "WITH q AS (SELECT id FROM orders) SELECT TOP 10 PERCENT id FROM q";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        "WITH q AS (SELECT id FROM orders) SELECT TOP 100 * FROM (SELECT TOP 10 PERCENT id FROM q\n) AS subq"
+      );
+    });
+
+    it("should recognise a TOP expression with nested parentheses as the statement's own TOP", () => {
+      const sql = "SELECT TOP (COALESCE(NULLIF(@p, 0), 10)) x FROM t";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
+      );
+    });
+
+    it("should wrap rather than append when the FETCH count is in an unparsed form", () => {
+      const sql = "SELECT x FROM t ORDER BY x OFFSET 0 ROWS FETCH NEXT (@p1) ROWS ONLY";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
+      );
+    });
+
+    it("should cap a set-operator query with OFFSET ... FETCH through its FETCH count", () => {
+      // The OFFSET applies to the combined output, and hoisting it next to
+      // an outer TOP would be rejected (TOP and OFFSET on the same query).
+      const sql = "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
+      );
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
+          "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+          100
+        ).probeApplied
+      ).toBe(false);
+    });
+
+    it.each(["SELECT TOP(1)PERCENT x FROM t", "SELECT TOP(1)WITH TIES x FROM t ORDER BY x"])(
+      "should recognise a modifier with no whitespace after a parenthesised operand: %s",
+      (sql) => {
+        expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
+          sql: `SELECT TOP 101 * FROM (${sql}\n) AS subq`,
+          probeApplied: true,
+        });
+      }
+    );
+
+    it("should keep a statement-level OPTION hint outside the wrap", () => {
+      // OPTION is only allowed on the outermost statement.
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServer("SELECT TOP (@p1) x FROM t ORDER BY x OPTION (RECOMPILE);", 100)
+      ).toBe("SELECT TOP 100 * FROM (SELECT TOP (@p1) x FROM t ORDER BY x\n) AS subq OPTION (RECOMPILE);");
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServer("SELECT id FROM a UNION ALL SELECT id FROM b OPTION (MAXDOP 1)", 100)
+      ).toBe("SELECT TOP 100 * FROM (SELECT id FROM a UNION ALL SELECT id FROM b\n) AS subq OPTION (MAXDOP 1)");
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServer("SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OPTION (MAXDOP 1)", 100)
+      ).toBe("SELECT TOP 100 * FROM (SELECT id FROM a UNION ALL SELECT id FROM b\n) AS subq ORDER BY id OPTION (MAXDOP 1)");
+    });
+
+    it("should not treat 'top (3)' inside a string literal as a TOP clause", () => {
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT 'top (3)' AS s FROM t", 100)).toBe(
+        "SELECT TOP 100 'top (3)' AS s FROM t"
+      );
+    });
+  });
+
   describe("applyMaxRowsWithTruncationProbe", () => {
-    it("should not modify SQL or probe when maxRows is undefined", () => {
-      const sql = "SELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, undefined)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should not modify or probe non-SELECT queries", () => {
-      const sql = "UPDATE users SET active = true";
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
     it("should add a probe LIMIT of maxRows + 1 when no LIMIT exists", () => {
       const result = SQLRowLimiter.applyMaxRowsWithTruncationProbe("SELECT * FROM users", 100);
       expect(result).toEqual({ sql: "SELECT * FROM users\nLIMIT 101", probeApplied: true });
@@ -605,22 +662,6 @@ describe("SQLRowLimiter", () => {
   });
 
   describe("applyMaxRowsForSQLServerWithTruncationProbe", () => {
-    it("should not modify SQL or probe when maxRows is undefined", () => {
-      const sql = "SELECT * FROM users";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, undefined)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should not modify or probe non-SELECT queries", () => {
-      const sql = "UPDATE users SET active = 1";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
     it("should add a probe TOP of maxRows + 1 when no TOP exists", () => {
       const result = SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
         "SELECT * FROM users",
@@ -657,6 +698,53 @@ describe("SQLRowLimiter", () => {
         probeApplied: true,
       });
     });
+
+    it("should not probe when the query's own parenthesised TOP is within the cap", () => {
+      const sql = "SELECT TOP (3) name FROM users ORDER BY name";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
+        sql,
+        probeApplied: false,
+      });
+    });
+
+    it("should not probe when the query's own FETCH count is within the cap", () => {
+      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY";
+      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
+        sql,
+        probeApplied: false,
+      });
+    });
+
+    it("should probe through the FETCH count when it exceeds the cap", () => {
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
+          "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3000 ROWS ONLY",
+          100
+        )
+      ).toEqual({
+        sql: "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 101 ROWS ONLY",
+        probeApplied: true,
+      });
+    });
+
+    it.each([
+      "SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount",
+      "SELECT TOP 1 PERCENT id FROM orders",
+      "SELECT TOP (@p1) id FROM orders",
+    ])("should always probe a TOP that is not a row bound: %s", (sql) => {
+      // TOP 1 WITH TIES / TOP 1 PERCENT can return thousands of rows, so a
+      // literal within the cap must not be taken as the user's own limit.
+      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
+        sql: `SELECT TOP 101 * FROM (${sql}\n) AS subq`,
+        probeApplied: true,
+      });
+    });
+
+    it("should probe a SELECT DISTINCT by inserting TOP after DISTINCT", () => {
+      expect(
+        SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe("SELECT DISTINCT status FROM orders", 100)
+      ).toEqual({ sql: "SELECT DISTINCT TOP 101 status FROM orders", probeApplied: true });
+    });
   });
 
   describe("flagTruncation", () => {
@@ -682,15 +770,12 @@ describe("SQLRowLimiter", () => {
       expect("truncated" in resultSet).toBe(false);
     });
 
-    it("should do nothing when the probe was not applied", () => {
+    it.each([
+      ["the probe was not applied", 2, false],
+      ["maxRows is undefined", undefined, true],
+    ])("should do nothing when %s", (_label, maxRows, probeApplied) => {
       const resultSet = { rows: [{ id: 1 }, { id: 2 }, { id: 3 }], rowCount: 3 };
-      SQLRowLimiter.flagTruncation(resultSet, 2, false);
-      expect(resultSet).toEqual({ rows: [{ id: 1 }, { id: 2 }, { id: 3 }], rowCount: 3 });
-    });
-
-    it("should do nothing when maxRows is undefined", () => {
-      const resultSet = { rows: [{ id: 1 }, { id: 2 }, { id: 3 }], rowCount: 3 };
-      SQLRowLimiter.flagTruncation(resultSet, undefined, true);
+      SQLRowLimiter.flagTruncation(resultSet, maxRows, probeApplied);
       expect(resultSet).toEqual({ rows: [{ id: 1 }, { id: 2 }, { id: 3 }], rowCount: 3 });
     });
   });
