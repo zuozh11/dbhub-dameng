@@ -68,7 +68,6 @@ describe('Environment Configuration Tests', () => {
       ['mysql', 3306],
       ['mariadb', 3306],
       ['sqlserver', 1433],
-      ['dameng', 5236],
     ])('should build %s DSN with default port %i when port not specified', (type, port) => {
       process.env.DB_TYPE = type;
       process.env.DB_HOST = `${type}.example.com`;

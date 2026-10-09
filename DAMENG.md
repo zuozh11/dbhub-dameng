@@ -35,13 +35,9 @@ pnpm install --frozen-lockfile
 pnpm test:unit
 pnpm build
 pnpm test:build
-# 可选：明确指定本机配置，只读验证真实 DM8（不会执行 init_script）
-node scripts/verify-dameng.mjs /absolute/path/to/dbhub.toml [source-id]
-# 另外验证可选诊断工具（不会修改原配置）
-node scripts/verify-dameng.mjs /absolute/path/to/dbhub.toml [source-id] --extended
 ```
 
-GitHub 检查无需真实库凭据；真实 DM8 验证在本机显式运行。
+验证复用上游已有测试与构建检查，fork 不维护自有测试文件。GitHub 检查无需真实库凭据。
 
 ## 自动同步和发布
 
