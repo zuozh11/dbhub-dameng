@@ -2,6 +2,8 @@
  * Configuration types for TOML-based multi-database setup
  */
 
+import type { SessionSettings } from "../utils/session-settings.js";
+
 /**
  * SSH tunnel configuration (inline per-source)
  */
@@ -48,6 +50,10 @@ export interface ConnectionParams {
   sslrootcert?: string; // CA certificate path (PostgreSQL only; requires verify-ca or verify-full)
   sslcert?: string; // PEM client certificate path for client certificate authentication (PostgreSQL only; requires sslkey and sslmode require/verify-ca/verify-full)
   sslkey?: string; // PEM private key path for sslcert (PostgreSQL only; unencrypted)
+  // Oracle wallet / mutual TLS options (Oracle only; require sslmode require or verify-full)
+  wallet_location?: string; // Directory containing the PEM wallet (ewallet.pem)
+  wallet_password?: string; // Password of an encrypted ewallet.pem
+  ssl_server_cert_dn?: string; // Expected server certificate DN, for hosts whose name does not match the certificate
   // SQL Server authentication options
   authentication?: "ntlm" | "azure-active-directory-access-token";
   domain?: string; // Required for NTLM authentication
@@ -69,6 +75,7 @@ export interface SourceConfig extends ConnectionParams, SSHConfig {
   timezone?: string; // MySQL/MariaDB: how the driver interprets DATETIME values. "Z" (UTC), "local", or "±HH:MM" (e.g., "+09:00")
   charset?: string; // MySQL/MariaDB: connection character set (e.g., "utf8mb4"). May be combined with collation; when both are set, collation takes precedence (it implies its character set).
   collation?: string; // MySQL/MariaDB: connection collation (e.g., "utf8mb4_0900_ai_ci"). Takes precedence over charset when both are set.
+  session?: SessionSettings; // MySQL/PostgreSQL: [sources.session] settings applied to every new connection (e.g., lock_timeout = "5s")
 }
 
 /**

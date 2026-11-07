@@ -40,6 +40,7 @@ import {
   clientQueryTimeoutMs,
   isClientSideTimeout,
 } from "../../utils/query-timeout.js";
+import { buildPostgresSessionOptions } from "../../utils/session-settings.js";
 
 /**
  * PostgreSQL DSN Parser
@@ -260,11 +261,6 @@ export class PostgresConnector implements Connector {
       // not shifted by the host's local timezone (see type-parsers.ts).
       poolConfig.types = postgresTypeParsers;
 
-      // SDK-level readonly enforcement: Set default_transaction_read_only for the entire connection
-      if (config?.readonly) {
-        poolConfig.options = (poolConfig.options || '') + ' -c default_transaction_read_only=on';
-      }
-
       // Set search_path if configured
       if (config?.searchPath) {
         const schemas = config.searchPath.split(',').map(s => s.trim()).filter(s => s.length > 0);
@@ -275,6 +271,23 @@ export class PostgresConnector implements Connector {
           const optionsValue = quotedSchemas.join(',').replace(/\\/g, '\\\\').replace(/ /g, '\\ ');
           poolConfig.options = (poolConfig.options || '') + ` -c search_path=${optionsValue}`;
         }
+      }
+
+      // Per-source [sources.session] settings, sent as startup options like
+      // search_path, so the server rejects a bad one when the connection opens.
+      if (config?.sessionSettings !== undefined) {
+        const sessionOptions = buildPostgresSessionOptions(config.sessionSettings);
+        if (sessionOptions !== '') {
+          poolConfig.options = (poolConfig.options || '') + sessionOptions;
+        }
+      }
+
+      // SDK-level readonly enforcement: set default_transaction_read_only for the
+      // entire connection. Appended last on purpose: the server applies startup
+      // options in order, so the enforced value wins over a conflicting
+      // `default_transaction_read_only = false` in [sources.session].
+      if (config?.readonly) {
+        poolConfig.options = (poolConfig.options || '') + ' -c default_transaction_read_only=on';
       }
 
       this.pool = new Pool(poolConfig);

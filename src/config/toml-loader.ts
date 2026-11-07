@@ -7,6 +7,7 @@ import { parseCommandLineArgs, requireFlagValue } from "./env.js";
 import { parseConnectionInfoFromDSN, getDefaultPortForType } from "../utils/dsn-obfuscate.js";
 import { SafeURL } from "../utils/safe-url.js";
 import { MAX_QUERY_TIMEOUT_SECONDS } from "../utils/query-timeout.js";
+import { validateSessionSettings } from "../utils/session-settings.js";
 import { BUILTIN_TOOL_EXECUTE_SQL, BUILTIN_TOOL_SEARCH_OBJECTS, ALL_BUILTIN_TOOL_NAMES } from "../tools/builtin-tools.js";
 
 /**
@@ -22,6 +23,22 @@ export function loadTomlConfig(): { sources: SourceConfig[]; tools?: TomlConfig[
   try {
     const fileContent = fs.readFileSync(configPath, "utf-8");
     const rawToml = toml.parse(fileContent) as unknown as TomlConfig;
+
+    // An unresolved placeholder would reach the driver verbatim (e.g. as the
+    // password), failing every login and eventually locking the account. Check
+    // before interpolating so that a resolved value containing "${...}" is not
+    // mistaken for a missing variable.
+    if (Array.isArray(rawToml.sources)) {
+      rawToml.sources.forEach((source, index) => {
+        const missing = findUnresolvedEnvVars(source);
+        if (missing.length > 0) {
+          const name = typeof source?.id === "string" ? `'${source.id}'` : `#${index + 1}`;
+          throw new Error(
+            `source ${name} references unset environment variable(s): ${missing.join(", ")}`
+          );
+        }
+      });
+    }
 
     // Interpolate environment variables (e.g., ${DB_PASSWORD}) in all string values
     const parsedToml = interpolateEnvVars(rawToml) as TomlConfig;
@@ -235,6 +252,27 @@ function validateToolsConfig(
  * and the merge step to append a duplicate param. Scanning the raw query string
  * here avoids that.
  */
+/** Raw (undecoded) keys of a DSN's query string, in order, duplicates included. */
+function rawDSNQueryKeys(dsn: string): string[] {
+  const queryStart = dsn.indexOf("?");
+  if (queryStart === -1) {
+    return [];
+  }
+  return dsn
+    .substring(queryStart + 1)
+    .split("&")
+    .filter((pair) => pair !== "")
+    .map((pair) => {
+      const eq = pair.indexOf("=");
+      return eq === -1 ? pair : pair.substring(0, eq);
+    });
+}
+
+/** How many times `key` appears in the DSN's query string. */
+function countRawDSNQueryParam(dsn: string, key: string): number {
+  return rawDSNQueryKeys(dsn).filter((rawKey) => rawKey === key).length;
+}
+
 function getRawDSNQueryParam(dsn: string, key: string): string | null {
   const queryStart = dsn.indexOf("?");
   if (queryStart === -1) {
@@ -261,6 +299,9 @@ function getRawDSNQueryParam(dsn: string, key: string): string | null {
   }
   return null;
 }
+
+/** Oracle wallet / mutual TLS fields, also accepted as DSN query parameters of the same name. */
+const ORACLE_WALLET_FIELDS = ["wallet_location", "wallet_password", "ssl_server_cert_dn"] as const;
 
 /** SSL modes in which a PostgreSQL client certificate (sslcert/sslkey) is presented. */
 const CLIENT_CERT_SSL_MODES: ReadonlyArray<string> = ["require", "verify-ca", "verify-full"];
@@ -428,6 +469,40 @@ function validateDSNFieldConflicts(source: SourceConfig, configPath: string): vo
   const dsnDomain = getRawDSNQueryParam(source.dsn!, "domain");
   if (source.domain && dsnDomain !== null && dsnDomain !== source.domain) {
     conflict("domain", source.domain, dsnDomain);
+  }
+
+  // A repeated wallet parameter is ambiguous: this loader reads the first
+  // occurrence and SafeURL (hence the connector) the last, so the directory
+  // checked here could differ from the one used at connection time.
+  for (const field of ORACLE_WALLET_FIELDS) {
+    if (countRawDSNQueryParam(source.dsn!, field) > 1) {
+      throw new Error(
+        `Configuration file ${configPath}: source '${source.id}' has ${field} more than once in the DSN. Set it once.`
+      );
+    }
+  }
+
+  const dsnWalletLocation = getRawDSNQueryParam(source.dsn!, "wallet_location");
+  if (
+    source.wallet_location &&
+    dsnWalletLocation !== null &&
+    expandHomeDir(source.wallet_location) !== expandHomeDir(dsnWalletLocation)
+  ) {
+    conflict("wallet_location", expandHomeDir(source.wallet_location), expandHomeDir(dsnWalletLocation));
+  }
+
+  const dsnCertDN = getRawDSNQueryParam(source.dsn!, "ssl_server_cert_dn");
+  if (source.ssl_server_cert_dn && dsnCertDN !== null && dsnCertDN !== source.ssl_server_cert_dn) {
+    conflict("ssl_server_cert_dn", source.ssl_server_cert_dn, dsnCertDN);
+  }
+
+  // Same check, but never echo the secret values.
+  const dsnWalletPassword = getRawDSNQueryParam(source.dsn!, "wallet_password");
+  if (source.wallet_password && dsnWalletPassword !== null && dsnWalletPassword !== source.wallet_password) {
+    throw new Error(
+      `Configuration file ${configPath}: source '${source.id}' has conflicting wallet_password: ` +
+        `the DSN and the wallet_password field differ. Set wallet_password in only one place.`
+    );
   }
 }
 
@@ -729,6 +804,49 @@ function validateSourceConfig(source: SourceConfig, configPath: string): void {
     }
   }
 
+  // Validate Oracle wallet / mutual TLS options
+  const walletFields = ORACLE_WALLET_FIELDS.filter((field) => source[field] !== undefined);
+  if (walletFields.length > 0) {
+    if (source.type !== "oracle") {
+      throw new Error(
+        `Configuration file ${configPath}: source '${source.id}' has ${walletFields.join(", ")} but ` +
+          `${walletFields.length > 1 ? "they are" : "it is"} only supported for Oracle.`
+      );
+    }
+    for (const field of walletFields) {
+      if (typeof source[field] !== "string" || source[field]!.trim().length === 0) {
+        throw new Error(
+          `Configuration file ${configPath}: source '${source.id}' has invalid ${field}. Must be a non-empty string.`
+        );
+      }
+    }
+    if (source.sslmode !== "require" && source.sslmode !== "verify-full") {
+      throw new Error(
+        `Configuration file ${configPath}: source '${source.id}' has ${walletFields.join(", ")} but sslmode is ` +
+          `'${source.sslmode ?? "not set"}'. Oracle wallet/TLS options require sslmode 'require' or 'verify-full'`
+      );
+    }
+    if (source.wallet_password !== undefined && source.wallet_location === undefined) {
+      throw new Error(
+        `Configuration file ${configPath}: source '${source.id}' has wallet_password but no wallet_location.`
+      );
+    }
+    if (source.wallet_location !== undefined) {
+      const walletDir = expandHomeDir(source.wallet_location);
+      let isDirectory = false;
+      try {
+        isDirectory = fs.statSync(walletDir).isDirectory();
+      } catch {
+        // reported below
+      }
+      if (!isDirectory) {
+        throw new Error(
+          `Configuration file ${configPath}: source '${source.id}' wallet_location is not an accessible directory: '${walletDir}'`
+        );
+      }
+    }
+  }
+
   // Validate search_path (PostgreSQL only)
   if (source.search_path !== undefined) {
     if (source.type !== "postgres") {
@@ -799,6 +917,21 @@ function validateSourceConfig(source: SourceConfig, configPath: string): void {
       throw new Error(
         `Configuration file ${configPath}: source '${source.id}' has invalid collation '${source.collation}'. ` +
           `Must be a non-empty string naming a collation (e.g. "utf8mb4_0900_ai_ci").`
+      );
+    }
+  }
+
+  // Validate [sources.session] (MySQL/PostgreSQL only)
+  if (source.session !== undefined) {
+    if (source.type !== "mysql" && source.type !== "postgres") {
+      throw new Error(
+        `Configuration file ${configPath}: source '${source.id}' has [sources.session] but it is only supported for MySQL and PostgreSQL sources.`
+      );
+    }
+    const problem = validateSessionSettings(source.session, source.type);
+    if (problem !== undefined) {
+      throw new Error(
+        `Configuration file ${configPath}: source '${source.id}' [sources.session] ${problem}`
       );
     }
   }
@@ -945,6 +1078,23 @@ function processSourceConfigs(
       } catch {
         // DSN parsing for query params is best-effort; connector will handle errors
       }
+
+      // Oracle wallet options given only in the DSN go through the same checks
+      // as the TOML fields (Oracle only, sslmode, wallet directory exists) and
+      // can be completed by a field: wallet_location in the DSN with
+      // wallet_password = "${WALLET_PASSWORD}" beside it is a valid split.
+      // Explicit fields are kept as they are, so conflicts are still detected.
+      // Raw lookup rather than SafeURL: a wallet password may contain '=', and
+      // a present-but-empty value (`?ssl_server_cert_dn=`) must reach
+      // validation to be rejected like an empty field, not be ignored.
+      if (processed.type === "oracle") {
+        for (const field of ORACLE_WALLET_FIELDS) {
+          const dsnValue = getRawDSNQueryParam(processed.dsn, field);
+          if (processed[field] === undefined && dsnValue !== null) {
+            processed[field] = dsnValue;
+          }
+        }
+      }
     }
 
     return processed;
@@ -954,9 +1104,33 @@ function processSourceConfigs(
 /**
  * Interpolate environment variables in configuration values.
  * Supports ${VAR_NAME} syntax, resolved from process.env at load time.
- * Unresolved variables are left as-is (no error thrown).
+ * Unresolved variables are left as-is; loadTomlConfig rejects sources that
+ * contain any (see findUnresolvedEnvVars).
  */
 const ENV_VAR_PATTERN = /\$\{([^}]+)\}/g;
+
+/**
+ * Names of the ${VAR_NAME} placeholders in a value whose environment variable
+ * is not set, in order of first appearance.
+ */
+export function findUnresolvedEnvVars(value: unknown): string[] {
+  const missing = new Set<string>();
+  const visit = (item: unknown): void => {
+    if (typeof item === "string") {
+      for (const [, varName] of item.matchAll(ENV_VAR_PATTERN)) {
+        if (process.env[varName] === undefined) {
+          missing.add(varName);
+        }
+      }
+    } else if (Array.isArray(item)) {
+      item.forEach(visit);
+    } else if (item !== null && typeof item === "object" && Object.getPrototypeOf(item) === Object.prototype) {
+      Object.values(item).forEach(visit);
+    }
+  };
+  visit(value);
+  return [...missing];
+}
 export function interpolateEnvVars(value: unknown): unknown {
   if (typeof value === "string") {
     return value.replace(ENV_VAR_PATTERN, (match, varName) => {
@@ -1036,6 +1210,7 @@ function mergeSourceFieldsIntoDSN(dsn: string, source: SourceConfig): string {
   }
 
   additions.push(...postgresSslFileParams(source).filter(({ key }) => !hasParam(key)).map(({ param }) => param));
+  additions.push(...oracleWalletParams(source).filter(({ key }) => !hasParam(key)).map(({ param }) => param));
 
   if (additions.length === 0) {
     return dsn;
@@ -1076,6 +1251,27 @@ function postgresSslFileParams(source: SourceConfig): Array<{ key: string; param
   if (source.sslcert && source.sslkey && CLIENT_CERT_SSL_MODES.includes(source.sslmode ?? "")) {
     push("sslcert");
     push("sslkey");
+  }
+  return params;
+}
+
+/**
+ * Oracle wallet / mutual TLS parameters (wallet_location/wallet_password/
+ * ssl_server_cert_dn) to append to a DSN query string, percent-encoded, with
+ * `~/` expanded in wallet_location. Validation already restricts them to Oracle
+ * sources with sslmode require or verify-full.
+ */
+function oracleWalletParams(source: SourceConfig): Array<{ key: string; param: string }> {
+  if (source.type !== "oracle") {
+    return [];
+  }
+  const params: Array<{ key: string; param: string }> = [];
+  for (const key of ORACLE_WALLET_FIELDS) {
+    const value = source[key];
+    if (value) {
+      const resolved = key === "wallet_location" ? expandHomeDir(value) : value;
+      params.push({ key, param: `${key}=${encodeURIComponent(resolved)}` });
+    }
   }
   return params;
 }
@@ -1170,6 +1366,7 @@ export function buildDSNFromSource(source: SourceConfig): string {
   }
 
   queryParams.push(...postgresSslFileParams(source).map(({ param }) => param));
+  queryParams.push(...oracleWalletParams(source).map(({ param }) => param));
 
   // Append query string if any params exist
   if (queryParams.length > 0) {

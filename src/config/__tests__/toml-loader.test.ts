@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { loadTomlConfig, buildDSNFromSource, interpolateEnvVars } from '../toml-loader.js';
+import { loadTomlConfig, buildDSNFromSource, interpolateEnvVars, findUnresolvedEnvVars } from '../toml-loader.js';
 import type { SourceConfig } from '../../types/config.js';
 import { SQLiteConnector } from '../../connectors/sqlite/index.js';
 import { MAX_QUERY_TIMEOUT_SECONDS } from '../../utils/query-timeout.js';
@@ -435,10 +435,103 @@ pool_max_connections = ${value}
         ['timezone', 'postgres', 'timezone = "+09:00"', "'timezone' but it is only supported for MySQL and MariaDB"],
         ['charset', 'postgres', 'charset = "utf8mb4"', "'charset' but it is only supported for MySQL and MariaDB"],
         ['collation', 'postgres', 'collation = "utf8mb4_0900_ai_ci"', "'collation' but it is only supported for MySQL and MariaDB"],
+        ['wallet_location', 'postgres', 'sslmode = "require"\nwallet_location = "/opt/wallet"', 'wallet_location but it is only supported for Oracle'],
+        ['ssl_server_cert_dn', 'sqlserver', 'sslmode = "require"\nssl_server_cert_dn = "CN=db"', 'ssl_server_cert_dn but it is only supported for Oracle'],
       ])('should reject %s for a %s source', (_field, type, extra, message) => {
         writeSource(extra, type);
 
         expect(() => loadTomlConfig()).toThrow(message);
+      });
+    });
+
+    describe('Oracle wallet options', () => {
+      it('should accept a wallet directory and pass the options to the DSN', () => {
+        const walletDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbhub-wallet-'));
+        try {
+          writeSource(
+            `sslmode = "require"\nwallet_location = '${walletDir}'\nwallet_password = "w@llet"\nssl_server_cert_dn = "CN=adb.example.com"`,
+            'oracle'
+          );
+          const source = loadTomlConfig()!.sources[0];
+          const dsn = buildDSNFromSource(source);
+
+          expect(dsn).toContain(`wallet_location=${encodeURIComponent(walletDir)}`);
+          expect(dsn).toContain('wallet_password=w%40llet');
+          expect(dsn).toContain('ssl_server_cert_dn=CN%3Dadb.example.com');
+        } finally {
+          fs.rmSync(walletDir, { recursive: true, force: true });
+        }
+      });
+
+      it.each([
+        ['sslmode not set', 'ssl_server_cert_dn = "CN=db"', "sslmode is 'not set'. Oracle wallet/TLS options require sslmode 'require' or 'verify-full'"],
+        ['sslmode disable', 'sslmode = "disable"\nssl_server_cert_dn = "CN=db"', "sslmode is 'disable'"],
+        ['wallet_password alone', 'sslmode = "require"\nwallet_password = "x"', 'has wallet_password but no wallet_location'],
+        ['missing wallet directory', 'sslmode = "require"\nwallet_location = "/nonexistent/dbhub-wallet"', 'wallet_location is not an accessible directory'],
+        ['empty value', 'sslmode = "require"\nssl_server_cert_dn = " "', 'has invalid ssl_server_cert_dn'],
+      ])('should reject %s', (_case, extra, message) => {
+        writeSource(extra, 'oracle');
+
+        expect(() => loadTomlConfig()).toThrow(message);
+      });
+
+      it('should complete wallet_location from the DSN with a wallet_password field', () => {
+        const walletDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbhub-wallet-'));
+        try {
+          const config = loadToml(`
+[[sources]]
+id = "adb"
+dsn = "oracle://app:pass@adb.example.com:1522/svc?sslmode=require&wallet_location=${encodeURIComponent(walletDir)}"
+wallet_password = "w@llet"
+`);
+          const source = config!.sources[0];
+          expect(source.wallet_location).toBe(walletDir);
+          expect(source.wallet_password).toBe('w@llet');
+
+          const dsn = buildDSNFromSource(source);
+          expect(dsn).toContain(`wallet_location=${encodeURIComponent(walletDir)}`);
+          expect(dsn).toContain('wallet_password=w%40llet');
+          expect(dsn.match(/wallet_location=/g)).toHaveLength(1);
+        } finally {
+          fs.rmSync(walletDir, { recursive: true, force: true });
+        }
+      });
+
+      it.each([
+        ['missing wallet directory', 'sslmode=require&wallet_location=%2Fnonexistent%2Fdbhub-wallet', 'wallet_location is not an accessible directory'],
+        ['wallet_password alone', 'sslmode=require&wallet_password=x', 'has wallet_password but no wallet_location'],
+        ['sslmode disable', 'sslmode=disable&ssl_server_cert_dn=CN%3Ddb', "sslmode is 'disable'"],
+        // Present but empty is rejected like an empty field, not ignored
+        ['empty value', 'sslmode=require&ssl_server_cert_dn=', 'has invalid ssl_server_cert_dn'],
+        ['duplicate parameter', 'sslmode=require&wallet_location=%2Fmissing&wallet_location=%2Ftmp', 'has wallet_location more than once in the DSN'],
+      ])('should validate wallet options given only in the DSN (%s)', (_case, query, message) => {
+        expect(() => loadToml(`
+[[sources]]
+id = "adb"
+dsn = "oracle://app:pass@adb.example.com:1522/svc?${query}"
+`)).toThrow(message);
+      });
+
+      it('should reject a wallet_password that conflicts with the DSN without echoing either value', () => {
+        const walletDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbhub-wallet-'));
+        try {
+          let error: Error | undefined;
+          try {
+            loadToml(`
+[[sources]]
+id = "adb"
+dsn = "oracle://app:pass@adb.example.com:1522/svc?sslmode=require&wallet_location=${encodeURIComponent(walletDir)}&wallet_password=dsnSecret"
+wallet_password = "fieldSecret"
+`);
+          } catch (e) {
+            error = e as Error;
+          }
+          expect(error?.message).toContain('conflicting wallet_password');
+          expect(error?.message).not.toContain('dsnSecret');
+          expect(error?.message).not.toContain('fieldSecret');
+        } finally {
+          fs.rmSync(walletDir, { recursive: true, force: true });
+        }
       });
     });
 
@@ -468,6 +561,55 @@ id = "test_db"
 dsn = "${DSN_BY_TYPE[type]}"
 ${extra}
 `)).toThrow(message);
+      });
+    });
+
+    describe('[sources.session]', () => {
+      const withSession = (type: string, body: string): string => `
+[[sources]]
+id = "test_db"
+dsn = "${DSN_BY_TYPE[type]}"
+
+[sources.session]
+${body}
+`;
+
+      it.each([
+        ['mysql', 'transaction_read_only = 1\nlock_wait_timeout = 5\ntime_zone = "+09:00"', { transaction_read_only: 1, lock_wait_timeout: 5, time_zone: '+09:00' }],
+        ['mysql', 'max_heap_table_size = 9223372036854775807', { max_heap_table_size: 9223372036854775807n }],
+        ['postgres', 'lock_timeout = "5s"\n"pg_stat_statements.track" = "all"\njit = false', { lock_timeout: '5s', 'pg_stat_statements.track': 'all', jit: false }],
+      ])('should accept a %s session table and echo it back', (type, body, expected) => {
+        const result = loadToml(withSession(type, body));
+        expect(result?.sources[0].session).toEqual(expected);
+      });
+
+      it.each([
+        ['for a MariaDB source', 'mariadb', 'lock_wait_timeout = 5', 'only supported for MySQL and PostgreSQL'],
+        ['a non-table value', 'mysql', { inline: 'session = 5' }, 'must be a table'],
+        ['a datetime in place of the table', 'postgres', { inline: 'session = 2024-01-01T00:00:00Z' }, 'must be a table'],
+        ['a local date in place of the table', 'mysql', { inline: 'session = 1979-05-27' }, 'must be a table'],
+        ['a name that is not an identifier', 'mysql', '"lock wait" = 5', "invalid setting name 'lock wait'"],
+        ['a dotted name on MySQL', 'mysql', '"a.b" = 1', "invalid setting name 'a.b'"],
+        ['a name with more than one dot on PostgreSQL', 'postgres', '"a.b.c" = 1', "invalid setting name 'a.b.c'"],
+        ['max_execution_time on MySQL', 'mysql', 'MAX_EXECUTION_TIME = 1000', "Use 'query_timeout' instead"],
+        ['statement_timeout on PostgreSQL', 'postgres', 'statement_timeout = "5s"', "Use 'query_timeout' instead"],
+        ['search_path on PostgreSQL', 'postgres', 'search_path = "app"', "Use 'search_path' instead"],
+        ['an array value', 'mysql', 'sql_mode = ["ANSI"]', "invalid value for 'sql_mode'"],
+        ['a nested table', 'postgres', '[sources.session.lock_timeout]\nx = 1', "invalid value for 'lock_timeout'"],
+        ['a date value', 'postgres', 'datestyle = 1979-05-27', "invalid value for 'datestyle'"],
+        ['a backslash in a MySQL string', 'mysql', 'sql_mode = "A\\\\B"', 'must not contain backslashes'],
+        ['a NUL in a PostgreSQL string', 'postgres', 'application_name = "a\\u0000b"', 'must not contain NUL'],
+      ])('should reject %s', (_label, type, body, message) => {
+        // `inline` replaces the [sources.session] table with a plain key.
+        const toml = typeof body === 'string'
+          ? withSession(type, body)
+          : `
+[[sources]]
+id = "test_db"
+dsn = "${DSN_BY_TYPE[type]}"
+${body.inline}
+`;
+        expect(() => loadToml(toml)).toThrow(message);
       });
     });
 
@@ -981,6 +1123,16 @@ aws_iam_auth = true
         'merge authentication and domain fields into a SQL Server DSN',
         { type: 'sqlserver', dsn: 'sqlserver://user:pass@localhost:1433/db', authentication: 'ntlm', domain: 'CORP' },
         'sqlserver://user:pass@localhost:1433/db?authentication=ntlm&domain=CORP',
+      ],
+      [
+        'merge Oracle wallet fields into an Oracle DSN',
+        { type: 'oracle', dsn: 'oracle://app:pass@adb:1522/svc', sslmode: 'require', wallet_location: '/opt/wallet', wallet_password: 'p&w', ssl_server_cert_dn: 'CN=adb' },
+        'oracle://app:pass@adb:1522/svc?sslmode=require&wallet_location=%2Fopt%2Fwallet&wallet_password=p%26w&ssl_server_cert_dn=CN%3Dadb',
+      ],
+      [
+        'not duplicate Oracle wallet params already present in the DSN',
+        { type: 'oracle', dsn: 'oracle://app:pass@adb:1522/svc?sslmode=require&wallet_location=%2Fw', sslmode: 'require', wallet_location: '/w' },
+        'oracle://app:pass@adb:1522/svc?sslmode=require&wallet_location=%2Fw',
       ],
       [
         'merge sslrootcert field into a postgres DSN for verify-ca',
@@ -1513,15 +1665,65 @@ dsn = "postgres://\${TEST_DB_USER}:\${TEST_DB_PASSWORD}@localhost:5432/testdb"
       expect(result?.sources[0].dsn).toBe('postgres://admin:p@ss@localhost:5432/testdb');
     });
 
-    it('should leave unresolved variables as-is', () => {
+    it('should reject a source that references an unset variable', () => {
       delete process.env.NONEXISTENT_VAR;
-      const result = loadToml(`
+      expect(() => loadToml(`
 [[sources]]
 id = "test_db"
 dsn = "postgres://user:\${NONEXISTENT_VAR}@localhost:5432/testdb"
+`)).toThrow("source 'test_db' references unset environment variable(s): NONEXISTENT_VAR");
+    });
+
+    it('should name every unset variable of a source, not their values', () => {
+      delete process.env.MISSING_USER;
+      delete process.env.MISSING_PASSWORD;
+      vi.stubEnv('TEST_DB_HOST', 'db.internal');
+      expect(() => loadToml(`
+[[sources]]
+id = "test_db"
+type = "postgres"
+host = "\${TEST_DB_HOST}"
+database = "testdb"
+user = "\${MISSING_USER}"
+password = "\${MISSING_PASSWORD}"
+`)).toThrow(/unset environment variable\(s\): MISSING_USER, MISSING_PASSWORD$/);
+    });
+
+    it('should identify a source without id by its position', () => {
+      delete process.env.NONEXISTENT_VAR;
+      expect(() => loadToml(`
+[[sources]]
+dsn = "postgres://user:\${NONEXISTENT_VAR}@localhost:5432/testdb"
+`)).toThrow('source #1 references unset environment variable(s): NONEXISTENT_VAR');
+    });
+
+    it('should accept a variable set to an empty string', () => {
+      vi.stubEnv('EMPTY_PASSWORD', '');
+      const result = loadToml(`
+[[sources]]
+id = "test_db"
+dsn = "postgres://user:\${EMPTY_PASSWORD}@localhost:5432/testdb"
 `);
 
-      expect(result?.sources[0].dsn).toBe('postgres://user:${NONEXISTENT_VAR}@localhost:5432/testdb');
+      expect(result?.sources[0].dsn).toBe('postgres://user:@localhost:5432/testdb');
+    });
+
+    it('should not mistake a resolved value containing ${...} for a missing variable', () => {
+      vi.stubEnv('TEST_DB_PASSWORD', 'pa${ss}word');
+      const result = loadToml(`
+[[sources]]
+id = "test_db"
+dsn = "postgres://user:\${TEST_DB_PASSWORD}@localhost:5432/testdb"
+`);
+
+      expect(result?.sources[0].dsn).toBe('postgres://user:pa${ss}word@localhost:5432/testdb');
+    });
+
+    it('should report unset variables recursively', () => {
+      delete process.env.NONEXISTENT_VAR;
+      vi.stubEnv('TEST_SET_VAR', 'x');
+      expect(findUnresolvedEnvVars({ a: '${TEST_SET_VAR}', b: ['${NONEXISTENT_VAR}'], c: { d: '${NONEXISTENT_VAR}' }, e: 1 }))
+        .toEqual(['NONEXISTENT_VAR']);
     });
 
     it('should not affect non-string values', () => {

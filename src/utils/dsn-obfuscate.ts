@@ -90,6 +90,44 @@ export function parseConnectionInfoFromDSN(dsn: string): ParsedConnectionInfo | 
  */
 export const REDACTED_DSN = '<redacted DSN>';
 
+/** DSN query parameters whose value is a secret and must not be logged. */
+const SECRET_QUERY_PARAM = /password/i;
+
+/** decodeURIComponent that hands back the input when it is not valid encoding */
+function decodeLoosely(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Mask the value of every secret-bearing parameter in a raw DSN query string,
+ * leaving everything else byte-for-byte as written.
+ *
+ * Each pair is split at its first '=', so a secret whose value contains an
+ * unescaped '=' (e.g. `wallet_password=secret==`) is still recognised and
+ * masked. Keys are matched both raw and percent-decoded.
+ */
+function maskSecretQueryParams(rawQuery: string): { query: string; hasSecretParam: boolean } {
+  let hasSecretParam = false;
+  const pairs = rawQuery.split('&').map((pair) => {
+    const eq = pair.indexOf('=');
+    if (eq === -1) {
+      return pair;
+    }
+    const key = pair.substring(0, eq);
+    const value = pair.substring(eq + 1);
+    if (!value || !(SECRET_QUERY_PARAM.test(key) || SECRET_QUERY_PARAM.test(decodeLoosely(key)))) {
+      return pair;
+    }
+    hasSecretParam = true;
+    return `${key}=${'*'.repeat(Math.min(decodeLoosely(value).length, 8))}`;
+  });
+  return { query: pairs.join('&'), hasSecretParam };
+}
+
 /**
  * Obfuscates the password in a DSN string for logging purposes.
  * Fails closed: if the DSN cannot be parsed, returns REDACTED_DSN rather than
@@ -121,37 +159,40 @@ export function obfuscateDSNPassword(dsn: string): string {
       return REDACTED_DSN;
     }
 
+    // Query parameters can carry secrets too (e.g. Oracle wallet_password).
+    // They are masked from the raw query string rather than SafeURL's parsed
+    // params: a pair SafeURL cannot parse is dropped from the params, and a
+    // dropped secret would otherwise be echoed verbatim.
+    const queryStart = dsn.indexOf('?');
+    const rawQuery = queryStart === -1 ? '' : dsn.substring(queryStart + 1);
+    const { query, hasSecretParam } = maskSecretQueryParams(rawQuery);
+
     // No password to obfuscate
-    if (!url.password) {
+    if (!url.password && !hasSecretParam) {
       return dsn;
     }
 
     // Reconstruct DSN with obfuscated password
-    const obfuscatedPassword = '*'.repeat(Math.min(url.password.length, 8));
     const protocol = dsn.split(':')[0];
 
     // SafeURL strips the brackets from an IPv6 literal so drivers get the bare
     // address; a DSN needs them back, or the address's colons read as a port.
     const host = url.hostname.includes(':') ? `[${url.hostname}]` : url.hostname;
 
-    let result;
-    if (url.username) {
-      result = `${protocol}://${url.username}:${obfuscatedPassword}@${host}`;
-    } else {
-      result = `${protocol}://${obfuscatedPassword}@${host}`;
+    let userinfo = url.username;
+    if (url.password) {
+      const obfuscatedPassword = '*'.repeat(Math.min(url.password.length, 8));
+      userinfo = url.username ? `${url.username}:${obfuscatedPassword}` : obfuscatedPassword;
     }
+    let result = userinfo ? `${protocol}://${userinfo}@${host}` : `${protocol}://${host}`;
     if (url.port) {
       result += `:${url.port}`;
     }
     result += url.pathname;
 
-    // Preserve query parameters
-    if (url.searchParams.size > 0) {
-      const params: string[] = [];
-      url.forEachSearchParam((value, key) => {
-        params.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
-      });
-      result += `?${params.join('&')}`;
+    // Preserve query parameters as written, with secret values masked
+    if (rawQuery) {
+      result += `?${query}`;
     }
 
     return result;
