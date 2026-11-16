@@ -1,7 +1,7 @@
 import os from "os";
 import path from "path";
 import oracledb from "oracledb";
-import { OracleCatalog } from "../oracle-catalog.js";
+import { OracleCatalog, type CatalogQuery } from "../oracle-catalog.js";
 import {
   Connector,
   ConnectorType,
@@ -29,6 +29,15 @@ import { closeQuietly } from "../../utils/resource-cleanup.js";
 /** Expand a leading `~/` in a wallet directory given as a DSN parameter. */
 function expandHomeDir(dir: string): string {
   return dir.startsWith("~/") ? path.join(os.homedir(), dir.slice(2)) : dir;
+}
+
+/**
+ * End-to-end tracing attributes for V$SESSION / ASH: `module` is the DBHub
+ * tool family that issued the call, `action` the connector method.
+ */
+interface SessionTag {
+  module: "connect" | "execute_sql" | "explain_sql" | "search_objects" | "health_check";
+  action: string;
 }
 
 /** What the DSN parser hands to the connector. */
@@ -124,6 +133,8 @@ export class OracleDSNParser implements DSNParser {
         user: url.username,
         password: url.password,
         connectString,
+        // V$SESSION.PROGRAM; the driver default is process.argv0 ("node").
+        program: "dbhub",
         poolMin: 0,
         poolMax: config?.poolMaxConnections ?? 4,
         poolIncrement: 1,
@@ -207,6 +218,7 @@ export class OracleConnector extends OracleCatalog implements Connector {
       // Resolve the session's default schema once; it doubles as the
       // connection smoke test so a bad credential fails here, not on first use.
       const rows = await this.query<{ SCHEMA_NAME: string }>(
+        { module: "connect", action: "connect" },
         "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS schema_name FROM dual"
       );
       this.defaultSchema = rows[0]?.SCHEMA_NAME ?? OracleConnector.foldIdentifier(parsed.pool.user ?? "");
@@ -230,8 +242,8 @@ export class OracleConnector extends OracleCatalog implements Connector {
     }
   }
 
-  /** Check out a pooled connection with the configured statement timeout applied. */
-  private async acquire(): Promise<oracledb.Connection> {
+  /** Check out a pooled connection with the statement timeout and session tag applied. */
+  private async acquire(tag: SessionTag): Promise<oracledb.Connection> {
     if (!this.pool) {
       throw new Error("Not connected to Oracle database");
     }
@@ -239,12 +251,18 @@ export class OracleConnector extends OracleCatalog implements Connector {
     if (this.callTimeoutMs !== undefined) {
       connection.callTimeout = this.callTimeoutMs;
     }
+    // Pooled sessions keep the previous caller's values; these piggyback on the next round trip.
+    connection.module = tag.module;
+    connection.action = tag.action;
     return connection;
   }
 
   /** Run one or more catalog queries on a single short-lived pooled connection. */
-  private async withConnection<R>(fn: (connection: oracledb.Connection) => Promise<R>): Promise<R> {
-    const connection = await this.acquire();
+  private async withConnection<R>(
+    tag: SessionTag,
+    fn: (connection: oracledb.Connection) => Promise<R>
+  ): Promise<R> {
+    const connection = await this.acquire(tag);
     try {
       return await fn(connection);
     } finally {
@@ -265,8 +283,23 @@ export class OracleConnector extends OracleCatalog implements Connector {
   }
 
   /** Run one catalog query on a short-lived pooled connection. */
-  protected query<T>(sql: string, binds: oracledb.BindParameters = {}): Promise<T[]> {
-    return this.withConnection((connection) => OracleConnector.fetchRows<T>(connection, sql, binds));
+  private query<T>(
+    tag: SessionTag,
+    sql: string,
+    binds: oracledb.BindParameters = {}
+  ): Promise<T[]> {
+    return this.withConnection(tag, (connection) =>
+      OracleConnector.fetchRows<T>(connection, sql, binds)
+    );
+  }
+
+  protected withCatalogQuery<T>(
+    action: string,
+    run: (query: CatalogQuery) => Promise<T>
+  ): Promise<T> {
+    return this.withConnection({ module: "search_objects", action }, (connection) =>
+      run((sql, binds) => OracleConnector.fetchRows(connection, sql, binds))
+    );
   }
 
   /**
@@ -336,6 +369,7 @@ export class OracleConnector extends OracleCatalog implements Connector {
       // (SYS, SYSTEM, XDB, ...) are noise for schema exploration, so list only
       // application users plus the session's own schema.
       const rows = await this.query<{ USERNAME: string }>(
+        { module: "search_objects", action: "getSchemas" },
         `SELECT username
          FROM all_users
          WHERE oracle_maintained = 'N' OR username = :current_schema
@@ -355,6 +389,7 @@ export class OracleConnector extends OracleCatalog implements Connector {
   async getTables(schema?: string): Promise<string[]> {
     try {
       const rows = await this.query<{ TABLE_NAME: string }>(
+        { module: "search_objects", action: "getTables" },
         `SELECT table_name
          FROM all_tables
          WHERE owner = :schema
@@ -374,6 +409,7 @@ export class OracleConnector extends OracleCatalog implements Connector {
   async tableExists(tableName: string, schema?: string): Promise<boolean> {
     try {
       const rows = await this.query<{ CNT: number }>(
+        { module: "search_objects", action: "tableExists" },
         `SELECT COUNT(*) AS cnt FROM all_tables WHERE owner = :schema AND table_name = :table_name`,
         { schema: this.schemaOrDefault(schema), table_name: OracleConnector.foldIdentifier(tableName) }
       );
@@ -390,13 +426,14 @@ export class OracleConnector extends OracleCatalog implements Connector {
 
     const notes: string[] = [];
     const result: HealthCheckResult = {};
+    const tag: SessionTag = { module: "health_check", action: "getHealthCheck" };
 
     // V$SESSION / V$PARAMETER / V$SYSSTAT are readable only with
     // SELECT_CATALOG_ROLE (or SELECT ANY DICTIONARY); without it Oracle
     // reports ORA-00942 as if the view did not exist. Degrade per section
     // instead of failing the whole health check.
     try {
-      const [sessions, params] = await this.withConnection((connection) =>
+      const [sessions, params] = await this.withConnection(tag, (connection) =>
         Promise.all([
           OracleConnector.fetchRows<{
             TOTAL: number;
@@ -453,6 +490,7 @@ export class OracleConnector extends OracleCatalog implements Connector {
 
     try {
       const stats = await this.query<{ NAME: string; VALUE: number }>(
+        tag,
         `SELECT name, value FROM v$sysstat
          WHERE name IN ('db block gets', 'consistent gets', 'physical reads')`
       );
@@ -524,7 +562,7 @@ export class OracleConnector extends OracleCatalog implements Connector {
 
     const statements = OracleConnector.splitStatements(afterNoise);
 
-    const connection = await this.acquire();
+    const connection = await this.acquire({ module: "execute_sql", action: "executeSQL" });
     try {
       // Engine-level read-only enforcement: a READ ONLY transaction makes the
       // server itself reject DML (ORA-01456). DDL is not covered by it (DDL
@@ -625,7 +663,8 @@ export class OracleConnector extends OracleCatalog implements Connector {
 
     // STATEMENT_ID is VARCHAR2(30); this is well within it.
     const statementId = `dbhub_${Math.random().toString(36).slice(2, 14)}`;
-    return this.withConnection(async (connection) => {
+    const tag: SessionTag = { module: "explain_sql", action: "explainQuery" };
+    return this.withConnection(tag, async (connection) => {
       try {
         await connection.execute(
           `EXPLAIN PLAN SET STATEMENT_ID = '${statementId}' FOR ${innerQuery}`,

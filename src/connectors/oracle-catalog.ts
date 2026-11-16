@@ -1,8 +1,17 @@
 import type { TableColumn, TableIndex, StoredProcedure } from "./interface.js";
 
+export type CatalogQuery = <T>(sql: string, binds?: Record<string, string>) => Promise<T[]>;
+
 /** Shared ALL_* catalog queries; drivers and identifier rules stay in each connector. */
 export abstract class OracleCatalog {
-  protected abstract query<T>(sql: string, binds?: Record<string, string>): Promise<T[]>;
+  protected abstract withCatalogQuery<T>(
+    action: string,
+    run: (query: CatalogQuery) => Promise<T>
+  ): Promise<T>;
+
+  private queryCatalog<T>(action: string, sql: string, binds: Record<string, string>): Promise<T[]> {
+    return this.withCatalogQuery(action, (query) => query<T>(sql, binds));
+  }
   protected abstract schemaOrDefault(schema?: string): string;
 
   protected catalogIdentifier(name: string): string {
@@ -11,7 +20,8 @@ export abstract class OracleCatalog {
 
   async getViews(schema?: string): Promise<string[]> {
     try {
-      const rows = await this.query<{ VIEW_NAME: string }>(
+      const rows = await this.queryCatalog<{ VIEW_NAME: string }>(
+        "getViews",
         `SELECT VIEW_NAME FROM ALL_VIEWS WHERE OWNER = :schema ORDER BY VIEW_NAME`,
         { schema: this.schemaOrDefault(schema) }
       );
@@ -23,7 +33,7 @@ export abstract class OracleCatalog {
 
   async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
     try {
-      const rows = await this.query<{
+      const rows = await this.queryCatalog<{
         COLUMN_NAME: string;
         DATA_TYPE: string;
         DATA_LENGTH: number | null;
@@ -34,6 +44,7 @@ export abstract class OracleCatalog {
         DATA_DEFAULT: string | null;
         DESCRIPTION: string | null;
       }>(
+        "getTableSchema",
         `SELECT C.COLUMN_NAME,
                 C.DATA_TYPE,
                 C.DATA_LENGTH,
@@ -103,12 +114,13 @@ export abstract class OracleCatalog {
 
   async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
     try {
-      const rows = await this.query<{
+      const rows = await this.queryCatalog<{
         INDEX_NAME: string;
         UNIQUENESS: string;
         IS_PRIMARY: number;
         COLUMN_NAME: string;
       }>(
+        "getTableIndexes",
         `SELECT I.INDEX_NAME,
                 I.UNIQUENESS,
                 CASE WHEN PK.CONSTRAINT_NAME IS NOT NULL THEN 1 ELSE 0 END AS IS_PRIMARY,
@@ -151,7 +163,8 @@ export abstract class OracleCatalog {
 
   async getTableComment(tableName: string, schema?: string): Promise<string | null> {
     try {
-      const rows = await this.query<{ COMMENTS: string | null }>(
+      const rows = await this.queryCatalog<{ COMMENTS: string | null }>(
+        "getTableComment",
         `SELECT COMMENTS FROM ALL_TAB_COMMENTS WHERE OWNER = :schema AND TABLE_NAME = :table_name`,
         { schema: this.schemaOrDefault(schema), table_name: this.catalogIdentifier(tableName) }
       );
@@ -165,7 +178,8 @@ export abstract class OracleCatalog {
     try {
       // Optimizer statistics; NULL until the table has been analyzed, which
       // search_objects reports as an unknown count rather than a stale one.
-      const rows = await this.query<{ NUM_ROWS: number | null }>(
+      const rows = await this.queryCatalog<{ NUM_ROWS: number | null }>(
+        "getTableRowCount",
         `SELECT NUM_ROWS FROM ALL_TABLES WHERE OWNER = :schema AND TABLE_NAME = :table_name`,
         { schema: this.schemaOrDefault(schema), table_name: this.catalogIdentifier(tableName) }
       );
@@ -187,7 +201,8 @@ export abstract class OracleCatalog {
           : routineType === "procedure"
             ? "object_type = 'PROCEDURE'"
             : "object_type IN ('PROCEDURE', 'FUNCTION')";
-      const rows = await this.query<{ OBJECT_NAME: string }>(
+      const rows = await this.queryCatalog<{ OBJECT_NAME: string }>(
+        "getStoredProcedures",
         `SELECT OBJECT_NAME FROM ALL_OBJECTS WHERE OWNER = :schema AND ${typeFilter} ORDER BY OBJECT_NAME`,
         { schema: this.schemaOrDefault(schema) }
       );
@@ -202,59 +217,61 @@ export abstract class OracleCatalog {
       const schemaToUse = this.schemaOrDefault(schema);
       const name = this.catalogIdentifier(procedureName);
 
-      const objects = await this.query<{ OBJECT_TYPE: string }>(
-        `SELECT OBJECT_TYPE
-           FROM ALL_OBJECTS
-           WHERE OWNER = :schema AND OBJECT_NAME = :name
-             AND OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION')`,
-        { schema: schemaToUse, name }
-      );
-      if (objects.length === 0) {
-        throw new Error(`Stored procedure '${procedureName}' not found in schema '${schemaToUse}'`);
-      }
-      const objectType = objects[0].OBJECT_TYPE;
-      const isFunction = objectType === "FUNCTION";
-
-      const [args, source] = await Promise.all([
-        // Standalone routines only (package_name IS NULL). Position 0 with
-        // no argument name is a function's return value.
-        this.query<{
-          ARGUMENT_NAME: string | null;
-          POSITION: number;
-          IN_OUT: string;
-          DATA_TYPE: string | null;
-        }>(
-          `SELECT ARGUMENT_NAME, POSITION, IN_OUT, DATA_TYPE
-             FROM ALL_ARGUMENTS
+      return await this.withCatalogQuery("getStoredProcedureDetail", async (query) => {
+        const objects = await query<{ OBJECT_TYPE: string }>(
+          `SELECT OBJECT_TYPE
+             FROM ALL_OBJECTS
              WHERE OWNER = :schema AND OBJECT_NAME = :name
-               AND PACKAGE_NAME IS NULL AND DATA_LEVEL = 0
-             ORDER BY POSITION`,
+               AND OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION')`,
           { schema: schemaToUse, name }
-        ),
-        this.query<{ TEXT: string }>(
-          `SELECT TEXT FROM ALL_SOURCE
-             WHERE OWNER = :schema AND NAME = :name AND TYPE = :object_type
-             ORDER BY LINE`,
-          { schema: schemaToUse, name, object_type: objectType }
-        ),
-      ]);
+        );
+        if (objects.length === 0) {
+          throw new Error(`Stored procedure '${procedureName}' not found in schema '${schemaToUse}'`);
+        }
+        const objectType = objects[0].OBJECT_TYPE;
+        const isFunction = objectType === "FUNCTION";
 
-      const returnType = args.find(
-        (arg) => arg.POSITION === 0 && arg.ARGUMENT_NAME === null
-      )?.DATA_TYPE;
-      const parameterList = args
-        .filter((arg) => arg.ARGUMENT_NAME !== null)
-        .map((arg) => `${arg.ARGUMENT_NAME} ${arg.IN_OUT} ${arg.DATA_TYPE ?? ""}`.trim())
-        .join(", ");
+        const [args, source] = await Promise.all([
+          // Standalone routines only (package_name IS NULL). Position 0 with
+          // no argument name is a function's return value.
+          query<{
+            ARGUMENT_NAME: string | null;
+            POSITION: number;
+            IN_OUT: string;
+            DATA_TYPE: string | null;
+          }>(
+            `SELECT ARGUMENT_NAME, POSITION, IN_OUT, DATA_TYPE
+               FROM ALL_ARGUMENTS
+               WHERE OWNER = :schema AND OBJECT_NAME = :name
+                 AND PACKAGE_NAME IS NULL AND DATA_LEVEL = 0
+               ORDER BY POSITION`,
+            { schema: schemaToUse, name }
+          ),
+          query<{ TEXT: string }>(
+            `SELECT TEXT FROM ALL_SOURCE
+               WHERE OWNER = :schema AND NAME = :name AND TYPE = :object_type
+               ORDER BY LINE`,
+            { schema: schemaToUse, name, object_type: objectType }
+          ),
+        ]);
 
-      return {
-        procedure_name: name,
-        procedure_type: isFunction ? "function" : "procedure",
-        language: "plsql",
-        parameter_list: parameterList,
-        return_type: isFunction ? (returnType ?? undefined) : undefined,
-        definition: source.length > 0 ? source.map((row) => row.TEXT).join("") : undefined,
-      };
+        const returnType = args.find(
+          (arg) => arg.POSITION === 0 && arg.ARGUMENT_NAME === null
+        )?.DATA_TYPE;
+        const parameterList = args
+          .filter((arg) => arg.ARGUMENT_NAME !== null)
+          .map((arg) => `${arg.ARGUMENT_NAME} ${arg.IN_OUT} ${arg.DATA_TYPE ?? ""}`.trim())
+          .join(", ");
+
+        return {
+          procedure_name: name,
+          procedure_type: isFunction ? "function" : "procedure",
+          language: "plsql",
+          parameter_list: parameterList,
+          return_type: isFunction ? (returnType ?? undefined) : undefined,
+          definition: source.length > 0 ? source.map((row) => row.TEXT).join("") : undefined,
+        };
+      });
     } catch (error) {
       throw new Error(`Failed to get stored procedure details: ${(error as Error).message}`);
     }

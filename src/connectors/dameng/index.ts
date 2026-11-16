@@ -16,7 +16,7 @@ import { closeQuietly } from "../../utils/resource-cleanup.js";
 import { splitPLSQLStatements, LEADING_SQL_NOISE } from "../../utils/sql-parser.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
 
-import { OracleCatalog } from "../oracle-catalog.js";
+import { OracleCatalog, type CatalogQuery } from "../oracle-catalog.js";
 import { computeHitRatioPct } from "../health-check-utils.js";
 import { isReadOnlySQL } from "../../utils/allowed-keywords.js";
 import { policyFromReadonly, sqlVerdict } from "../../utils/sql-access-policy.js";
@@ -114,13 +114,20 @@ export class DamengConnector extends OracleCatalog implements Connector {
     }
   }
 
-  protected async query<T>(sql: string, parameters: Record<string, string> = {}): Promise<T[]> {
+  private async query<T>(sql: string, parameters: Record<string, string> = {}): Promise<T[]> {
     return this.withConnection(async (conn) => {
       const result = await conn.execute<T>(sql, parameters, {
         outFormat: dmdb.OUT_FORMAT_OBJECT,
       });
       return result.rows ?? [];
     });
+  }
+
+  protected withCatalogQuery<T>(
+    _action: string,
+    run: (query: CatalogQuery) => Promise<T>
+  ): Promise<T> {
+    return run((sql, binds) => this.query(sql, binds));
   }
 
   protected schemaOrDefault(schema?: string): string {
