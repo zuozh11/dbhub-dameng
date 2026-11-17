@@ -2,11 +2,22 @@ import { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import { EditorState, Prec } from '@codemirror/state';
 import { EditorView, keymap, placeholder as placeholderExt } from '@codemirror/view';
 import { sql } from '@codemirror/lang-sql';
+import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { tags } from '@lezer/highlight';
 import { defaultKeymap } from '@codemirror/commands';
 import { basicSetup } from 'codemirror';
 
+const sqlHighlightStyle = HighlightStyle.define([
+  { tag: tags.keyword, color: 'var(--syntax-keyword)' },
+  { tag: tags.string, color: 'var(--syntax-string)' },
+  { tag: [tags.number, tags.bool, tags.null], color: 'var(--syntax-number)' },
+  { tag: tags.comment, color: 'var(--muted-foreground)' },
+  { tag: tags.invalid, color: 'var(--destructive-foreground)' },
+]);
+
 export interface SqlEditorHandle {
   getSelectedSql: () => string;
+  focus: () => void;
 }
 
 interface SqlEditorProps {
@@ -16,6 +27,8 @@ interface SqlEditorProps {
   disabled?: boolean;
   readOnly?: boolean;
   placeholder?: string;
+  ariaLabelledBy?: string;
+  error?: string;
 }
 
 export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function SqlEditor({
@@ -25,6 +38,8 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   disabled = false,
   readOnly = false,
   placeholder = 'Enter SQL statement...',
+  ariaLabelledBy,
+  error,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -39,6 +54,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
 
   // Expose method to get selected SQL (or full content if no selection)
   useImperativeHandle(ref, () => ({
+    focus: () => viewRef.current?.focus(),
     getSelectedSql: () => {
       const view = viewRef.current;
       if (!view) return '';
@@ -70,24 +86,56 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
 
     const extensions = [
       basicSetup,
+      EditorView.contentAttributes.of({
+        'aria-labelledby': ariaLabelledBy || '',
+        'aria-readonly': String(readOnly),
+        ...(readOnly ? { tabindex: '0' } : {}),
+      }),
       sql(),
+      syntaxHighlighting(sqlHighlightStyle),
       keymap.of(defaultKeymap),
       placeholderExt(placeholder),
       runShortcutKeymap, // Add at the end with highest precedence
       EditorView.theme({
         '&': {
-          fontSize: '14px',
-          fontFamily: 'ui-monospace, monospace',
+          fontSize: 'inherit',
+          fontFamily: 'var(--font-mono)',
+          color: 'var(--foreground)',
+          backgroundColor: 'var(--background)',
         },
         '.cm-content': {
           padding: '12px',
           minHeight: '120px',
         },
-        '.cm-focused': {
-          outline: 'none',
+        '&.cm-focused': {
+          outline: '2px solid var(--ring)',
+          outlineOffset: '-2px',
+        },
+        '.cm-gutters': {
+          backgroundColor: 'var(--muted)',
+          color: 'var(--muted-foreground)',
+          borderColor: 'var(--border)',
+        },
+        '.cm-activeLine': {
+          backgroundColor: 'var(--muted)',
+        },
+        '.cm-activeLineGutter': {
+          backgroundColor: 'var(--accent)',
+          color: 'var(--accent-foreground)',
+        },
+        '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': {
+          backgroundColor: 'var(--selection)',
+        },
+        '.cm-cursor, .cm-dropCursor': {
+          borderLeftColor: 'var(--foreground)',
+        },
+        '.cm-placeholder': {
+          color: 'var(--muted-foreground)',
         },
         '.cm-scroller': {
           overflow: 'auto',
+          fontFamily: 'inherit',
+          lineHeight: 'var(--text-code--line-height)',
         },
       }),
     ];
@@ -121,7 +169,15 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
       view.destroy();
       viewRef.current = null;
     };
-  }, [readOnly, placeholder, onChange]);
+  }, [readOnly, placeholder, onChange, ariaLabelledBy]);
+
+  useEffect(() => {
+    const content = viewRef.current?.contentDOM;
+    if (!content) return;
+    content.setAttribute('aria-invalid', String(Boolean(error)));
+    if (error) content.setAttribute('aria-describedby', 'sql-statement-error');
+    else content.removeAttribute('aria-describedby');
+  }, [error, readOnly, placeholder, onChange, ariaLabelledBy]);
 
   // Update content when value prop changes externally
   useEffect(() => {
@@ -143,7 +199,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   return (
     <div
       ref={containerRef}
-      className="border border-border rounded-lg bg-background overflow-hidden"
+      className="border border-input rounded-lg bg-background overflow-hidden text-base sm:text-code"
     />
   );
 });

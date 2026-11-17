@@ -1,4 +1,4 @@
-@import 'tailwindcss';
+@import "tailwindcss";
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
@@ -14,85 +14,73 @@
   }
 }
 
-/*
-  The default border color has changed to `currentcolor` in Tailwind CSS v4,
-  so we've added these compatibility styles to make sure everything still
-  looks the same as it did with Tailwind CSS v3.
+/* Foundations extend Tailwind so existing utilities use the same scale. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --spacing: 0.25rem;
 
-  If we ever want to remove these styles, we need to add an explicit border
-  color utility to any element that depends on these defaults.
-*/
-@layer base {
-  *,
-  ::after,
-  ::before,
-  ::backdrop,
-  ::file-selector-button {
-    border-color: var(--color-gray-200, currentcolor);
-  }
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1.5;
+  --text-caption: 0.8125rem;
+  --text-caption--line-height: 1.5;
+  --text-sm: 0.875rem;
+  --text-sm--line-height: 1.5;
+  --text-base: 1rem;
+  --text-base--line-height: 1.5;
+  --text-lg: 1.125rem;
+  --text-lg--line-height: 1.4;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.3;
+  --text-2xl: 1.5rem;
+  --text-2xl--line-height: 1.25;
+  --text-3xl: 1.75rem;
+  --text-3xl--line-height: 1.2;
+  --text-page: 1.5rem;
+  --text-page--line-height: 1.25;
+  --text-page--letter-spacing: -0.025em;
+  --text-page--font-weight: 600;
+  --text-section: 1.125rem;
+  --text-section--line-height: 1.4;
+  --text-section--font-weight: 600;
+  --text-body: 1rem;
+  --text-body--line-height: 1.6;
+  --text-label: 0.875rem;
+  --text-label--line-height: 1.5;
+  --text-label--font-weight: 500;
+  --text-code: 0.875rem;
+  --text-code--line-height: 1.6;
+
+  --default-transition-duration: 150ms;
+  --default-transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
-
-@layer base {
-  :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
-    --radius: 0.5rem;
-  }
-
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
-  }
-}
-
-@layer base {
-  * {
-    @apply border-border;
-  }
-  body {
-    @apply bg-background text-foreground;
-  }
-}
-
-/*
-  ---break---
-*/
 
 @theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --shadow-xs: var(--elevation-control);
+  --shadow-sm: var(--elevation-raised);
+  --shadow-md: var(--elevation-floating);
+  --shadow-lg: var(--elevation-floating);
+  --color-canvas: var(--canvas);
+  --color-border-subtle: var(--border-subtle);
+  --color-selection: var(--selection);
+  --color-selection-foreground: var(--selection-foreground);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-active: var(--primary-active);
+  --color-disabled: var(--disabled);
+  --color-disabled-foreground: var(--disabled-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--foreground);
+  --color-sidebar-accent: var(--selection);
+  --color-sidebar-accent-foreground: var(--selection-foreground);
+  --color-sidebar-border: var(--border);
+  --color-sidebar-primary: var(--primary);
+  --color-sidebar-primary-foreground: var(--primary-foreground);
+  --color-sidebar-ring: var(--ring);
   --animate-skeleton: skeleton 2s -1s infinite linear;
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
@@ -120,85 +108,140 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   @keyframes skeleton {
-  to {
-    background-position: -200% 0;
+    to {
+      background-position: -200% 0;
     }
   }
 }
 
-/*
-  ---break---
-*/
-
 :root {
-  --accent: --alpha(var(--color-black) / 4%);
-  --accent-foreground: var(--color-zinc-800);
-  --background: var(--color-white);
-  --border: --alpha(var(--color-black) / 12%);
-  --card: var(--color-white);
-  --card-foreground: var(--color-zinc-800);
+  /* Brand artwork stays exact; UI roles use the supporting Zinc ramp. */
+  --brand-zinc: oklch(0.319 0.007 286);
+  --brand-white: oklch(1 0 0);
+  --radius: 0.5rem;
+  --border-hairline: 1px;
+
+  /* Surfaces: canvas → working surface → floating surface. */
+  --canvas: var(--color-zinc-50);
+  --background: var(--brand-white);
+  --card: var(--brand-white);
+  --popover: var(--brand-white);
+  --sidebar: var(--color-zinc-100);
+  --muted: var(--color-zinc-50);
+  --accent: var(--color-zinc-100);
+  --secondary: var(--color-zinc-100);
+  --selection: var(--color-zinc-200);
+
+  --foreground: var(--brand-zinc);
+  --card-foreground: var(--foreground);
+  --popover-foreground: var(--foreground);
+  --accent-foreground: var(--foreground);
+  --secondary-foreground: var(--foreground);
+  --selection-foreground: var(--foreground);
+  --muted-foreground: oklch(0.48 0.012 286);
+
+  /* Input edges and focus indicators are stronger than layout dividers. */
+  --border: oklch(0 0 0 / 0.08);
+  --border-subtle: oklch(0 0 0 / 0.05);
+  --input: oklch(0.65 0.01 286);
+  --ring: var(--color-zinc-600);
+
+  --primary: var(--brand-zinc);
+  --primary-foreground: var(--brand-white);
+  --primary-hover: color-mix(in oklch, var(--primary) 90%, oklch(0 0 0));
+  --primary-active: color-mix(in oklch, var(--primary) 80%, oklch(0 0 0));
+  --disabled: var(--color-zinc-100);
+  --disabled-foreground: var(--color-zinc-500);
+
+  /* Status foregrounds are for text; the base colors are for fills. */
   --destructive: var(--color-red-500);
   --destructive-foreground: var(--color-red-700);
-  --foreground: var(--color-zinc-800);
   --info: var(--color-blue-500);
   --info-foreground: var(--color-blue-700);
-  --input: --alpha(var(--color-black) / 12%);
-  --muted: --alpha(var(--color-black) / 4%);
-  --muted-foreground: color-mix(in srgb, var(--color-zinc-500) 90%, var(--color-black));
-  --popover: var(--color-white);
-  --popover-foreground: var(--color-zinc-800);
-  --primary: var(--color-zinc-800);
-  --primary-foreground: var(--color-zinc-50);
-  --ring: var(--color-zinc-400);
-  --secondary: --alpha(var(--color-black) / 4%);
-  --secondary-foreground: var(--color-zinc-800);
   --success: var(--color-emerald-500);
   --success-foreground: var(--color-emerald-700);
   --warning: var(--color-amber-500);
   --warning-foreground: var(--color-amber-700);
-}
 
-/*
-  ---break---
-*/
+  --syntax-keyword: oklch(0.46 0.12 300);
+  --syntax-string: oklch(0.49 0.1 165.612);
+  --syntax-number: var(--color-blue-700);
+
+  --elevation-control: 0 1px 2px oklch(0 0 0 / 0.04);
+  --elevation-raised:
+    0 0 0 1px oklch(0 0 0 / 0.05),
+    0 1px 3px oklch(0 0 0 / 0.04),
+    0 4px 10px -4px oklch(0 0 0 / 0.05);
+  --elevation-floating:
+    0 0 0 1px oklch(0 0 0 / 0.06),
+    0 4px 8px -2px oklch(0 0 0 / 0.06),
+    0 12px 24px -6px oklch(0 0 0 / 0.08);
+  color-scheme: light;
+}
 
 .dark {
-  --accent: --alpha(var(--color-white) / 6%);
-  --accent-foreground: var(--color-zinc-200);
-  --background: color-mix(in srgb, var(--color-zinc-950) 98%, var(--color-white));
-  --border: --alpha(var(--color-white) / 12%);
-  --card: color-mix(in srgb, var(--background) 98%, var(--color-white));
-  --card-foreground: var(--color-zinc-200);
-  --destructive: var(--color-red-500);
+  --canvas: var(--color-zinc-950);
+  --background: var(--color-zinc-900);
+  --card: var(--color-zinc-900);
+  --popover: var(--color-zinc-800);
+  --sidebar: var(--color-zinc-900);
+  --muted: var(--color-zinc-800);
+  --accent: var(--color-zinc-800);
+  --secondary: var(--color-zinc-800);
+  --selection: var(--brand-zinc);
+
+  --foreground: var(--color-zinc-100);
+  --muted-foreground: var(--color-zinc-400);
+  --border: var(--color-zinc-800);
+  --border-subtle: oklch(0.25 0.006 286);
+  --input: oklch(0.56 0.012 286);
+  --ring: var(--color-zinc-400);
+  --primary: var(--brand-white);
+  --primary-foreground: var(--brand-zinc);
+  --disabled: var(--color-zinc-800);
+  --disabled-foreground: var(--color-zinc-400);
+
   --destructive-foreground: var(--color-red-400);
-  --foreground: var(--color-zinc-200);
-  --info: var(--color-blue-500);
   --info-foreground: var(--color-blue-400);
-  --input: --alpha(var(--color-white) / 12%);
-  --muted: --alpha(var(--color-white) / 6%);
-  --muted-foreground: color-mix(in srgb, var(--color-zinc-500) 90%, var(--color-white));
-  --popover: color-mix(in srgb, var(--background) 96%, var(--color-white));
-  --popover-foreground: var(--color-zinc-200);
-  --primary: var(--color-zinc-200);
-  --primary-foreground: var(--color-zinc-800);
-  --ring: var(--color-zinc-500);
-  --secondary: --alpha(var(--color-white) / 6%);
-  --secondary-foreground: var(--color-zinc-200);
-  --success: var(--color-emerald-500);
   --success-foreground: var(--color-emerald-400);
-  --warning: var(--color-amber-500);
   --warning-foreground: var(--color-amber-400);
+
+  --syntax-keyword: oklch(0.78 0.1 300);
+  --syntax-string: oklch(0.765 0.164 163.223);
+  --syntax-number: oklch(0.809 0.098 251.813);
+
+  --elevation-control: 0 0 0 1px oklch(1 0 0 / 0.06);
+  --elevation-raised: 0 0 0 1px oklch(1 0 0 / 0.08);
+  --elevation-floating: 0 0 0 1px oklch(1 0 0 / 0.1);
+  color-scheme: dark;
 }
 
-/*
-  ---break---
-*/
+@media (min-resolution: 2dppx) {
+  :root {
+    --border-hairline: 0.5px;
+  }
+}
 
 @layer base {
+  html, body, #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
   * {
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-canvas text-foreground antialiased;
+    font-synthesis: none;
+  }
+
+  h1, h2, h3 {
+    text-wrap: balance;
+  }
+
+  ::selection {
+    background: var(--selection);
+    color: var(--selection-foreground);
   }
 }

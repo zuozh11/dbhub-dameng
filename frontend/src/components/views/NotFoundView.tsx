@@ -2,13 +2,13 @@ import { Link } from 'react-router-dom';
 
 export default function NotFoundView() {
   return (
-    <div className="container mx-auto px-8 py-12 max-w-4xl">
+    <div className="container mx-auto px-4 py-6 sm:px-8 sm:py-10 max-w-4xl">
       <div className="space-y-6">
         <div>
-          <h1 className="text-4xl font-bold text-foreground mb-4">
+          <h1 className="text-page text-foreground mb-4">
             404 - Page Not Found
           </h1>
-          <p className="text-xl text-muted-foreground">
+          <p className="text-body text-muted-foreground max-w-prose text-pretty">
             The page you're looking for doesn't exist.
           </p>
         </div>
