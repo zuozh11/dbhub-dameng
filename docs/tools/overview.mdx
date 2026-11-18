@@ -23,9 +23,11 @@ If no `[[tools]]` entries are defined for a source, both `execute_sql` and `sear
 ```toml
 [[sources]]
 id = "dev"
-dsn = "sqlite:///dev.db"
+dsn = "sqlite:///./dev.db"
 # No [[tools]] entries = both execute_sql and search_objects enabled
 ```
+
+Once a source has any `[[tools]]` entry, only the tools listed for it are enabled.
 
 ### Selective Tool Exposure
 

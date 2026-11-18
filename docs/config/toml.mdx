@@ -109,9 +109,8 @@ readonly = true
 max_rows = 1000
 
 [[tools]]
-name = "execute_sql"
-source = "staging"
-readonly = false
+name = "search_objects"
+source = "production"
 ```
 
 Start DBHub:
@@ -170,8 +169,10 @@ Sources define database connections. Each source represents a database that DBHu
 
       [[sources]]
       id = "local"
-      dsn = "sqlite:///./dev.db"
+      dsn = "sqlite:///./dev.db"  # relative to this config file
       ```
+
+      A relative SQLite path (`sqlite:///./dev.db`) is resolved against the directory holding the config file, so the config names the same database wherever DBHub is started from. Without the `./`, the path is absolute: `sqlite:///dev.db` is `/dev.db`. See the [SQLite DSN formats](/config/command-line#--dsn).
     </Tab>
 
     <Tab title="Individual Parameters">
@@ -257,8 +258,10 @@ Sources define database connections. Each source represents a database that DBHu
 
   PostgreSQL fetches a fresh token whenever it opens a new connection, so
   established connections are never rotated. MySQL and MariaDB refresh their
-  pool before the token expires. If credentials have expired (e.g. an AWS SSO
-  session), run `aws sso login --profile <profile>` and retry the request.
+  pool before the token expires: a new pool is connected first and the old one
+  is closed afterwards, so the source can briefly hold connections from both
+  pools. If credentials have expired (e.g. an AWS SSO session), run
+  `aws sso login --profile <profile>` and retry the request.
 
   ```toml
   [[sources]]
@@ -796,7 +799,7 @@ Tools define MCP tools (like `execute_sql`) with specific execution settings. To
   This is a **tool-level** setting, not a source-level setting. Configure it in the `[[tools]]` section, not in `[[sources]]`.
   </Note>
 
-  See [Execute SQL documentation](/tools/execute-sql#readonly-mode) for more details.
+  See [Read-Only Mode](/config/read-only-mode) for how it is enforced and what it does not cover.
 </ParamField>
 
 ### max_rows
@@ -815,7 +818,7 @@ Tools define MCP tools (like `execute_sql`) with specific execution settings. To
   This is a **tool-level** setting, not a source-level setting. Configure it in the `[[tools]]` section, not in `[[sources]]`.
   </Note>
 
-  See [Execute SQL documentation](/tools/execute-sql#row-limits) for more details.
+  See [Execute SQL documentation](/tools/execute-sql#row-limiting) for more details.
 </ParamField>
 
 ### statement

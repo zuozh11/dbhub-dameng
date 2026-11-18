@@ -18,7 +18,16 @@
         "groups": [
           {
             "group": "Getting Started",
-            "pages": ["index", "installation", "quickstart", "mcpb", "claude-code-plugin"]
+            "pages": [
+              "index",
+              {
+                "group": "Installation",
+                "root": "installation",
+                "expanded": true,
+                "pages": ["mcpb", "claude-code-plugin"]
+              },
+              "quickstart"
+            ]
           },
           {
             "group": "MCP Tools",
@@ -37,13 +46,14 @@
           },
           {
             "group": "Configuration",
-            "pages": ["config/command-line", "config/toml", "config/debug"]
+            "pages": ["config/command-line", "config/toml", "config/read-only-mode", "config/debug"]
           }
         ]
       },
       {
         "tab": "Blog",
         "pages": [
+          "blog/database-mcp-server-token-benchmark-2026",
           "blog/dbhub-1-0-0",
           "blog/how-dbhub-adopts-mcp-spec-2026-07-28",
           "blog/state-of-postgres-mcp-servers-2025",
