@@ -36,7 +36,19 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch https://github.com/bytebase/dbhub.git main
-          git merge --no-edit FETCH_HEAD
+          if ! git -c rerere.enabled=false merge --no-ff --no-commit FETCH_HEAD; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if ! git rev-parse --verify -q MERGE_HEAD >/dev/null || [ "$conflicts" != README.md ]; then
+              echo "::error::Upstream merge requires manual review. See the conflicts above."
+              exit 1
+            fi
+          fi
+          if git rev-parse --verify -q MERGE_HEAD >/dev/null; then
+            # README is the fork's npm documentation. Keep it even when Git
+            # can merge an upstream README change without conflicts.
+            git restore --source=HEAD --staged --worktree -- README.md
+            git commit --no-edit
+          fi
       - uses: pnpm/action-setup@v4
         with:
           version: 10.17.1
