@@ -14,6 +14,8 @@ pnpm test              # Run all tests (unit + integration)
 pnpm test:unit         # Unit tests only (no Docker needed)
 pnpm test:watch        # Interactive watch mode
 pnpm test:integration  # Integration tests only (requires Docker)
+pnpm test:build        # After `pnpm run build`: import every connector chunk in dist/
+pnpm test:mcpb         # After `pnpm run build:mcpb`: smoke-test the packed bundle over stdio
 ```
 
 Run a specific test file:
@@ -42,33 +44,45 @@ This means the naming convention matters — integration tests MUST have `integr
 
 ### Test File Locations
 
-**Unit tests** (~20 files, no Docker needed):
-- `src/utils/__tests__/` — Utility function tests (SQL parsing, DSN obfuscation, SSH config, allowed keywords, identifier quoting, parameter mapping, row limiting, safe URL, config watcher, AWS RDS signer)
-- `src/tools/__tests__/` — Tool handler tests (execute-sql, search-objects, custom-tool-handler)
+**Unit tests** (`*.test.ts` without `integration` in the name; no Docker needed):
+- `src/utils/__tests__/` — Utility function tests (SQL parsing and classification, access policy, row limiting, DSN obfuscation, SafeURL, SQLite DSNs, SSH config and tunnel, identifier quoting, parameter mapping, result columns, query timeouts, config watcher, auth token, cross-origin, AWS RDS signer, …)
+- `src/tools/__tests__/` — Tool handler tests (execute-sql, search-objects, explain-sql, health-check, custom-tool-handler, registry, builtin-tools)
 - `src/config/__tests__/` — Configuration tests (env parsing, TOML loading)
-- `src/connectors/__tests__/` — Connector unit tests (dsn-parser, manager)
+- `src/connectors/__tests__/` — Connector unit tests (dsn-parser, manager, oracle, clickhouse (against a fake HTTP server), per-connector timeout / auth / pool behaviour, read-only transaction strategy)
 - `src/requests/__tests__/` — Request store tests
+- `src/__tests__/` — Connector loading and `plugin-consistency.test.ts` (plugin / bundle / registry manifests stay in step with `package.json`)
 
-**Integration tests** (~11 files, Docker required):
+**Integration tests** (`integration` in the file name). List them with `git ls-files 'src/**/*integration*.test.ts'`.
+
+Need Docker (Testcontainers):
 - `src/connectors/__tests__/postgres.integration.test.ts`
+- `src/connectors/__tests__/postgres-ssh.integration.test.ts`
+- `src/connectors/__tests__/postgres-client-cert.integration.test.ts`
 - `src/connectors/__tests__/mysql.integration.test.ts`
 - `src/connectors/__tests__/mariadb.integration.test.ts`
 - `src/connectors/__tests__/sqlserver.integration.test.ts`
 - `src/connectors/__tests__/oracle.integration.test.ts`
+- `src/connectors/__tests__/clickhouse.integration.test.ts`
+
+Run without Docker (in-memory SQLite or no database):
 - `src/connectors/__tests__/sqlite.integration.test.ts`
-- `src/connectors/__tests__/postgres-ssh.integration.test.ts`
 - `src/connectors/__tests__/multi-sqlite-sources.integration.test.ts`
 - `src/__tests__/json-rpc-integration.test.ts`
+- `src/__tests__/http-bind-host.integration.test.ts`
 - `src/api/__tests__/sources.integration.test.ts`
 - `src/api/__tests__/requests.integration.test.ts`
 - `src/config/__tests__/ssh-config-integration.test.ts`
+- `src/utils/__tests__/tool-metadata.integration.test.ts`
+- `src/tools/__tests__/builtin-tool-table.integration.test.ts`
 
 ### IntegrationTestBase
 
 Database connector integration tests extend `IntegrationTestBase<TContainer>` from `src/connectors/__tests__/shared/integration-test-base.ts`. This abstract class provides:
 
-- **Lifecycle**: Container start in `beforeAll` (120s timeout) → connect → setup test data → run tests → cleanup in `afterAll`
-- **Shared test suites**: `createConnectionTests()`, `createSchemaTests()`, `createTableTests()`, `createSQLExecutionTests()`, `createStoredProcedureTests()`, `createCommentTests()`, `createErrorHandlingTests()`
+- **Lifecycle**: `registerLifecycle()` registers the `beforeAll` (container start, 120s timeout → connect → setup test data) and `afterAll` (cleanup) hooks
+- **Shared test suites**: `createCommonTests()` runs all of `createConnectionTests()`, `createSchemaTests()`, `createTableTests()`, `createSQLExecutionTests()`, `createStoredProcedureTests()`, `createCommentTests()`, `createErrorHandlingTests()`, `createMaxRowsTests()` and `createReadonlyBackstopTests()`; `createSSLTests()` is opt-in for engines whose container can report session encryption (`expectSessionEncryption` hook)
+- **Dialect hooks**: `DatabaseTestConfig` flags gate the tests an engine cannot run; `userLimitedSQL(n)` is overridden where the row limit is not `LIMIT` (SQL Server `TOP`, Oracle `FETCH FIRST`)
+- **`withConnector(config, fn)`**: connects a second connector with the given `ConnectorConfig`, runs `fn`, and always disconnects — use it instead of a hand-written connect / try / finally
 - **Standard test data**: `users` table (id, name, email, age) + `orders` table (id, user_id, amount) + `test_schema.products`
 
 To add a new database connector test, extend this class and implement:
@@ -76,12 +90,23 @@ To add a new database connector test, extend this class and implement:
 - `createConnector()` — Create the database connector
 - `setupTestData(connector)` — Populate test tables
 
+MySQL and MariaDB share almost everything: both extend `MySQLFamilyIntegrationTest` (`shared/mysql-family-suite.ts`) and call `createFamilyTests(traits)`. A test that applies to both engines goes there; each engine's own file holds only what differs.
+
+Behaviour that belongs to the database engine rather than to a connector branch (window functions, JSON operators, storage engines…) is not tested here — a new integration test should name the connector code it exercises.
+
+### Shared helpers for other tests
+
+- `src/tools/__tests__/helpers.ts` — `createMockConnector()`, `parseToolResponse()`, `describeRequestTracking()` for tool handler tests. Error-envelope shaping lives in `runToolRequest` and is tested once, in `execute-sql.test.ts`.
+- `src/api/__tests__/test-server.ts` — `startApiServer(routes)` serves API handlers on an ephemeral port.
+- `src/__tests__/spawn-http-server.ts` — `spawnHttpServer(bindHost?)` starts the real server as a child process in an isolated working directory.
+
 ### Test Fixtures
 
 Located in `src/__fixtures__/`:
 - `helpers.ts` — Utilities: `fixtureTomlPath()`, `loadFixtureConfig()`, `setupManagerWithFixture()`
 - `toml/multi-sqlite.toml` — Three in-memory SQLite databases (database_a, database_b, database_c)
 - `toml/readonly-maxrows.toml` — Sources with readonly/max_rows tool configurations
+- `toml/tunneled-credentials.toml` — A lazy (never connected) PostgreSQL source with a database password and SSH tunnel credentials, for asserting what the sources API exposes and withholds
 
 Usage:
 ```typescript
@@ -117,10 +142,11 @@ Before running integration tests:
 | Database | Image | Notes |
 |----------|-------|-------|
 | PostgreSQL | `postgres:15-alpine` | Fast startup |
-| MySQL | `@testcontainers/mysql` | Supports IAM auth testing |
-| MariaDB | `@testcontainers/mariadb` | Supports IAM auth testing |
-| SQL Server | `@testcontainers/mssqlserver` | Slow startup (3-5 min), needs 4GB+ RAM |
+| MySQL | `@testcontainers/mysql` (`mysql:8.0`) | Supports IAM auth testing |
+| MariaDB | `@testcontainers/mariadb` (`mariadb:10.11`) | Supports IAM auth testing |
+| SQL Server | `@testcontainers/mssqlserver` (`mssql/server:2019-latest`) | Slow startup (3-5 min), needs 4GB+ RAM |
 | Oracle | `@testcontainers/oraclefree` (`gvenzl/oracle-free:23-slim-faststart`) | ~1.2GB pull, 1-2 min startup, needs 2GB+ RAM |
+| ClickHouse | `@testcontainers/clickhouse` (`clickhouse/clickhouse-server:25.8`) | Fast startup; replaces the shared SQL-execution suite with its own (no auto-increment, no repeated aliases) |
 | SQLite | No container needed | In-memory or file-based |
 
 ## Troubleshooting
@@ -164,4 +190,6 @@ The CI workflow (`.github/workflows/run-tests.yml`) runs unit and integration te
 
 **Integration test**: Create `src/{module}/__tests__/{name}.integration.test.ts` — the `integration` in the filename is what routes it to `pnpm test:integration`.
 
-**New connector test**: Extend `IntegrationTestBase`, implement the three abstract methods, and call the shared test suite methods.
+**New connector test**: Extend `IntegrationTestBase`, implement the three abstract methods, then call `registerLifecycle()` and `createCommonTests()` inside the `describe`.
+
+**Prefer a row to a test**: most of the suite is `it.each` tables. When a new case differs from an existing one only in its input and expected value, add a row to that table rather than a new `it`.

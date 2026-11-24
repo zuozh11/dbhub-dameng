@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { loadTomlConfig, buildDSNFromSource, interpolateEnvVars, findUnresolvedEnvVars } from '../toml-loader.js';
-import type { SourceConfig } from '../../types/config.js';
+import type { CustomToolConfig, SourceConfig } from '../../types/config.js';
 import { sourceConfigEquals } from '../../utils/config-watcher.js';
 import { SQLiteConnector } from '../../connectors/sqlite/index.js';
 import { MAX_QUERY_TIMEOUT_SECONDS } from '../../utils/query-timeout.js';
@@ -63,16 +63,25 @@ password = "pass"
 ${extra}
 `;
 
-  const writeSource = (extra: string, type = 'postgres'): void => {
-    fs.writeFileSync(path.join(tempDir, 'dbhub.toml'), sourceToml(type, extra));
-  };
+  const loadSource = (extra: string, type = 'postgres'): ReturnType<typeof loadTomlConfig> =>
+    loadToml(sourceToml(type, extra));
 
   // DSN-based sources used by the per-field validation tables
   const DSN_BY_TYPE: Record<string, string> = {
     postgres: 'postgres://user:pass@localhost:5432/testdb',
     mysql: 'mysql://user:pass@localhost:3306/testdb',
     mariadb: 'mariadb://user:pass@localhost:3306/testdb',
+    clickhouse: 'clickhouse://user:pass@localhost:8123/testdb',
   };
+
+  // A single DSN-only source of the given type followed by `extra`.
+  const loadDsnSource = (type: string, extra: string): ReturnType<typeof loadTomlConfig> =>
+    loadToml(`
+[[sources]]
+id = "test_db"
+dsn = "${DSN_BY_TYPE[type]}"
+${extra}
+`);
 
   describe('loadTomlConfig', () => {
     it('should load valid TOML config from dbhub.toml', () => {
@@ -82,9 +91,10 @@ id = "test_db"
 dsn = "postgres://user:pass@localhost:5432/testdb"
 `);
 
-      expect(result).toBeTruthy();
       expect(result?.sources).toHaveLength(1);
-      // DSN should be parsed to populate connection fields
+      // DSN should be parsed to populate connection fields. toEqual also pins
+      // down that nothing else is set: every optional field (sslmode,
+      // connection_timeout, description, ...) stays undefined when omitted.
       expect(result?.sources[0]).toEqual({
         id: 'test_db',
         dsn: 'postgres://user:pass@localhost:5432/testdb',
@@ -104,40 +114,32 @@ id = "sqlite_dsn"
 dsn = "sqlite:///path/to/database.db"
 `);
 
-      expect(result?.sources[0]).toMatchObject({
+      // Exact match: SQLite gets no host/port/user
+      expect(result?.sources[0]).toEqual({
         id: 'sqlite_dsn',
+        dsn: 'sqlite:///path/to/database.db',
         type: 'sqlite',
         database: '/path/to/database.db',
       });
-      // SQLite should not have host/port/user
-      expect(result?.sources[0].host).toBeUndefined();
-      expect(result?.sources[0].port).toBeUndefined();
-      expect(result?.sources[0].user).toBeUndefined();
     });
 
-    it('should resolve a relative sqlite database against the config file directory', () => {
-      // Config lives in a subdirectory while the process runs from tempDir, so
-      // resolving against the config file and resolving against process.cwd()
-      // produce different answers and the test can tell them apart.
+    // Load a one-source config that lives in a subdirectory while the process
+    // runs from tempDir, so resolving against the config file and resolving
+    // against process.cwd() produce different answers and a test can tell them
+    // apart.
+    const loadFromConfDir = (connection: string): { confDir: string; source: SourceConfig } => {
       const confDir = path.join(tempDir, 'conf');
-      fs.mkdirSync(path.join(confDir, 'data'), { recursive: true });
+      fs.mkdirSync(confDir);
       const configPath = path.join(confDir, 'dbhub.toml');
-      fs.writeFileSync(
-        configPath,
-        `
-[[sources]]
-id = "rel"
-type = "sqlite"
-database = "data/app.db"
-`
-      );
+      fs.writeFileSync(configPath, `\n[[sources]]\nid = "rel"\n${connection}\n`);
       process.argv = ['node', 'test', '--config', configPath];
+      return { confDir, source: loadTomlConfig()!.sources[0] };
+    };
 
-      const result = loadTomlConfig();
+    it('should resolve a relative sqlite database against the config file directory', () => {
+      const { confDir, source } = loadFromConfDir('type = "sqlite"\ndatabase = "data/app.db"');
 
-      expect(result?.sources[0].database).toBe(
-        path.join(confDir, 'data', 'app.db').replace(/\\/g, '/')
-      );
+      expect(source.database).toBe(path.join(confDir, 'data', 'app.db').replace(/\\/g, '/'));
     });
 
     it.each([
@@ -145,14 +147,7 @@ database = "data/app.db"
       ['sqlite://./data/app.db'],
       ['sqlite://data/app.db'],
     ])('should resolve the relative path in dsn = "%s" against the config file directory', async (dsn) => {
-      // Same layout as the `database` test above: config dir and cwd differ.
-      const confDir = path.join(tempDir, 'conf');
-      fs.mkdirSync(path.join(confDir, 'data'), { recursive: true });
-      const configPath = path.join(confDir, 'dbhub.toml');
-      fs.writeFileSync(configPath, `\n[[sources]]\nid = "rel"\ndsn = "${dsn}"\n`);
-      process.argv = ['node', 'test', '--config', configPath];
-
-      const source = loadTomlConfig()!.sources[0];
+      const { confDir, source } = loadFromConfDir(`dsn = "${dsn}"`);
       const expected = path.join(confDir, 'data', 'app.db');
 
       expect(source.database).toBe(expected);
@@ -183,106 +178,52 @@ dsn = "sqlite://"
     });
 
     describe('tools_read_only marker', () => {
-      const readOnlyTool = (source: string): string => `
-[[tools]]
-name = "execute_sql"
-source = "${source}"
-readonly = true
-`;
+      const writableTool = '[[tools]]\nname = "execute_sql"\nsource = "db"';
+      const readOnlyTool = `${writableTool}\nreadonly = true`;
+      const load = (connection: string, tools: string): SourceConfig =>
+        loadToml(`\n[[sources]]\nid = "db"\n${connection}\n\n${tools}\n`)!.sources[0];
 
       it('should mark a SQLite source whose tools are all read-only', () => {
-        const result = loadToml(`
-[[sources]]
-id = "shop"
-dsn = "sqlite:///./shop.db"
-${readOnlyTool('shop')}
-[[tools]]
-name = "search_objects"
-source = "shop"
-`);
+        const source = load('dsn = "sqlite:///./shop.db"', `${readOnlyTool}\n\n[[tools]]\nname = "search_objects"\nsource = "db"`);
 
-        expect(result?.sources[0].tools_read_only).toBe(true);
+        expect(source.tools_read_only).toBe(true);
       });
 
       it.each([
-        ['has no [[tools]] entries', ''],
-        ['has a writable execute_sql', '\n[[tools]]\nname = "execute_sql"\nsource = "shop"\n'],
-      ])('should not mark a SQLite source that %s', (_label, tools) => {
-        const result = loadToml(`
-[[sources]]
-id = "shop"
-dsn = "sqlite:///./shop.db"
-${tools}`);
-
-        expect(result?.sources[0].tools_read_only).toBeUndefined();
-      });
-
-      it('should not mark other databases', () => {
-        const result = loadToml(`
-[[sources]]
-id = "pg"
-dsn = "postgres://user:pass@localhost:5432/db"
-${readOnlyTool('pg')}`);
-
-        expect(result?.sources[0].tools_read_only).toBeUndefined();
-      });
-
-      it.each([
-        ['dsn = "sqlite:///:memory:"'],
-        ['type = "sqlite"\ndatabase = ":memory:"'],
+        ['a SQLite source that has no [[tools]] entries', 'dsn = "sqlite:///./shop.db"', ''],
+        ['a SQLite source that has a writable execute_sql', 'dsn = "sqlite:///./shop.db"', writableTool],
+        ['other databases', 'dsn = "postgres://user:pass@localhost:5432/db"', readOnlyTool],
+        ['an in-memory source (DSN)', 'dsn = "sqlite:///:memory:"', readOnlyTool],
+        ['an in-memory source (database field)', 'type = "sqlite"\ndatabase = ":memory:"', readOnlyTool],
         // The DSN is what gets opened, whatever `database` says
-        ['dsn = "sqlite:///:memory:"\ndatabase = "shop.db"'],
-      ])('should not mark an in-memory source (%s)', (connection) => {
-        const result = loadToml(`
-[[sources]]
-id = "mem"
-${connection}
-${readOnlyTool('mem')}`);
-
-        expect(result?.sources[0].tools_read_only).toBeUndefined();
+        ['an in-memory source (DSN beside a database field)', 'dsn = "sqlite:///:memory:"\ndatabase = "shop.db"', readOnlyTool],
+        // The marker is internal and never taken from the file
+        ['a source that sets tools_read_only in the file', 'dsn = "sqlite:///./shop.db"\ntools_read_only = true', ''],
+      ])('should not mark %s', (_label, connection, tools) => {
+        expect(load(connection, tools).tools_read_only).toBeUndefined();
       });
 
       it('should load an in-memory source identically whether or not its tool is read-only', () => {
-        const source = '\n[[sources]]\nid = "mem"\ndsn = "sqlite:///:memory:"\n';
-        const writable = loadToml(`${source}\n[[tools]]\nname = "execute_sql"\nsource = "mem"\n`);
-        const readOnly = loadToml(`${source}${readOnlyTool('mem')}`);
+        const writable = load('dsn = "sqlite:///:memory:"', writableTool);
+        const readOnly = load('dsn = "sqlite:///:memory:"', readOnlyTool);
 
-        expect(sourceConfigEquals(writable!.sources[0], readOnly!.sources[0])).toBe(true);
+        expect(sourceConfigEquals(writable, readOnly)).toBe(true);
       });
+    });
 
-      it('should not take the marker from the file', () => {
+    it('should leave an absolute sqlite database path and the :memory: sentinel unchanged', () => {
+      const absolute = path.join(tempDir, 'elsewhere', 'app.db').replace(/\\/g, '/');
+
+      for (const database of [absolute, ':memory:']) {
         const result = loadToml(`
 [[sources]]
-id = "shop"
-dsn = "sqlite:///./shop.db"
-tools_read_only = true
-`);
-
-        expect(result?.sources[0].tools_read_only).toBeUndefined();
-      });
-    });
-
-    it('should leave an absolute sqlite database path unchanged', () => {
-      const absolute = path.join(tempDir, 'elsewhere', 'app.db').replace(/\\/g, '/');
-      const result = loadToml(`
-[[sources]]
-id = "abs"
+id = "db"
 type = "sqlite"
-database = "${absolute}"
+database = "${database}"
 `);
 
-      expect(result?.sources[0].database).toBe(absolute);
-    });
-
-    it('should pass the :memory: sentinel through untouched', () => {
-      const result = loadToml(`
-[[sources]]
-id = "mem"
-type = "sqlite"
-database = ":memory:"
-`);
-
-      expect(result?.sources[0].database).toBe(':memory:');
+        expect(result?.sources[0].database).toBe(database);
+      }
     });
 
     it.each([
@@ -321,73 +262,20 @@ dsn = "postgres://user:pass@localhost:5432/ambient"
       expect(loadTomlConfig()).toBeNull();
     });
 
-    it('should load multiple sources', () => {
-      const result = loadToml(`
-[[sources]]
-id = "db1"
-dsn = "postgres://user:pass@localhost:5432/db1"
-
-[[sources]]
-id = "db2"
-dsn = "mysql://user:pass@localhost:3306/db2"
-
-[[sources]]
-id = "db3"
-type = "sqlite"
-database = "/tmp/test.db"
-`);
-
-      expect(result?.sources).toHaveLength(3);
-      expect(result?.sources[0].id).toBe('db1');
-      expect(result?.sources[1].id).toBe('db2');
-      expect(result?.sources[2].id).toBe('db3');
-    });
-
-    it('should throw error for missing sources array', () => {
-      expect(() => loadToml(`
-[server]
-port = 8080
-`)).toThrow('must contain a [[sources]] array');
-    });
-
-    it('should throw error for empty sources array', () => {
-      expect(() => loadToml(`sources = []`)).toThrow('sources array cannot be empty');
-    });
-
-    it('should throw error for duplicate source IDs', () => {
-      expect(() => loadToml(`
-[[sources]]
-id = "duplicate"
-dsn = "postgres://user:pass@localhost:5432/db1"
-
-[[sources]]
-id = "duplicate"
-dsn = "mysql://user:pass@localhost:3306/db2"
-`)).toThrow('duplicate source IDs found: duplicate');
-    });
-
-    it('should throw error for source without id', () => {
-      expect(() => loadToml(`
-[[sources]]
-dsn = "postgres://user:pass@localhost:5432/db"
-`)).toThrow("each source must have an 'id' field");
-    });
-
-    it('should throw error for source without DSN or connection params', () => {
-      expect(() => loadToml(`
-[[sources]]
-id = "invalid"
-description = "x"
-`)).toThrow('must have either');
-    });
-
-    it('should throw error for invalid database type', () => {
-      expect(() => loadToml(`
-[[sources]]
-id = "invalid"
-type = "db2"
-host = "localhost"
-`)).toThrow("invalid type 'db2'");
+    it.each([
+      ['a missing sources array', '[server]\nport = 8080', 'must contain a [[sources]] array'],
+      ['an empty sources array', 'sources = []', 'sources array cannot be empty'],
+      [
+        'duplicate source IDs',
+        '[[sources]]\nid = "duplicate"\ndsn = "postgres://user:pass@localhost:5432/db1"\n\n' +
+          '[[sources]]\nid = "duplicate"\ndsn = "mysql://user:pass@localhost:3306/db2"',
+        'duplicate source IDs found: duplicate',
+      ],
+      ['a source without id', '[[sources]]\ndsn = "postgres://user:pass@localhost:5432/db"', "each source must have an 'id' field"],
+      ['a source without DSN or connection params', '[[sources]]\nid = "invalid"\ndescription = "x"', 'must have either'],
+      ['an invalid database type', '[[sources]]\nid = "invalid"\ntype = "db2"\nhost = "localhost"', "invalid type 'db2'"],
+    ])('should throw error for %s', (_label, toml, message) => {
+      expect(() => loadToml(toml)).toThrow(message);
     });
 
     it('should accept oracle sources and default the port to 1521', () => {
@@ -400,26 +288,12 @@ database = "FREEPDB1"
 user = "app"
 password = "secret"
 `);
+
       expect(config!.sources[0].type).toBe('oracle');
       expect(buildDSNFromSource(config!.sources[0])).toBe('oracle://app:secret@localhost:1521/FREEPDB1');
     });
 
-    it('should expand tilde in ssh_agent paths', () => {
-      const result = loadToml(`
-[[sources]]
-id = "remote_db"
-dsn = "postgres://user:pass@10.0.0.5:5432/db"
-ssh_host = "bastion.example.com"
-ssh_user = "ubuntu"
-ssh_agent = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
-`);
-
-      expect(result?.sources[0].ssh_agent).toBe(
-        path.join(os.homedir(), 'Library', 'Group Containers', '2BUA8C4S2C.com.1password', 't', 'agent.sock')
-      );
-    });
-
-    it('should not accept the internal ssh_key_discovered marker from TOML', () => {
+    it('should expand tilde in ssh_agent paths and not take the internal ssh_key_discovered marker from TOML', () => {
       const result = loadToml(`
 [[sources]]
 id = "remote_db"
@@ -428,8 +302,12 @@ ssh_host = "bastion.example.com"
 ssh_user = "ubuntu"
 ssh_key = "~/.ssh/id_rsa"
 ssh_key_discovered = true
+ssh_agent = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 `);
 
+      expect(result?.sources[0].ssh_agent).toBe(
+        path.join(os.homedir(), 'Library', 'Group Containers', '2BUA8C4S2C.com.1password', 't', 'agent.sock')
+      );
       expect(result?.sources[0].ssh_key_discovered).toBeUndefined();
     });
 
@@ -444,6 +322,8 @@ ssh_key_discovered = true
         ['connection_timeout = 60', 'postgres', 'connection_timeout', 60],
         ['description = "Production read replica for analytics"', 'postgres', 'description', 'Production read replica for analytics'],
         ['query_timeout = 120', 'postgres', 'query_timeout', 120],
+        // The largest value the timer range allows (see the rejected rows below)
+        [`query_timeout = ${MAX_QUERY_TIMEOUT_SECONDS}`, 'postgres', 'query_timeout', MAX_QUERY_TIMEOUT_SECONDS],
         ['pool_max_connections = 5', 'postgres', 'pool_max_connections', 5],
         ['pool_max_connections = 5', 'mysql', 'pool_max_connections', 5],
         ['search_path = "myschema,public"', 'postgres', 'search_path', 'myschema,public'],
@@ -453,93 +333,9 @@ ssh_key_discovered = true
         ['collation = "utf8mb4_0900_ai_ci"', 'mysql', 'collation', 'utf8mb4_0900_ai_ci'],
         ['collation = "utf8mb4_unicode_ci"', 'mariadb', 'collation', 'utf8mb4_unicode_ci'],
       ])('should accept %s for %s and echo it back', (line, type, field, expected) => {
-        const result = loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "${DSN_BY_TYPE[type]}"
-${line}
-`);
+        const result = loadDsnSource(type, line);
 
-        expect(result).toBeTruthy();
         expect(result?.sources[0][field as keyof SourceConfig]).toBe(expected);
-      });
-
-      it('should leave all optional fields undefined when omitted', () => {
-        // Covers each optional field in one pass: connection_timeout,
-        // description, sslmode, search_path, timezone, charset, collation.
-        const result = loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "mysql://user:pass@localhost:3306/testdb"
-`);
-
-        expect(result).toBeTruthy();
-        expect(result?.sources[0].connection_timeout).toBeUndefined();
-        expect(result?.sources[0].description).toBeUndefined();
-        expect(result?.sources[0].sslmode).toBeUndefined();
-        expect(result?.sources[0].search_path).toBeUndefined();
-        expect(result?.sources[0].timezone).toBeUndefined();
-        expect(result?.sources[0].charset).toBeUndefined();
-        expect(result?.sources[0].collation).toBeUndefined();
-      });
-
-      it.each([-30, 0])('should throw error for non-positive connection_timeout (%i)', (value) => {
-        expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/testdb"
-connection_timeout = ${value}
-`)).toThrow('invalid connection_timeout');
-      });
-
-      it.each([-60, 0])('should throw error for non-positive query_timeout (%i)', (value) => {
-        expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/testdb"
-query_timeout = ${value}
-`)).toThrow('invalid query_timeout');
-      });
-
-      // Node's setTimeout clamps delays above 2^31-1 ms (and non-finite ones)
-      // to 1ms, which would turn the client-side fallback into an immediate
-      // timeout on every query.
-      it.each([
-        ['infinite', 'inf'],
-        ['NaN', 'nan'],
-        ['beyond the timer range', String(MAX_QUERY_TIMEOUT_SECONDS + 1)],
-      ])('should reject a query_timeout that is %s', (_label, value) => {
-        expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/testdb"
-query_timeout = ${value}
-`)).toThrow('invalid query_timeout');
-      });
-
-      it('should accept a query_timeout at the timer-range limit', () => {
-        const result = loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/testdb"
-query_timeout = ${MAX_QUERY_TIMEOUT_SECONDS}
-`);
-        expect(result?.sources[0].query_timeout).toBe(MAX_QUERY_TIMEOUT_SECONDS);
-      });
-
-      it.each([
-        ['zero', '0'],
-        ['negative', '-1'],
-        ['fractional', '1.5'],
-        ['string', '"5"'],
-        ['above the limit', '1001'],
-      ])('should reject a %s pool_max_connections value', (_label, value) => {
-        expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/testdb"
-pool_max_connections = ${value}
-`)).toThrow('invalid pool_max_connections');
       });
     });
 
@@ -563,29 +359,23 @@ pool_max_connections = ${value}
         ['wallet_location', 'postgres', 'sslmode = "require"\nwallet_location = "/opt/wallet"', 'wallet_location but it is only supported for Oracle'],
         ['ssl_server_cert_dn', 'sqlserver', 'sslmode = "require"\nssl_server_cert_dn = "CN=db"', 'ssl_server_cert_dn but it is only supported for Oracle'],
       ])('should reject %s for a %s source', (_field, type, extra, message) => {
-        writeSource(extra, type);
-
-        expect(() => loadTomlConfig()).toThrow(message);
+        expect(() => loadSource(extra, type)).toThrow(message);
       });
     });
 
     describe('Oracle wallet options', () => {
+      // wallet_location only has to be an existing directory, so the per-test
+      // tempDir stands in for a wallet.
       it('should accept a wallet directory and pass the options to the DSN', () => {
-        const walletDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbhub-wallet-'));
-        try {
-          writeSource(
-            `sslmode = "require"\nwallet_location = '${walletDir}'\nwallet_password = "w@llet"\nssl_server_cert_dn = "CN=adb.example.com"`,
-            'oracle'
-          );
-          const source = loadTomlConfig()!.sources[0];
-          const dsn = buildDSNFromSource(source);
+        const source = loadSource(
+          `sslmode = "require"\nwallet_location = '${tempDir}'\nwallet_password = "w@llet"\nssl_server_cert_dn = "CN=adb.example.com"`,
+          'oracle'
+        )!.sources[0];
+        const dsn = buildDSNFromSource(source);
 
-          expect(dsn).toContain(`wallet_location=${encodeURIComponent(walletDir)}`);
-          expect(dsn).toContain('wallet_password=w%40llet');
-          expect(dsn).toContain('ssl_server_cert_dn=CN%3Dadb.example.com');
-        } finally {
-          fs.rmSync(walletDir, { recursive: true, force: true });
-        }
+        expect(dsn).toContain(`wallet_location=${encodeURIComponent(tempDir)}`);
+        expect(dsn).toContain('wallet_password=w%40llet');
+        expect(dsn).toContain('ssl_server_cert_dn=CN%3Dadb.example.com');
       });
 
       it.each([
@@ -595,31 +385,23 @@ pool_max_connections = ${value}
         ['missing wallet directory', 'sslmode = "require"\nwallet_location = "/nonexistent/dbhub-wallet"', 'wallet_location is not an accessible directory'],
         ['empty value', 'sslmode = "require"\nssl_server_cert_dn = " "', 'has invalid ssl_server_cert_dn'],
       ])('should reject %s', (_case, extra, message) => {
-        writeSource(extra, 'oracle');
-
-        expect(() => loadTomlConfig()).toThrow(message);
+        expect(() => loadSource(extra, 'oracle')).toThrow(message);
       });
 
       it('should complete wallet_location from the DSN with a wallet_password field', () => {
-        const walletDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbhub-wallet-'));
-        try {
-          const config = loadToml(`
+        const source = loadToml(`
 [[sources]]
 id = "adb"
-dsn = "oracle://app:pass@adb.example.com:1522/svc?sslmode=require&wallet_location=${encodeURIComponent(walletDir)}"
+dsn = "oracle://app:pass@adb.example.com:1522/svc?sslmode=require&wallet_location=${encodeURIComponent(tempDir)}"
 wallet_password = "w@llet"
-`);
-          const source = config!.sources[0];
-          expect(source.wallet_location).toBe(walletDir);
-          expect(source.wallet_password).toBe('w@llet');
+`)!.sources[0];
+        expect(source.wallet_location).toBe(tempDir);
+        expect(source.wallet_password).toBe('w@llet');
 
-          const dsn = buildDSNFromSource(source);
-          expect(dsn).toContain(`wallet_location=${encodeURIComponent(walletDir)}`);
-          expect(dsn).toContain('wallet_password=w%40llet');
-          expect(dsn.match(/wallet_location=/g)).toHaveLength(1);
-        } finally {
-          fs.rmSync(walletDir, { recursive: true, force: true });
-        }
+        const dsn = buildDSNFromSource(source);
+        expect(dsn).toContain(`wallet_location=${encodeURIComponent(tempDir)}`);
+        expect(dsn).toContain('wallet_password=w%40llet');
+        expect(dsn.match(/wallet_location=/g)).toHaveLength(1);
       });
 
       it.each([
@@ -638,25 +420,20 @@ dsn = "oracle://app:pass@adb.example.com:1522/svc?${query}"
       });
 
       it('should reject a wallet_password that conflicts with the DSN without echoing either value', () => {
-        const walletDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbhub-wallet-'));
+        let error: Error | undefined;
         try {
-          let error: Error | undefined;
-          try {
-            loadToml(`
+          loadToml(`
 [[sources]]
 id = "adb"
-dsn = "oracle://app:pass@adb.example.com:1522/svc?sslmode=require&wallet_location=${encodeURIComponent(walletDir)}&wallet_password=dsnSecret"
+dsn = "oracle://app:pass@adb.example.com:1522/svc?sslmode=require&wallet_location=${encodeURIComponent(tempDir)}&wallet_password=dsnSecret"
 wallet_password = "fieldSecret"
 `);
-          } catch (e) {
-            error = e as Error;
-          }
-          expect(error?.message).toContain('conflicting wallet_password');
-          expect(error?.message).not.toContain('dsnSecret');
-          expect(error?.message).not.toContain('fieldSecret');
-        } finally {
-          fs.rmSync(walletDir, { recursive: true, force: true });
+        } catch (e) {
+          error = e as Error;
         }
+        expect(error?.message).toContain('conflicting wallet_password');
+        expect(error?.message).not.toContain('dsnSecret');
+        expect(error?.message).not.toContain('fieldSecret');
       });
     });
 
@@ -666,11 +443,29 @@ wallet_password = "fieldSecret"
       // Empty and non-string values are the two sides of the
       // `typeof !== "string" || trim() === ""` checks, so both stay.
       it.each([
+        ['negative connection_timeout', 'postgres', 'connection_timeout = -30', 'invalid connection_timeout'],
+        ['zero connection_timeout', 'postgres', 'connection_timeout = 0', 'invalid connection_timeout'],
+        ['negative query_timeout', 'postgres', 'query_timeout = -60', 'invalid query_timeout'],
+        ['zero query_timeout', 'postgres', 'query_timeout = 0', 'invalid query_timeout'],
+        // Node's setTimeout clamps delays above 2^31-1 ms (and non-finite ones)
+        // to 1ms, which would turn the client-side fallback into an immediate
+        // timeout on every query.
+        ['infinite query_timeout', 'postgres', 'query_timeout = inf', 'invalid query_timeout'],
+        ['NaN query_timeout', 'postgres', 'query_timeout = nan', 'invalid query_timeout'],
+        ['query_timeout beyond the timer range', 'postgres', `query_timeout = ${MAX_QUERY_TIMEOUT_SECONDS + 1}`, 'invalid query_timeout'],
+        ['zero pool_max_connections', 'postgres', 'pool_max_connections = 0', 'invalid pool_max_connections'],
+        ['negative pool_max_connections', 'postgres', 'pool_max_connections = -1', 'invalid pool_max_connections'],
+        ['fractional pool_max_connections', 'postgres', 'pool_max_connections = 1.5', 'invalid pool_max_connections'],
+        ['string pool_max_connections', 'postgres', 'pool_max_connections = "5"', 'invalid pool_max_connections'],
+        ['pool_max_connections above the limit', 'postgres', 'pool_max_connections = 1001', 'invalid pool_max_connections'],
         ['empty ssh_agent', 'postgres', `${ssh}ssh_agent = ""`, 'invalid ssh_agent'],
         ['non-string ssh_agent', 'postgres', `${ssh}ssh_agent = 123`, 'invalid ssh_agent'],
         ['out-of-range ssh_port', 'postgres', `${ssh}ssh_key = "~/.ssh/id_rsa"\nssh_port = 99999`, 'invalid ssh_port'],
         ['non-string aws_profile', 'postgres', 'aws_iam_auth = true\naws_region = "us-east-1"\naws_profile = 42', 'invalid aws_profile'],
         ['blank aws_profile', 'postgres', 'aws_iam_auth = true\naws_region = "us-east-1"\naws_profile = "   "', 'invalid aws_profile'],
+        ['aws_profile without aws_iam_auth', 'postgres', 'aws_profile = "development"', 'aws_profile requires aws_iam_auth = true'],
+        ['aws_iam_auth without aws_region', 'mysql', 'aws_iam_auth = true', 'aws_region is not specified'],
+        ['unknown sslmode', 'postgres', 'sslmode = "invalid"', "invalid sslmode 'invalid'"],
         ['IANA-zone timezone', 'mysql', 'timezone = "Asia/Seoul"', 'invalid timezone'],
         // ["local"] coerces to the string "local" via RegExp.test(), so the
         // typeof guard is required to reject it before it reaches the driver.
@@ -680,36 +475,29 @@ wallet_password = "fieldSecret"
         ['empty collation', 'mysql', 'collation = ""', 'invalid collation'],
         ['non-string collation (TOML array)', 'mysql', 'collation = ["utf8mb4_0900_ai_ci"]', 'invalid collation'],
       ])('should reject %s', (_label, type, extra, message) => {
-        expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "${DSN_BY_TYPE[type]}"
-${extra}
-`)).toThrow(message);
+        expect(() => loadDsnSource(type, extra)).toThrow(message);
       });
     });
 
     describe('[sources.session]', () => {
-      const withSession = (type: string, body: string): string => `
-[[sources]]
-id = "test_db"
-dsn = "${DSN_BY_TYPE[type]}"
-
-[sources.session]
-${body}
-`;
+      // A row gives the body of the [sources.session] table; `inline` replaces
+      // the table with a plain key.
+      const sessionToml = (body: string | { inline: string }): string =>
+        typeof body === 'string' ? `\n[sources.session]\n${body}` : body.inline;
 
       it.each([
         ['mysql', 'transaction_read_only = 1\nlock_wait_timeout = 5\ntime_zone = "+09:00"', { transaction_read_only: 1, lock_wait_timeout: 5, time_zone: '+09:00' }],
         ['mysql', 'max_heap_table_size = 9223372036854775807', { max_heap_table_size: 9223372036854775807n }],
         ['postgres', 'lock_timeout = "5s"\n"pg_stat_statements.track" = "all"\njit = false', { lock_timeout: '5s', 'pg_stat_statements.track': 'all', jit: false }],
+        ['clickhouse', 'max_rows_to_read = 1000000000\nmax_memory_usage = "10G"\nuse_uncompressed_cache = false', { max_rows_to_read: 1000000000, max_memory_usage: '10G', use_uncompressed_cache: false }],
       ])('should accept a %s session table and echo it back', (type, body, expected) => {
-        const result = loadToml(withSession(type, body));
+        const result = loadDsnSource(type, sessionToml(body));
+
         expect(result?.sources[0].session).toEqual(expected);
       });
 
       it.each([
-        ['for a MariaDB source', 'mariadb', 'lock_wait_timeout = 5', 'only supported for MySQL and PostgreSQL'],
+        ['for a MariaDB source', 'mariadb', 'lock_wait_timeout = 5', 'only supported for MySQL, PostgreSQL and ClickHouse'],
         ['a non-table value', 'mysql', { inline: 'session = 5' }, 'must be a table'],
         ['a datetime in place of the table', 'postgres', { inline: 'session = 2024-01-01T00:00:00Z' }, 'must be a table'],
         ['a local date in place of the table', 'mysql', { inline: 'session = 1979-05-27' }, 'must be a table'],
@@ -719,22 +507,18 @@ ${body}
         ['max_execution_time on MySQL', 'mysql', 'MAX_EXECUTION_TIME = 1000', "Use 'query_timeout' instead"],
         ['statement_timeout on PostgreSQL', 'postgres', 'statement_timeout = "5s"', "Use 'query_timeout' instead"],
         ['search_path on PostgreSQL', 'postgres', 'search_path = "app"', "Use 'search_path' instead"],
+        ['max_execution_time on ClickHouse', 'clickhouse', 'max_execution_time = 30', "Use 'query_timeout' instead"],
+        ['readonly on ClickHouse', 'clickhouse', 'readonly = 2', "Use a tool's 'readonly' option"],
+        ['the errors-as-rows setting on ClickHouse', 'clickhouse', 'http_write_exception_in_output_format = 1', 'which DBHub turns off itself'],
+        ['an HTTP interface parameter on ClickHouse', 'clickhouse', 'session_id = "abc"', "a parameter of ClickHouse's HTTP interface"],
+        ['a query parameter binding on ClickHouse', 'clickhouse', 'param_tenant = "acme"', "a parameter of ClickHouse's HTTP interface"],
         ['an array value', 'mysql', 'sql_mode = ["ANSI"]', "invalid value for 'sql_mode'"],
         ['a nested table', 'postgres', '[sources.session.lock_timeout]\nx = 1', "invalid value for 'lock_timeout'"],
         ['a date value', 'postgres', 'datestyle = 1979-05-27', "invalid value for 'datestyle'"],
         ['a backslash in a MySQL string', 'mysql', 'sql_mode = "A\\\\B"', 'must not contain backslashes'],
         ['a NUL in a PostgreSQL string', 'postgres', 'application_name = "a\\u0000b"', 'must not contain NUL'],
       ])('should reject %s', (_label, type, body, message) => {
-        // `inline` replaces the [sources.session] table with a plain key.
-        const toml = typeof body === 'string'
-          ? withSession(type, body)
-          : `
-[[sources]]
-id = "test_db"
-dsn = "${DSN_BY_TYPE[type]}"
-${body.inline}
-`;
-        expect(() => loadToml(toml)).toThrow(message);
+        expect(() => loadDsnSource(type, sessionToml(body))).toThrow(message);
       });
     });
 
@@ -745,6 +529,9 @@ ${body.inline}
         ['host', 'dsn = "postgres://dsn_user:pass@dsn_host:5432/dsn_db"\ntype = "postgres"\nhost = "explicit_host"', 'conflicting host'],
         ['user', 'dsn = "postgres://dsn_user:pass@localhost:5432/db"\nuser = "other_user"', 'conflicting user'],
         ['database', 'dsn = "postgres://user:pass@localhost:5432/dsn_db"\ndatabase = "other_db"', 'conflicting database'],
+        // The field is never injected into the DSN, so accepting this would
+        // silently connect without a default database
+        ['database (the DSN names none)', 'dsn = "mysql://user:pass@localhost:3306/"\ndatabase = "myapp"', 'the DSN names no database'],
         ['sslmode', 'dsn = "postgres://user:pass@localhost:5432/db?sslmode=disable"\nsslmode = "require"', 'conflicting sslmode'],
         // SafeURL drops `?sslmode=`, but an empty DSN value is still "present"
         ['sslmode against an empty DSN sslmode (?sslmode=)', 'dsn = "postgres://user:pass@localhost:5432/db?sslmode="\nsslmode = "require"', 'conflicting sslmode'],
@@ -764,22 +551,11 @@ ${body}
 `)).toThrow(message);
       });
 
-      it('should accept a host field that differs only in case from the DSN', () => {
-        const result = loadToml(`
-[[sources]]
-id = "case_host"
-dsn = "postgres://user:pass@DB.EXAMPLE.COM:5432/db"
-host = "db.example.com"
-`);
-
-        expect(result?.sources[0].id).toBe('case_host');
-      });
-
-      it('should accept identity fields that match the DSN', () => {
+      it('should accept identity fields that match the DSN, comparing the host case-insensitively', () => {
         const result = loadToml(`
 [[sources]]
 id = "redundant"
-dsn = "postgres://dsn_user:pass@dsn_host:5432/dsn_db"
+dsn = "postgres://dsn_user:pass@DSN_HOST:5432/dsn_db"
 type = "postgres"
 host = "dsn_host"
 port = 5432
@@ -797,40 +573,20 @@ user = "dsn_user"
         });
       });
 
-      it('should throw error when a database field is paired with a DSN naming no database', () => {
-        // The field is never injected into the DSN, so accepting this would
-        // silently connect without a default database
-        expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "mysql://user:pass@localhost:3306/"
-database = "myapp"
-`)).toThrow("the DSN names no database");
-      });
-
-      it('should throw error when password field conflicts with DSN password', () => {
+      it.each([
+        ['conflicts with the DSN password', 'postgres://user:dsn_pass@localhost:5432/db', "password' field that conflicts"],
+        ['is set but the DSN has no password', 'postgres://user@localhost:5432/db', 'the DSN has no password'],
+      ])('should reject a password field that %s without echoing a password', (_label, dsn, message) => {
         const toml = `
 [[sources]]
 id = "test_db"
-dsn = "postgres://user:dsn_pass@localhost:5432/db"
-password = "other_pass"
-`;
-
-        expect(() => loadToml(toml)).toThrow("password' field that conflicts");
-        // The error must not echo either password value
-        expect(() => loadToml(toml)).not.toThrow(/dsn_pass|other_pass/);
-      });
-
-      it('should report a clear error when password field is set but DSN has no password', () => {
-        const toml = `
-[[sources]]
-id = "test_db"
-dsn = "postgres://user@localhost:5432/db"
+dsn = "${dsn}"
 password = "field_pass"
 `;
 
-        expect(() => loadToml(toml)).toThrow("the DSN has no password");
-        expect(() => loadToml(toml)).not.toThrow(/field_pass/);
+        expect(() => loadToml(toml)).toThrow(message);
+        // The error must not echo either password value
+        expect(() => loadToml(toml)).not.toThrow(/dsn_pass|field_pass/);
       });
     });
 
@@ -888,20 +644,15 @@ sslmode = "verify-full"
         ['verify-full', 'postgres', 'postgres://user:pass@localhost:5432/testdb?sslmode=verify-full'],
         ['verify-full', 'sqlserver', 'sqlserver://user:pass@localhost:1433/testdb?sslmode=verify-full'],
         ['verify-full', 'oracle', 'oracle://user:pass@localhost:1521/testdb?sslmode=verify-full'],
+        ['verify-ca', 'mysql', 'mysql://user:pass@localhost:3306/testdb?sslmode=verify-ca'],
+        ['verify-full', 'mysql', 'mysql://user:pass@localhost:3306/testdb?sslmode=verify-full'],
+        ['verify-ca', 'mariadb', 'mariadb://user:pass@localhost:3306/testdb?sslmode=verify-ca'],
+        ['verify-full', 'mariadb', 'mariadb://user:pass@localhost:3306/testdb?sslmode=verify-full'],
       ])('should accept sslmode = %j for %s and carry it into the DSN', (sslmode, type, expectedDSN) => {
-        writeSource(`sslmode = "${sslmode}"`, type);
+        const result = loadSource(`sslmode = "${sslmode}"`, type);
 
-        const result = loadTomlConfig();
-
-        expect(result).toBeTruthy();
         expect(result?.sources[0].sslmode).toBe(sslmode);
         expect(buildDSNFromSource(result!.sources[0])).toBe(expectedDSN);
-      });
-
-      it('should throw error for invalid sslmode value', () => {
-        writeSource('sslmode = "invalid"');
-
-        expect(() => loadTomlConfig()).toThrow("invalid sslmode 'invalid'");
       });
 
       it.each([
@@ -918,37 +669,25 @@ sslmode = "${sslmode}"
 `)).toThrow("invalid sslmode ''");
       });
 
-      it('should accept matching DSN sslmode and sslmode field', () => {
+      it.each([
+        ['populate the sslmode field from the DSN query parameter', ''],
+        ['accept an sslmode field that matches the DSN', 'sslmode = "require"'],
+      ])('should %s', (_label, sslmodeLine) => {
         const result = loadToml(`
 [[sources]]
 id = "test_db"
 dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
-sslmode = "require"
-`);
-
-        expect(result).toBeTruthy();
-        expect(result?.sources[0].sslmode).toBe('require');
-      });
-
-      it('should populate sslmode field from DSN query parameter', () => {
-        const result = loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
+${sslmodeLine}
 `);
 
         expect(result?.sources[0].sslmode).toBe('require');
       });
 
       it.each([
-        ['verify-ca', 'mysql'],
-        ['verify-full', 'mariadb'],
         ['verify-ca', 'sqlserver'],
         ['verify-ca', 'oracle'],
       ])('should reject sslmode = %j for %s', (sslmode, type) => {
-        writeSource(`sslmode = "${sslmode}"`, type);
-
-        expect(() => loadTomlConfig()).toThrow(
+        expect(() => loadSource(`sslmode = "${sslmode}"`, type)).toThrow(
           `sslmode '${sslmode}' which is not supported for ${type}`
         );
       });
@@ -959,27 +698,25 @@ dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
       ])('should reject sslrootcert when sslmode is %s', (_label, sslmodeLine) => {
         const certPath = path.join(tempDir, 'ca.pem');
         fs.writeFileSync(certPath, 'cert-content');
-        writeSource(`${sslmodeLine}\nsslrootcert = '${certPath}'`);
 
-        expect(() => loadTomlConfig()).toThrow("sslrootcert requires sslmode 'verify-ca' or 'verify-full'");
+        expect(() => loadSource(`${sslmodeLine}\nsslrootcert = '${certPath}'`)).toThrow(
+          "sslrootcert requires sslmode 'verify-ca' or 'verify-full'"
+        );
       });
 
       it('should accept sslrootcert with sslmode = "verify-ca" when file exists', () => {
         const certPath = path.join(tempDir, 'ca.pem');
         fs.writeFileSync(certPath, 'cert-content');
-        writeSource(`sslmode = "verify-ca"\nsslrootcert = '${certPath}'`);
+        const result = loadSource(`sslmode = "verify-ca"\nsslrootcert = '${certPath}'`);
 
-        const result = loadTomlConfig();
-
-        expect(result).toBeTruthy();
         expect(result?.sources[0].sslmode).toBe('verify-ca');
         expect(result?.sources[0].sslrootcert).toBe(certPath);
       });
 
       it('should reject sslrootcert when file does not exist', () => {
-        writeSource('sslmode = "verify-ca"\nsslrootcert = "/nonexistent/ca.pem"');
-
-        expect(() => loadTomlConfig()).toThrow("sslrootcert file not found or not accessible: '/nonexistent/ca.pem'");
+        expect(() => loadSource('sslmode = "verify-ca"\nsslrootcert = "/nonexistent/ca.pem"')).toThrow(
+          "sslrootcert file not found or not accessible: '/nonexistent/ca.pem'"
+        );
       });
     });
 
@@ -997,9 +734,7 @@ dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
       it.each(['require', 'verify-ca', 'verify-full'])(
         'should accept sslcert + sslkey with sslmode = "%s"',
         (sslmode) => {
-          writeSource(`sslmode = "${sslmode}"\nsslcert = '${certPath}'\nsslkey = '${keyPath}'`);
-
-          const result = loadTomlConfig();
+          const result = loadSource(`sslmode = "${sslmode}"\nsslcert = '${certPath}'\nsslkey = '${keyPath}'`);
 
           expect(result?.sources[0].sslcert).toBe(certPath);
           expect(result?.sources[0].sslkey).toBe(keyPath);
@@ -1013,11 +748,9 @@ dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
       it('should accept sslcert + sslkey together with sslrootcert', () => {
         const caPath = path.join(tempDir, 'ca.pem');
         fs.writeFileSync(caPath, 'ca-content');
-        writeSource(
+        const result = loadSource(
           `sslmode = "verify-full"\nsslrootcert = '${caPath}'\nsslcert = '${certPath}'\nsslkey = '${keyPath}'`
         );
-
-        const result = loadTomlConfig();
 
         expect(buildDSNFromSource(result!.sources[0])).toBe(
           `postgres://user:pass@localhost:5432/testdb?sslmode=verify-full` +
@@ -1043,9 +776,7 @@ dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
 
       it('should expand ~ in sslcert and sslkey', () => {
         withHomeCerts((relDir, homeCert, homeKey) => {
-          writeSource(`sslmode = "require"\nsslcert = "~/${relDir}/client.crt"\nsslkey = "~/${relDir}/client.key"`);
-
-          const result = loadTomlConfig();
+          const result = loadSource(`sslmode = "require"\nsslcert = "~/${relDir}/client.crt"\nsslkey = "~/${relDir}/client.key"`);
 
           expect(result?.sources[0].sslcert).toBe(homeCert);
           expect(result?.sources[0].sslkey).toBe(homeKey);
@@ -1057,32 +788,30 @@ dsn = "postgres://user:pass@localhost:5432/db?sslmode=require"
         ['sslkey', 'sslcert'],
       ])('should reject %s without %s', (present, missing) => {
         const file = present === 'sslcert' ? certPath : keyPath;
-        writeSource(`sslmode = "require"\n${present} = '${file}'`);
-
-        expect(() => loadTomlConfig()).toThrow(`has ${present} without ${missing}`);
+        expect(() => loadSource(`sslmode = "require"\n${present} = '${file}'`)).toThrow(
+          `has ${present} without ${missing}`
+        );
       });
 
       it.each([
         ['"disable"', 'sslmode = "disable"', "sslmode is 'disable'. sslcert/sslkey require sslmode 'require', 'verify-ca' or 'verify-full'"],
         ['not set', '', "sslmode is 'not set'"],
       ])('should reject sslcert/sslkey when sslmode is %s', (_label, sslmodeLine, message) => {
-        writeSource(`${sslmodeLine}\nsslcert = '${certPath}'\nsslkey = '${keyPath}'`);
-
-        expect(() => loadTomlConfig()).toThrow(`sslcert/sslkey but ${message}`);
+        expect(() => loadSource(`${sslmodeLine}\nsslcert = '${certPath}'\nsslkey = '${keyPath}'`)).toThrow(
+          `sslcert/sslkey but ${message}`
+        );
       });
 
       it('should reject sslkey when the file does not exist', () => {
-        writeSource(`sslmode = "require"\nsslcert = '${certPath}'\nsslkey = "/nonexistent/client.key"`);
-
-        expect(() => loadTomlConfig()).toThrow(
+        expect(() => loadSource(`sslmode = "require"\nsslcert = '${certPath}'\nsslkey = "/nonexistent/client.key"`)).toThrow(
           "sslkey file not found or not accessible: '/nonexistent/client.key'"
         );
       });
 
       it('should reject sslcert when the path is a directory', () => {
-        writeSource(`sslmode = "require"\nsslcert = '${tempDir}'\nsslkey = '${keyPath}'`);
-
-        expect(() => loadTomlConfig()).toThrow(`sslcert path is not a regular file: '${tempDir}'`);
+        expect(() => loadSource(`sslmode = "require"\nsslcert = '${tempDir}'\nsslkey = '${keyPath}'`)).toThrow(
+          `sslcert path is not a regular file: '${tempDir}'`
+        );
       });
 
       it('should populate sslcert and sslkey fields from DSN query parameters', () => {
@@ -1112,12 +841,18 @@ sslkey = "~/${relDir}/client.key"
     });
 
     describe('SQL Server authentication validation', () => {
-      it('should accept authentication = "ntlm" with domain', () => {
-        writeSource('authentication = "ntlm"\ndomain = "MYDOMAIN"', 'sqlserver');
+      it.each([
+        ['connection parameters', 'type = "sqlserver"\nhost = "localhost"\ndatabase = "testdb"\nuser = "user"\npassword = "pass"'],
+        ['a SQL Server DSN (no explicit type)', 'dsn = "sqlserver://user:pass@localhost:1433/testdb"'],
+      ])('should accept authentication = "ntlm" with domain alongside %s', (_label, connection) => {
+        const result = loadToml(`
+[[sources]]
+id = "test_db"
+${connection}
+authentication = "ntlm"
+domain = "MYDOMAIN"
+`);
 
-        const result = loadTomlConfig();
-
-        expect(result).toBeTruthy();
         expect(result?.sources[0].authentication).toBe('ntlm');
         expect(result?.sources[0].domain).toBe('MYDOMAIN');
       });
@@ -1133,7 +868,6 @@ user = "admin@tenant.onmicrosoft.com"
 authentication = "azure-active-directory-access-token"
 `);
 
-        expect(result).toBeTruthy();
         expect(result?.sources[0].authentication).toBe('azure-active-directory-access-token');
         expect(result?.sources[0].password).toBeUndefined();
       });
@@ -1146,15 +880,11 @@ authentication = "azure-active-directory-access-token"
         ['an unknown applicationIntent value', 'applicationIntent = "Secondary"', "invalid applicationIntent 'Secondary'"],
         ['a non-string applicationIntent', 'applicationIntent = true', "invalid applicationIntent 'true'"],
       ])('should reject %s', (_label, extra, message) => {
-        writeSource(extra, 'sqlserver');
-
-        expect(() => loadTomlConfig()).toThrow(message);
+        expect(() => loadSource(extra, 'sqlserver')).toThrow(message);
       });
 
       it.each(['ReadOnly', 'readwrite'])('should accept applicationIntent = "%s"', (intent) => {
-        writeSource(`applicationIntent = "${intent}"`, 'sqlserver');
-
-        expect(loadTomlConfig()?.sources[0].applicationIntent).toBe(intent);
+        expect(loadSource(`applicationIntent = "${intent}"`, 'sqlserver')?.sources[0].applicationIntent).toBe(intent);
       });
 
       it('should accept applicationIntent matching the DSN case-insensitively', () => {
@@ -1167,31 +897,9 @@ applicationIntent = "ReadOnly"
 
         expect(buildDSNFromSource(result!.sources[0])).toBe('sqlserver://user:pass@localhost:1433/testdb?applicationIntent=readonly');
       });
-
-      it('should accept authentication with SQL Server DSN (no explicit type)', () => {
-        const result = loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "sqlserver://user:pass@localhost:1433/testdb"
-authentication = "ntlm"
-domain = "MYDOMAIN"
-`);
-
-        expect(result).toBeTruthy();
-        expect(result?.sources[0].authentication).toBe('ntlm');
-        expect(result?.sources[0].domain).toBe('MYDOMAIN');
-      });
     });
 
     describe('AWS IAM auth validation', () => {
-      it('should reject aws_profile when AWS IAM auth is not enabled', () => {
-        writeSource('aws_profile = "development"');
-
-        expect(() => loadTomlConfig()).toThrow(
-          'aws_profile requires aws_iam_auth = true'
-        );
-      });
-
       it('should accept aws_iam_auth for MySQL without password', () => {
         const result = loadToml(`
 [[sources]]
@@ -1205,7 +913,6 @@ aws_region = "eu-west-1"
 aws_profile = "development"
 `);
 
-        expect(result).toBeTruthy();
         expect(result?.sources[0]).toMatchObject({
           id: 'mysql_iam',
           type: 'mysql',
@@ -1218,31 +925,15 @@ aws_profile = "development"
         });
         expect(result?.sources[0].password).toBeUndefined();
       });
-
-      it('should throw error when aws_iam_auth is enabled without aws_region', () => {
-        expect(() => loadToml(`
-[[sources]]
-id = "mysql_iam_missing_region"
-type = "mysql"
-host = "mydb.abc123.eu-west-1.rds.amazonaws.com"
-database = "mydb"
-user = "dbuser@example.com"
-aws_iam_auth = true
-`)).toThrow('aws_region is not specified');
-      });
     });
   });
 
   describe('buildDSNFromSource', () => {
     it('should return DSN if already provided', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        dsn: 'postgres://user:pass@localhost:5432/db',
-      };
+      // No `type`: a raw source carries only what the file gave it
+      const source = { id: 'test', dsn: 'postgres://user:pass@localhost:5432/db' } as SourceConfig;
 
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('postgres://user:pass@localhost:5432/db');
+      expect(buildDSNFromSource(source)).toBe('postgres://user:pass@localhost:5432/db');
     });
 
     // Each row is one branch of mergeSourceFieldsIntoDSN
@@ -1341,92 +1032,100 @@ aws_iam_auth = true
       expect(buildDSNFromSource({ id: 'test', ...source })).toBe(expectedDSN);
     });
 
-    it.each([
-      ['mysql', 3306, 'testdb', 'root', 'secret'],
-      ['mariadb', 3306, 'testdb', 'root', 'secret'],
-      ['sqlserver', 1433, 'master', 'sa', 'StrongPass123'],
-    ])('should build %s DSN with default port %i', (type, port, database, user, password) => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: type as SourceConfig['type'],
-        host: 'localhost',
-        database,
-        user,
-        password,
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe(`${type}://${user}:${password}@localhost:${port}/${database}`);
-    });
-
-    it('should build PostgreSQL DSN with verify-ca and sslrootcert', () => {
-      const source: SourceConfig = {
-        id: 'pg_verify',
-        type: 'postgres',
-        host: 'rds.amazonaws.com',
-        port: 5432,
-        database: 'testdb',
-        user: 'user',
-        password: 'pass',
-        sslmode: 'verify-ca',
-        sslrootcert: '/path/to/ca-bundle.pem'
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('postgres://user:pass@rds.amazonaws.com:5432/testdb?sslmode=verify-ca&sslrootcert=%2Fpath%2Fto%2Fca-bundle.pem');
-    });
-
-    it('should build SQL Server DSN with Azure AD authentication (no password required)', () => {
-      const source: SourceConfig = {
-        id: 'sqlserver_azure',
-        type: 'sqlserver',
-        host: 'myserver.database.windows.net',
-        port: 1433,
-        database: 'mydb',
-        user: 'admin@tenant.onmicrosoft.com',
+    // DSNs built from connection parameters. Default ports per database type
+    // are covered by the sslmode table above and the Oracle test.
+    it.each<[string, Omit<SourceConfig, 'id'>, string]>([
+      [
         // No password - Azure AD access token auth doesn't require it
-        authentication: 'azure-active-directory-access-token',
-        sslmode: 'require'
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('sqlserver://admin%40tenant.onmicrosoft.com:@myserver.database.windows.net:1433/mydb?authentication=azure-active-directory-access-token&sslmode=require');
+        'build SQL Server DSN with Azure AD authentication (no password required)',
+        { type: 'sqlserver', host: 'myserver.database.windows.net', port: 1433, database: 'mydb', user: 'admin@tenant.onmicrosoft.com', authentication: 'azure-active-directory-access-token', sslmode: 'require' },
+        'sqlserver://admin%40tenant.onmicrosoft.com:@myserver.database.windows.net:1433/mydb?authentication=azure-active-directory-access-token&sslmode=require',
+      ],
+      [
+        'build SQL Server DSN with all parameters',
+        { type: 'sqlserver', host: 'sqlserver.corp.local', port: 1433, database: 'appdb', user: 'jsmith', password: 'secret', instanceName: 'PROD', authentication: 'ntlm', domain: 'CORP', applicationIntent: 'ReadOnly', sslmode: 'require' },
+        'sqlserver://jsmith:secret@sqlserver.corp.local:1433/appdb?instanceName=PROD&authentication=ntlm&domain=CORP&applicationIntent=ReadOnly&sslmode=require',
+      ],
+      [
+        'encode special characters in credentials',
+        { type: 'postgres', host: 'localhost', database: 'db', user: 'user@domain.com', password: 'pass@word#123' },
+        'postgres://user%40domain.com:pass%40word%23123@localhost:5432/db',
+      ],
+      [
+        'allow missing password when aws_iam_auth is enabled',
+        { type: 'postgres', host: 'mydb.abc123.eu-west-1.rds.amazonaws.com', database: 'mydb', user: 'dbuser@example.com', aws_iam_auth: true, aws_region: 'eu-west-1' },
+        'postgres://dbuser%40example.com:@mydb.abc123.eu-west-1.rds.amazonaws.com:5432/mydb',
+      ],
+      [
+        'use custom port when provided',
+        { type: 'postgres', host: 'localhost', port: 9999, database: 'db', user: 'user', password: 'pass' },
+        'postgres://user:pass@localhost:9999/db',
+      ],
+    ])('should %s', (_label, source, expectedDSN) => {
+      expect(buildDSNFromSource({ id: 'test', ...source })).toBe(expectedDSN);
     });
 
-    it('should build SQL Server DSN with all parameters', () => {
-      const source: SourceConfig = {
-        id: 'sqlserver_all',
-        type: 'sqlserver',
-        host: 'sqlserver.corp.local',
-        port: 1433,
-        database: 'appdb',
-        user: 'jsmith',
-        password: 'secret',
-        instanceName: 'PROD',
-        authentication: 'ntlm',
-        domain: 'CORP',
-        applicationIntent: 'ReadOnly',
-        sslmode: 'require'
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('sqlserver://jsmith:secret@sqlserver.corp.local:1433/appdb?instanceName=PROD&authentication=ntlm&domain=CORP&applicationIntent=ReadOnly&sslmode=require');
+    it.each<[string, Omit<SourceConfig, 'id'>, string]>([
+      [
+        'type is missing',
+        { host: 'localhost', database: 'db', user: 'user', password: 'pass' } as Omit<SourceConfig, 'id'>,
+        "'type' field is required when 'dsn' is not provided",
+      ],
+      ['SQLite is missing database', { type: 'sqlite' }, "'database' field is required for SQLite"],
+      [
+        'required connection params (user, database) are missing',
+        { type: 'postgres', host: 'localhost' },
+        'missing required connection parameters',
+      ],
+      [
+        'password is missing for non-Azure-AD auth',
+        { type: 'postgres', host: 'localhost', database: 'testdb', user: 'user' },
+        'password is required',
+      ],
+      [
+        'required connection params (database) are missing for ClickHouse',
+        { type: 'clickhouse', host: 'localhost', user: 'default' },
+        'missing required connection parameters',
+      ],
+      [
+        'password is missing and aws_iam_auth is set on an unsupported type',
+        { type: 'sqlserver', host: 'localhost', database: 'master', user: 'sa', aws_iam_auth: true, aws_region: 'eu-west-1' },
+        'password is required',
+      ],
+    ])('should throw error when %s', (_label, source, message) => {
+      expect(() => buildDSNFromSource({ id: 'test', ...source })).toThrow(message);
     });
 
-    it('should build SQLite DSN from database path', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'sqlite',
-        database: '/path/to/database.db',
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('sqlite:///path/to/database.db');
+    // ClickHouse serves HTTP and HTTPS on different ports, and its out-of-the-box
+    // `default` user has no password.
+    it.each<[string, Omit<SourceConfig, 'id'>, string]>([
+      [
+        'the HTTP port without sslmode',
+        { type: 'clickhouse', host: 'ch.local', database: 'analytics', user: 'reader', password: 'p@ss' },
+        'clickhouse://reader:p%40ss@ch.local:8123/analytics',
+      ],
+      [
+        'the HTTPS port with sslmode=require',
+        { type: 'clickhouse', host: 'x.clickhouse.cloud', database: 'default', user: 'default', password: 'pw', sslmode: 'require' },
+        'clickhouse://default:pw@x.clickhouse.cloud:8443/default?sslmode=require',
+      ],
+      [
+        'the HTTPS port with sslmode=verify-full',
+        { type: 'clickhouse', host: 'x.clickhouse.cloud', database: 'default', user: 'default', password: 'pw', sslmode: 'verify-full' },
+        'clickhouse://default:pw@x.clickhouse.cloud:8443/default?sslmode=verify-full',
+      ],
+      [
+        'an explicit port over either default',
+        { type: 'clickhouse', host: 'ch.local', port: 9443, database: 'default', user: 'default', password: 'pw', sslmode: 'require' },
+        'clickhouse://default:pw@ch.local:9443/default?sslmode=require',
+      ],
+      [
+        'no password',
+        { type: 'clickhouse', host: 'localhost', database: 'default', user: 'default' },
+        'clickhouse://default:@localhost:8123/default',
+      ],
+    ])('should build a ClickHouse DSN with %s', (_label, source, expectedDSN) => {
+      expect(buildDSNFromSource({ id: 'test', ...source })).toBe(expectedDSN);
     });
 
     // The DSN is only an intermediate encoding; what matters is the path the
@@ -1439,135 +1138,14 @@ aws_iam_auth = true
         return dbPath;
       };
 
-      it('preserves a POSIX absolute path', async () => {
-        await expect(roundTrip('/var/lib/app/data.db')).resolves.toBe('/var/lib/app/data.db');
+      it.each([
+        ['a POSIX absolute path', '/var/lib/app/data.db'],
+        ['a Windows drive-letter path', 'C:/Data/app/data.db'],
+        ['a path containing spaces', '/var/lib/my app/data.db'],
+        ['the :memory: sentinel', ':memory:'],
+      ])('preserves %s', async (_label, database) => {
+        await expect(roundTrip(database)).resolves.toBe(database);
       });
-
-      it('preserves a Windows drive-letter path', async () => {
-        await expect(roundTrip('C:/Data/app/data.db')).resolves.toBe('C:/Data/app/data.db');
-      });
-
-      it('preserves a path containing spaces', async () => {
-        await expect(roundTrip('/var/lib/my app/data.db')).resolves.toBe('/var/lib/my app/data.db');
-      });
-
-      it('preserves the :memory: sentinel', async () => {
-        await expect(roundTrip(':memory:')).resolves.toBe(':memory:');
-      });
-    });
-
-    it('should encode special characters in credentials', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'postgres',
-        host: 'localhost',
-        database: 'db',
-        user: 'user@domain.com',
-        password: 'pass@word#123',
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('postgres://user%40domain.com:pass%40word%23123@localhost:5432/db');
-    });
-
-    it('should throw error when type is missing', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        host: 'localhost',
-        database: 'db',
-        user: 'user',
-        password: 'pass',
-      };
-
-      expect(() => buildDSNFromSource(source)).toThrow(
-        "'type' field is required when 'dsn' is not provided"
-      );
-    });
-
-    it('should throw error when SQLite is missing database', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'sqlite',
-      };
-
-      expect(() => buildDSNFromSource(source)).toThrow(
-        "'database' field is required for SQLite"
-      );
-    });
-
-    it('should throw error when required connection params are missing', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'postgres',
-        host: 'localhost',
-        // Missing user, database
-      };
-
-      expect(() => buildDSNFromSource(source)).toThrow(
-        'missing required connection parameters'
-      );
-    });
-
-    it('should throw error when password is missing for non-Azure-AD auth', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'postgres',
-        host: 'localhost',
-        database: 'testdb',
-        user: 'user',
-        // Missing password
-      };
-
-      expect(() => buildDSNFromSource(source)).toThrow(
-        'password is required'
-      );
-    });
-
-    it('should allow missing password when aws_iam_auth is enabled', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'postgres',
-        host: 'mydb.abc123.eu-west-1.rds.amazonaws.com',
-        database: 'mydb',
-        user: 'dbuser@example.com',
-        aws_iam_auth: true,
-        aws_region: 'eu-west-1',
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('postgres://dbuser%40example.com:@mydb.abc123.eu-west-1.rds.amazonaws.com:5432/mydb');
-    });
-
-    it('should still require password for unsupported aws_iam_auth types', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'sqlserver',
-        host: 'localhost',
-        database: 'master',
-        user: 'sa',
-        aws_iam_auth: true,
-        aws_region: 'eu-west-1',
-      };
-
-      expect(() => buildDSNFromSource(source)).toThrow('password is required');
-    });
-
-    it('should use custom port when provided', () => {
-      const source: SourceConfig = {
-        id: 'test',
-        type: 'postgres',
-        host: 'localhost',
-        port: 9999,
-        database: 'db',
-        user: 'user',
-        password: 'pass',
-      };
-
-      const dsn = buildDSNFromSource(source);
-
-      expect(dsn).toBe('postgres://user:pass@localhost:9999/db');
     });
   });
 
@@ -1597,7 +1175,6 @@ type = "sqlite"
 database = "~/databases/local.db"
 `);
 
-      expect(result).toBeTruthy();
       expect(result?.sources).toHaveLength(3);
 
       // Verify first source (with SSH) - DSN fields should be parsed
@@ -1613,9 +1190,7 @@ database = "~/databases/local.db"
         ssh_port: 22,
         ssh_user: 'ubuntu',
       });
-      expect(result?.sources[0].ssh_key).toBe(
-        path.join(os.homedir(), '.ssh', 'prod_key')
-      );
+      expect(result?.sources[0].ssh_key).toBe(path.join(os.homedir(), '.ssh', 'prod_key'));
 
       // Verify second source (MySQL with params)
       expect(result?.sources[1]).toEqual({
@@ -1644,6 +1219,8 @@ database = "~/databases/local.db"
   });
 
   describe('Custom Tool Configuration', () => {
+    const customTool = 'name = "test_tool"\ndescription = "Test tool"\nstatement = "SELECT 1"';
+
     it('should accept custom tool with readonly and max_rows', () => {
       const result = loadToml(`
 [[sources]]
@@ -1659,8 +1236,6 @@ readonly = true
 max_rows = 100
 `);
 
-      expect(result).toBeTruthy();
-      expect(result?.tools).toBeDefined();
       expect(result?.tools).toHaveLength(1);
       expect(result?.tools![0]).toMatchObject({
         name: 'get_active_users',
@@ -1702,42 +1277,28 @@ required = true
         name: 'update_status',
         description: 'Update user status',
       });
-      expect(result?.tools![0].readonly).toBeUndefined();
-      expect(result?.tools![0].max_rows).toBeUndefined();
-    });
-
-    it('should throw error for custom tool with invalid readonly type', () => {
-      expect(() => loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:pass@localhost:5432/testdb"
-
-[[tools]]
-name = "test_tool"
-source = "test_db"
-description = "Test tool"
-statement = "SELECT 1"
-readonly = "yes"
-`)).toThrow('invalid readonly');
+      const tool = result?.tools![0] as CustomToolConfig;
+      expect(tool.readonly).toBeUndefined();
+      expect(tool.max_rows).toBeUndefined();
     });
 
     // The max_rows check runs after the builtin/custom fork, so both kinds of
     // tool share it.
     it.each([
-      ['custom tool', -50, 'name = "test_tool"\ndescription = "Test tool"\nstatement = "SELECT 1"'],
-      ['custom tool', 0, 'name = "test_tool"\ndescription = "Test tool"\nstatement = "SELECT 1"'],
-      ['execute_sql', -100, 'name = "execute_sql"'],
-    ])('should throw error for %s with non-positive max_rows (%i)', (_label, value, toolFields) => {
+      ['custom tool with a non-boolean readonly', `${customTool}\nreadonly = "yes"`, 'invalid readonly'],
+      ['custom tool with a negative max_rows', `${customTool}\nmax_rows = -50`, 'invalid max_rows'],
+      ['custom tool with a zero max_rows', `${customTool}\nmax_rows = 0`, 'invalid max_rows'],
+      ['execute_sql with a negative max_rows', 'name = "execute_sql"\nmax_rows = -100', 'invalid max_rows'],
+    ])('should throw error for %s', (_label, toolFields, message) => {
       expect(() => loadToml(`
 [[sources]]
 id = "test_db"
 dsn = "postgres://user:pass@localhost:5432/testdb"
 
 [[tools]]
-${toolFields}
 source = "test_db"
-max_rows = ${value}
-`)).toThrow('invalid max_rows');
+${toolFields}
+`)).toThrow(message);
     });
   });
 
@@ -1793,6 +1354,7 @@ source = "test_db"
 description = "Custom tool colliding with ${toolName} naming"
 statement = "SELECT 1"
 `);
+
       expect(result?.tools).toHaveLength(1);
       expect(result?.tools![0].name).toBe(`${toolName}_foo`);
     });
@@ -1801,16 +1363,6 @@ statement = "SELECT 1"
   describe('environment variable interpolation', () => {
     // interpolateEnvVars recurses over every string in the parsed TOML, so the
     // DSN cases below cover connection, SSH and tool fields as well.
-    it('should interpolate ${VAR} in DSN strings', () => {
-      vi.stubEnv('TEST_DB_PASSWORD', 's3cret');
-      const result = loadToml(`
-[[sources]]
-id = "test_db"
-dsn = "postgres://user:\${TEST_DB_PASSWORD}@localhost:5432/testdb"
-`);
-
-      expect(result?.sources[0].dsn).toBe('postgres://user:s3cret@localhost:5432/testdb');
-    });
 
     it('should interpolate multiple variables in a single string', () => {
       vi.stubEnv('TEST_DB_USER', 'admin');

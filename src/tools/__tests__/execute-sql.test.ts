@@ -2,43 +2,29 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createExecuteSqlToolHandler } from '../execute-sql.js';
 import { ConnectorManager } from '../../connectors/manager.js';
 import { getToolRegistry } from '../registry.js';
-import type { Connector, ConnectorType, SQLResult } from '../../connectors/interface.js';
+import type { Connector, SQLResult } from '../../connectors/interface.js';
+import { createMockConnector, describeRequestTracking, parseToolResponse } from './helpers.js';
 
 // Mock dependencies
 vi.mock('../../connectors/manager.js');
 vi.mock('../registry.js');
-
-// Mock connector for testing
-const createMockConnector = (id: ConnectorType = 'sqlite', sourceId: string = 'default'): Connector => ({
-  id,
-  name: 'Mock Connector',
-  getId: () => sourceId,
-  dsnParser: {} as any,
-  connect: vi.fn(),
-  disconnect: vi.fn(),
-  clone: vi.fn(),
-  getSchemas: vi.fn(),
-  getTables: vi.fn(),
-  tableExists: vi.fn(),
-  getTableSchema: vi.fn(),
-  getTableIndexes: vi.fn(),
-  getStoredProcedures: vi.fn(),
-  getStoredProcedureDetail: vi.fn(),
-  executeSQL: vi.fn(),
-});
-
-// Helper function to parse tool response
-const parseToolResponse = (response: any) => {
-  return JSON.parse(response.content[0].text);
-};
 
 describe('execute-sql tool', () => {
   let mockConnector: Connector;
   const mockGetCurrentConnector = vi.mocked(ConnectorManager.getCurrentConnector);
   const mockGetToolRegistry = vi.mocked(getToolRegistry);
 
+  // Run a handler (bound to test_source unless given) and parse its response
+  const execute = async (sql: string, handler = createExecuteSqlToolHandler('test_source')) => {
+    const result: any = await handler({ sql }, null);
+    return { result, parsed: parseToolResponse(result) };
+  };
+
   beforeEach(() => {
     mockConnector = createMockConnector('sqlite');
+    // Single-source by default, so resolveTrackedToolName resolves to the
+    // bare tool name; multi-source naming is covered separately below.
+    vi.mocked(ConnectorManager.getAvailableSourceIds).mockReturnValue(['test_source']);
     mockGetCurrentConnector.mockReturnValue(mockConnector);
 
     // Mock tool registry to return empty config (no readonly, no max_rows)
@@ -52,74 +38,41 @@ describe('execute-sql tool', () => {
   });
 
   describe('basic execution', () => {
-    it('should execute SELECT and return rows', async () => {
-      const mockResult: SQLResult = {
-        resultSets: [{ sql: 'SELECT * FROM users', rows: [{ id: 1, name: 'test' }], rowCount: 1 }],
-      };
-      vi.mocked(mockConnector.executeSQL).mockResolvedValue(mockResult);
-
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql: 'SELECT * FROM users' }, null);
-      const parsedResult = parseToolResponse(result);
-
-      expect(parsedResult.success).toBe(true);
-      expect(parsedResult.data.statements).toEqual([
-        { sql: 'SELECT * FROM users', rows: [{ id: 1, name: 'test' }], count: 1 },
-      ]);
-      expect(mockConnector.executeSQL).toHaveBeenCalledWith('SELECT * FROM users', { readonly: false, maxRows: undefined });
-    });
-
-    it('should pass multi-statement SQL directly to connector', async () => {
+    it('should pass the SQL to the connector unchanged and return one entry per statement', async () => {
       const mockResult: SQLResult = {
         resultSets: [
-          { sql: 'SELECT * FROM users', rows: [{ id: 1 }], rowCount: 1 },
-          { sql: 'SELECT * FROM roles', rows: [{ id: 2 }], rowCount: 1 },
+          { sql: 'SELECT * FROM users', rows: [{ id: 1, name: 'test' }], rowCount: 1 },
+          // Capped by max_rows: flagged, so it can be told from a complete result
+          { sql: 'SELECT * FROM roles', rows: [{ id: 2 }, { id: 3 }], rowCount: 2, truncated: true },
         ],
       };
       vi.mocked(mockConnector.executeSQL).mockResolvedValue(mockResult);
 
       const sql = 'SELECT * FROM users; SELECT * FROM roles;';
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql }, null);
-      const parsedResult = parseToolResponse(result);
+      const { parsed } = await execute(sql);
 
-      expect(parsedResult.success).toBe(true);
-      expect(parsedResult.data.statements).toEqual([
-        { sql: 'SELECT * FROM users', rows: [{ id: 1 }], count: 1 },
-        { sql: 'SELECT * FROM roles', rows: [{ id: 2 }], count: 1 },
+      expect(parsed.success).toBe(true);
+      expect(parsed.data.statements).toEqual([
+        { sql: 'SELECT * FROM users', rows: [{ id: 1, name: 'test' }], count: 1 },
+        { sql: 'SELECT * FROM roles', rows: [{ id: 2 }, { id: 3 }], count: 2, truncated: true },
       ]);
       expect(mockConnector.executeSQL).toHaveBeenCalledWith(sql, { readonly: false, maxRows: undefined });
     });
+  });
 
-    it('should surface truncated: true when a result set was capped by max_rows', async () => {
-      const mockResult: SQLResult = {
-        resultSets: [
-          { sql: 'SELECT * FROM users', rows: [{ id: 1 }, { id: 2 }], rowCount: 2, truncated: true },
-        ],
-      };
-      vi.mocked(mockConnector.executeSQL).mockResolvedValue(mockResult);
-
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql: 'SELECT * FROM users' }, null);
-      const parsedResult = parseToolResponse(result);
-
-      expect(parsedResult.success).toBe(true);
-      expect(parsedResult.data.statements).toEqual([
-        { sql: 'SELECT * FROM users', rows: [{ id: 1 }, { id: 2 }], count: 2, truncated: true },
-      ]);
-    });
-
+  // Error shaping and connection-failure classification live in
+  // runToolRequest, the shell every tool handler runs in. They are covered
+  // here once rather than per tool.
+  describe('error handling', () => {
     it('should handle execution errors', async () => {
       vi.mocked(mockConnector.executeSQL).mockRejectedValue(new Error('Database error'));
 
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql: 'SELECT * FROM invalid_table' }, null);
+      const { result, parsed } = await execute('SELECT * FROM invalid_table');
 
       expect(result.isError).toBe(true);
-      const parsedResult = parseToolResponse(result);
-      expect(parsedResult.success).toBe(false);
-      expect(parsedResult.error).toBe('Database error');
-      expect(parsedResult.code).toBe('EXECUTION_ERROR');
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toBe('Database error');
+      expect(parsed.code).toBe('EXECUTION_ERROR');
     });
 
     // Wire a connector whose executeSQL fails with a network error, plus the
@@ -133,42 +86,31 @@ describe('execute-sql tool', () => {
         executeSQL: vi.fn().mockRejectedValue(econn),
       } as any);
       vi.mocked(ConnectorManager.getSourceConfig).mockReturnValue(sourceConfig as any);
-      vi.mocked(ConnectorManager.ensureConnected).mockResolvedValue(undefined as any);
     };
 
-    it('returns SOURCE_UNREACHABLE when the connector throws a network error', async () => {
-      mockUnreachable('prod', { id: 'prod', type: 'postgres' });
+    it.each([
+      ['a named source', 'prod', { id: 'prod', type: 'postgres' }, 'prod'],
+      ['the unnamed single source, displayed as "default"', undefined, { type: 'postgres' }, 'default'],
+    ])(
+      'returns SOURCE_UNREACHABLE when the connector of %s throws a network error',
+      async (_, sourceId, sourceConfig, displayId) => {
+        mockUnreachable(displayId, sourceConfig);
 
-      const handler = createExecuteSqlToolHandler('prod');
-      const res: any = await handler({ sql: 'SELECT 1' }, {});
-      const payload = parseToolResponse(res);
+        const { result, parsed } = await execute('SELECT 1', createExecuteSqlToolHandler(sourceId));
 
-      expect(res.isError).toBe(true);
-      expect(payload.code).toBe('SOURCE_UNREACHABLE');
-      expect(payload.details.source_id).toBe('prod');
-    });
+        expect(result.isError).toBe(true);
+        expect(parsed.code).toBe('SOURCE_UNREACHABLE');
+        expect(parsed.details.source_id).toBe(displayId);
+      }
+    );
 
     it('falls through to EXECUTION_ERROR when the source config is null', async () => {
       mockUnreachable('prod', null);
 
-      const handler = createExecuteSqlToolHandler('prod');
-      const res: any = await handler({ sql: 'SELECT 1' }, {});
-      const payload = parseToolResponse(res);
+      const { result, parsed } = await execute('SELECT 1', createExecuteSqlToolHandler('prod'));
 
-      expect(res.isError).toBe(true);
-      expect(payload.code).toBe('EXECUTION_ERROR');
-    });
-
-    it('uses the display source id "default" in single-source mode', async () => {
-      mockUnreachable('default', { type: 'postgres' });
-
-      const handler = createExecuteSqlToolHandler();
-      const res: any = await handler({ sql: 'SELECT 1' }, {});
-      const payload = parseToolResponse(res);
-
-      expect(res.isError).toBe(true);
-      expect(payload.code).toBe('SOURCE_UNREACHABLE');
-      expect(payload.details.source_id).toBe('default');
+      expect(result.isError).toBe(true);
+      expect(parsed.code).toBe('EXECUTION_ERROR');
     });
   });
 
@@ -180,44 +122,56 @@ describe('execute-sql tool', () => {
     beforeEach(() => {
       // Set per-source readonly mode via tool registry (simulates TOML config)
       mockGetToolRegistry.mockReturnValue({
-        getBuiltinToolConfig: vi.fn().mockReturnValue({ readonly: true }),
+        getBuiltinToolConfig: vi.fn().mockReturnValue({ readonly: true, max_rows: 100 }),
       } as any);
     });
 
-    it('should allow SELECT statements', async () => {
+    it('should allow SELECT statements, passing readonly and max_rows on to the connector', async () => {
       const mockResult: SQLResult = { resultSets: [{ rows: [{ id: 1 }], rowCount: 1 }] };
       vi.mocked(mockConnector.executeSQL).mockResolvedValue(mockResult);
 
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql: 'SELECT * FROM users' }, null);
-      const parsedResult = parseToolResponse(result);
+      const { parsed } = await execute('SELECT * FROM users');
 
-      expect(parsedResult.success).toBe(true);
-      expect(mockConnector.executeSQL).toHaveBeenCalledWith('SELECT * FROM users', { readonly: true, maxRows: undefined });
+      expect(parsed.success).toBe(true);
+      expect(mockConnector.executeSQL).toHaveBeenCalledWith('SELECT * FROM users', { readonly: true, maxRows: 100 });
     });
 
     it.each([
       ['a write statement', "INSERT INTO users (name) VALUES ('test')"],
       ['a multi-statement containing a write', 'SELECT 1; DROP TABLE t'],
     ])('should reject %s', async (_, sql) => {
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql }, null);
+      const { result, parsed } = await execute(sql);
 
       expect(result.isError).toBe(true);
-      const parsedResult = parseToolResponse(result);
-      expect(parsedResult.code).toBe('READONLY_VIOLATION');
+      expect(parsed.code).toBe('READONLY_VIOLATION');
       expect(mockConnector.executeSQL).not.toHaveBeenCalled();
     });
 
+    it('should say so when PostgreSQL SQL was refused because it could not be parsed', async () => {
+      const postgres = createMockConnector('postgres', 'pg_source');
+      mockGetCurrentConnector.mockReturnValue(postgres);
+
+      const { result, parsed } = await execute(
+        'SELECT * FORM users',
+        createExecuteSqlToolHandler('pg_source')
+      );
+
+      expect(result.isError).toBe(true);
+      expect(parsed.code).toBe('READONLY_VIOLATION');
+      expect(parsed.error).toContain('could not be parsed as PostgreSQL');
+      expect(parsed.error).toContain('syntax error at or near "FORM" (position 10)');
+      expect(postgres.executeSQL).not.toHaveBeenCalled();
+    });
+
     it('should forward the connector dialect to the classifier (MySQL conditional comment bypass)', async () => {
-      const mysqlConnector = createMockConnector('mysql', 'mysql_source');
-      mockGetCurrentConnector.mockReturnValue(mysqlConnector);
+      mockGetCurrentConnector.mockReturnValue(createMockConnector('mysql', 'mysql_source'));
 
-      const sql = 'SELECT 1; /*!50000 DROP TABLE users */';
-      const handler = createExecuteSqlToolHandler('mysql_source');
-      const result = await handler({ sql }, null);
+      const { parsed } = await execute(
+        'SELECT 1; /*!50000 DROP TABLE users */',
+        createExecuteSqlToolHandler('mysql_source')
+      );
 
-      expect(parseToolResponse(result).code).toBe('READONLY_VIOLATION');
+      expect(parsed.code).toBe('READONLY_VIOLATION');
     });
   });
 
@@ -229,10 +183,12 @@ describe('execute-sql tool', () => {
       const mockResult: SQLResult = { resultSets: [{ rows: [], rowCount: 0 }] };
       vi.mocked(mockConnector.executeSQL).mockResolvedValue(mockResult);
 
-      const handler = createExecuteSqlToolHandler('test_source');
-      const result = await handler({ sql }, null);
-
-      expect(parseToolResponse(result).success).toBe(true);
+      expect((await execute(sql)).parsed.success).toBe(true);
     });
+  });
+
+  describeRequestTracking('execute_sql', async (sourceId) => {
+    vi.mocked(mockConnector.executeSQL).mockResolvedValue({ resultSets: [{ rows: [], rowCount: 0 }] });
+    await createExecuteSqlToolHandler(sourceId)({ sql: 'SELECT 1' }, null);
   });
 });

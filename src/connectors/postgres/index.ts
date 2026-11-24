@@ -15,7 +15,7 @@ import {
   HealthCheckResult,
 } from "../interface.js";
 import { toNullableNumber } from "../health-check-utils.js";
-import { SafeURL } from "../../utils/safe-url.js";
+import { SafeURL, rawQueryParamValues } from "../../utils/safe-url.js";
 import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
 import { quoteIdentifier } from "../../utils/identifier-quoter.js";
@@ -88,16 +88,13 @@ class PostgresDSNParser implements DSNParser {
         password: config?.password ?? url.password,
       };
 
-      let sslmode: string | undefined;
       let sslrootcert: string | undefined;
       let sslcert: string | undefined;
       let sslkey: string | undefined;
 
-      // Handle query parameters (like sslmode, sslrootcert, etc.)
+      // Handle query parameters (sslrootcert, sslcert, sslkey)
       url.forEachSearchParam((value, key) => {
-        if (key === "sslmode") {
-          sslmode = value;
-        } else if (key === "sslrootcert") {
+        if (key === "sslrootcert") {
           sslrootcert = value;
         } else if (key === "sslcert") {
           sslcert = value;
@@ -111,11 +108,20 @@ class PostgresDSNParser implements DSNParser {
       // through to `ssl: true`, which verifies against the system CA store and
       // never falls back to plaintext — the opposite of what allow/prefer ask
       // for. Reject it instead of guessing.
-      if (sslmode !== undefined && !SUPPORTED_SSL_MODES.includes(sslmode)) {
-        throw new Error(
-          `Unsupported sslmode '${sslmode}'. Valid values: ${SUPPORTED_SSL_MODES.join(", ")}`
-        );
+      //
+      // sslmode is read from the raw query rather than SafeURL's parameters:
+      // SafeURL drops a parameter with no value, so `?sslmode=` and a bare
+      // `?sslmode` would otherwise look like no sslmode at all and connect
+      // unencrypted. Every occurrence must be valid; the last one applies.
+      const sslmodes = rawQueryParamValues(dsn, "sslmode");
+      for (const mode of sslmodes) {
+        if (!SUPPORTED_SSL_MODES.includes(mode)) {
+          throw new Error(
+            `Unsupported sslmode '${mode}'. Valid values: ${SUPPORTED_SSL_MODES.join(", ")}`
+          );
+        }
       }
+      const sslmode = sslmodes.at(-1);
 
       // sslrootcert is only read for verify-ca/verify-full. libpq treats
       // require + a root CA as verify-ca, so a DSN copied from psql would
@@ -328,10 +334,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getSchemas(): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       const result = await client.query(`
@@ -348,10 +350,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getTables(schema?: string): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       // Use the configured default schema (from search_path config, defaults to 'public')
@@ -378,10 +376,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getViews(schema?: string): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       const schemaToUse = schema || this.defaultSchema;
@@ -403,74 +397,37 @@ export class PostgresConnector implements Connector {
     }
   }
 
-  async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
-    const client = await this.acquireClient();
-    try {
-      // Use the configured default schema (from search_path config, defaults to 'public')
-      const schemaToUse = schema || this.defaultSchema;
-
-      const result = await client.query(
-        `
-        SELECT EXISTS (
-          SELECT FROM information_schema.tables
-          WHERE table_schema = $1
-          AND table_name = $2
-        )
-      `,
-        [schemaToUse, tableName]
-      );
-
-      return result.rows[0].exists;
-    } finally {
-      client.release();
-    }
-  }
-
   async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       // Use the configured default schema (from search_path config, defaults to 'public')
       const schemaToUse = schema || this.defaultSchema;
 
-      // Query to get all indexes for the table. attname is of type `name`;
-      // node-pg has no parser for name[] and would hand back the raw '{id}'
-      // string, so the aggregate is cast to text[] to get a real array.
+      // Walk indkey positionally: INCLUDE columns follow indnkeyatts, and
+      // expression keys have attnum 0 (no matching pg_attribute row).
       const result = await client.query(
         `
         SELECT
           i.relname as index_name,
-          array_agg(a.attname::text) as column_names,
+          array_agg(
+            COALESCE(a.attname::text, pg_get_indexdef(i.oid, k.position::int, true))
+            ORDER BY k.position
+          ) FILTER (WHERE k.position <= ix.indnkeyatts) as column_names,
+          array_agg(a.attname::text ORDER BY k.position)
+            FILTER (WHERE k.position > ix.indnkeyatts) as included_columns,
           ix.indisunique as is_unique,
           ix.indisprimary as is_primary
-        FROM
-          pg_class t,
-          pg_class i,
-          pg_index ix,
-          pg_attribute a,
-          pg_namespace ns
-        WHERE
-          t.oid = ix.indrelid
-          AND i.oid = ix.indexrelid
-          AND a.attrelid = t.oid
-          AND a.attnum = ANY(ix.indkey)
-          AND t.relkind IN ('r','p')
+        FROM pg_class t
+        JOIN pg_namespace ns ON ns.oid = t.relnamespace
+        JOIN pg_index ix ON ix.indrelid = t.oid
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, position)
+        LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+        WHERE t.relkind IN ('r','p')
           AND t.relname = $1
-          AND ns.oid = t.relnamespace
           AND ns.nspname = $2
-        GROUP BY
-          i.relname,
-          ix.indisunique,
-          ix.indisprimary
-        ORDER BY
-          i.relname
+        GROUP BY i.oid, i.relname, ix.indisunique, ix.indisprimary
+        ORDER BY i.relname
       `,
         [tableName, schemaToUse]
       );
@@ -478,6 +435,7 @@ export class PostgresConnector implements Connector {
       return result.rows.map((row) => ({
         index_name: row.index_name,
         column_names: row.column_names,
+        ...(row.included_columns?.length ? { included_columns: row.included_columns } : {}),
         is_unique: row.is_unique,
         is_primary: row.is_primary,
       }));
@@ -487,10 +445,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       // Use the configured default schema (from search_path config, defaults to 'public')
@@ -529,10 +483,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getTableRowCount(tableName: string, schema?: string): Promise<number | null> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       // Use the configured default schema (from search_path config, defaults to 'public')
@@ -561,10 +511,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getTableComment(tableName: string, schema?: string): Promise<string | null> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       const schemaToUse = schema || this.defaultSchema;
@@ -591,10 +537,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getHealthCheck(): Promise<HealthCheckResult> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       const [connectionsResult, maxConnectionsResult, bufferCacheResult] = await Promise.all([
@@ -653,10 +595,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getStoredProcedures(schema?: string, routineType?: "procedure" | "function"): Promise<string[]> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       // Use the configured default schema (from search_path config, defaults to 'public')
@@ -690,10 +628,6 @@ export class PostgresConnector implements Connector {
   }
 
   async getStoredProcedureDetail(procedureName: string, schema?: string): Promise<StoredProcedure> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     try {
       // Use the configured default schema (from search_path config, defaults to 'public')
@@ -813,94 +747,72 @@ export class PostgresConnector implements Connector {
   }
 
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
-    if (!this.pool) {
-      throw new Error("Not connected to database");
-    }
-
     const client = await this.acquireClient();
     // Captured up front, before a timeout can lead to the client being discarded.
     const backendPid = (client as unknown as { processID: number | null }).processID;
     let isClientDiscarded = false;
     try {
-      // Check if this is a multi-statement query
       const statements = splitSQLStatements(sql, "postgres");
+      const isSingleStatement = statements.length === 1;
 
-      if (statements.length === 1) {
-        // Single statement - apply maxRows (with a truncation probe row) if applicable
-        const { sql: processedStatement, probeApplied } = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
-            statements[0],
-            options.maxRows,
-            "postgres"
-          );
+      // Parameters are not supported for multi-statement queries
+      if (!isSingleStatement && parameters && parameters.length > 0) {
+        throw new Error("Parameters are not supported for multi-statement queries in PostgreSQL");
+      }
 
-        // Engine-level read-only enforcement: when the tool is read-only, run the
-        // statement inside a READ ONLY transaction so the database itself rejects any
-        // write, even one the keyword classifier failed to catch (e.g. SELECT setval()).
-        if (options.readonly) {
-          await client.query('BEGIN READ ONLY');
-          try {
-            const { rows, rowCount } = await PostgresConnector.queryRows(
-              client,
-              processedStatement,
-              parameters
-            );
-            await client.query('COMMIT');
-            const resultSet: SQLResultSet = { sql: statements[0], rows, rowCount };
-            SQLRowLimiter.flagTruncation(resultSet, options.maxRows, probeApplied);
-            return { resultSets: [resultSet] };
-          } catch (error) {
-            await this.rollbackQuietly(client, error);
-            throw error;
-          }
-        }
+      // A batch runs in one transaction, for session consistency across its
+      // statements. A single statement runs in autocommit, as written — some
+      // statements (VACUUM, CREATE INDEX CONCURRENTLY) refuse to run inside a
+      // transaction — unless the tool is read-only.
+      //
+      // Engine-level read-only enforcement: when the tool is read-only, the
+      // transaction is opened READ ONLY so the database itself rejects any
+      // write, even one the AST classifier cannot establish (e.g. SELECT
+      // setval()). Defense in depth, not a parser.
+      const inTransaction = !isSingleStatement || options.readonly === true;
 
-        const { rows, rowCount } = await PostgresConnector.queryRows(
-          client,
-          processedStatement,
-          parameters
-        );
-        const resultSet: SQLResultSet = { sql: statements[0], rows, rowCount };
-        SQLRowLimiter.flagTruncation(resultSet, options.maxRows, probeApplied);
-        return { resultSets: [resultSet] };
-      } else {
-        // Multiple statements - parameters not supported for multi-statement queries
-        if (parameters && parameters.length > 0) {
-          throw new Error("Parameters are not supported for multi-statement queries in PostgreSQL");
-        }
+      // Each statement keeps its rows/rowCount as its own result set rather
+      // than being merged into one - a caller needs to tell "SELECT 1 AS a" and
+      // "SELECT 2 AS b" apart, not just see their rows concatenated.
+      const resultSets: SQLResultSet[] = [];
 
-        // Execute all in same session for transaction consistency, keeping
-        // each statement's rows/rowCount as its own result set rather than
-        // merging them into one - a caller needs to tell "SELECT 1 AS a" and
-        // "SELECT 2 AS b" apart, not just see their rows concatenated.
-        const resultSets: SQLResultSet[] = [];
-
-        // Execute within a transaction to ensure session consistency.
-        // In read-only mode, open it READ ONLY so the engine rejects any write the
-        // keyword classifier missed (defense in depth, not a parser).
+      if (inTransaction) {
         await client.query(options.readonly ? 'BEGIN READ ONLY' : 'BEGIN');
-        try {
-          for (let statement of statements) {
-            // Apply maxRows limit (with a truncation probe row) to SELECT queries if specified
-            const { sql: processedStatement, probeApplied } = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
+      }
+      try {
+        if (options.readonly) {
+          // Match libpg-query even if a prior writable request changed the session.
+          await client.query("SET LOCAL standard_conforming_strings = on");
+        }
+        for (const statement of statements) {
+          // Apply maxRows limit (with a truncation probe row) to SELECT queries if specified
+          const { sql: processedStatement, probeApplied } = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
             statement,
             options.maxRows,
             "postgres"
           );
 
-            const { rows, rowCount } = await PostgresConnector.queryRows(client, processedStatement);
-            const resultSet: SQLResultSet = { sql: statement, rows, rowCount };
-            SQLRowLimiter.flagTruncation(resultSet, options.maxRows, probeApplied);
-            resultSets.push(resultSet);
-          }
-          await client.query('COMMIT');
-        } catch (error) {
-          // Read-only violations mid-batch are expected under BEGIN READ ONLY.
-          await this.rollbackQuietly(client, error);
-          throw error;
+          const { rows, rowCount } = await PostgresConnector.queryRows(
+            client,
+            processedStatement,
+            isSingleStatement ? parameters : undefined
+          );
+          const resultSet: SQLResultSet = { sql: statement, rows, rowCount };
+          SQLRowLimiter.flagTruncation(resultSet, options.maxRows, probeApplied);
+          resultSets.push(resultSet);
         }
-
-        return { resultSets };
+        if (inTransaction) {
+          await client.query('COMMIT');
+        }
+      } catch (error) {
+        if (inTransaction) {
+          // Read-only violations are expected under BEGIN READ ONLY.
+          await this.rollbackQuietly(client, error);
+        }
+        throw error;
       }
+
+      return { resultSets };
     } catch (error) {
       if (isClientSideTimeout(error)) {
         // node-postgres's query_timeout only aborts client-side: the statement

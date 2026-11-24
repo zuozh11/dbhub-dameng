@@ -1,3 +1,4 @@
+import { isPostgresSelect } from "./postgres-sql.js";
 import { blankCommentsAndStrings } from "./sql-parser.js";
 import type { ConnectorType, SQLResultSet } from "../connectors/interface.js";
 import { hasMutatingKeyword } from "./allowed-keywords.js";
@@ -20,7 +21,7 @@ export interface MaxRowsRewrite {
 interface TopLevelClause {
   index: number;
   length: number;
-  /** Null when the clause holds a parameter placeholder instead of a literal. */
+  /** Null when the clause's row count is not a literal (a parameter placeholder, say). */
   value: number | null;
 }
 
@@ -47,16 +48,22 @@ export class SQLRowLimiter {
    * `WITH` leads a CTE whose final statement is normally a SELECT, so it is
    * limitable too, except for a data-modifying CTE
    * (`WITH x AS (DELETE ... RETURNING *) SELECT ...`), where a LIMIT would cap
-   * the rows handed back while the write still runs in full. Detection there is
-   * the same keyword heuristic the read-only classifier uses, so a false
-   * positive only means the statement keeps the old behaviour of not being limited.
+   * the rows handed back while the write still runs in full. PostgreSQL reads
+   * the statement's shape from the AST; other dialects, and PostgreSQL text
+   * the parser cannot read, use the shared keyword heuristic.
    *
    * `dialect` selects the connector's scanner so dialect-specific quoting
    * (PostgreSQL dollar quotes, MySQL backticks, SQL Server brackets) is
    * blanked the same way the read-only classifier blanks it; without it only
    * ANSI syntax is recognized.
    */
-  static isSelectQuery(sql: string, dialect?: ConnectorType): boolean {
+  private static isSelectQuery(sql: string, dialect?: ConnectorType): boolean {
+    if (dialect === "postgres") {
+      // Text the parser cannot read (a Postgres-compatible engine's own
+      // syntax, say) falls through to the keyword heuristic below.
+      const parsedAsSelect = isPostgresSelect(sql);
+      if (parsedAsSelect !== null) return parsedAsSelect;
+    }
     const blankedSQL = blankCommentsAndStrings(sql, dialect).trim().toLowerCase();
     // Leading parentheses are skipped: `(SELECT ...) UNION (SELECT ...)` is a
     // row-returning statement whose first token is `(`. So is a leading
@@ -69,41 +76,26 @@ export class SQLRowLimiter {
   }
 
   /**
-   * Check if a SQL statement has a LIMIT clause of its own (not one nested in
-   * a CTE body or subquery).
+   * Extract the statement's own LIMIT row count. Null when it has no LIMIT of
+   * its own, or when that count is not a literal (see hasParameterizedLimit).
    */
-  static hasLimitClause(sql: string, dialect?: ConnectorType): boolean {
-    return this.findTopLevelLimit(sql, dialect) !== null;
-  }
-
-  /**
-   * Check if a SQL statement has a TOP clause of its own (SQL Server).
-   */
-  static hasTopClause(sql: string): boolean {
-    return this.findTopLevelTop(sql) !== null;
-  }
-
-  /**
-   * Extract the statement's own LIMIT value. Null when it has no LIMIT of its
-   * own, or when that LIMIT is a parameter placeholder rather than a literal
-   * (see hasParameterizedLimit).
-   */
-  static extractLimitValue(sql: string, dialect?: ConnectorType): number | null {
+  private static extractLimitValue(sql: string, dialect?: ConnectorType): number | null {
     return this.findTopLevelLimit(sql, dialect)?.value ?? null;
   }
 
   /**
    * Extract the statement's own TOP value (SQL Server), or null when it has none.
    */
-  static extractTopValue(sql: string): number | null {
+  private static extractTopValue(sql: string): number | null {
     return this.findTopLevelTop(sql)?.value ?? null;
   }
 
   /**
-   * Check if the statement's own LIMIT clause uses a parameter placeholder
-   * ($1, ?, @p1) instead of a literal number.
+   * Check if the statement's own LIMIT clause has a row count that is not a
+   * literal number: a parameter placeholder ($1, ?, @p1), or an unrecognized
+   * count in the `LIMIT offset, count` form.
    */
-  static hasParameterizedLimit(sql: string, dialect?: ConnectorType): boolean {
+  private static hasParameterizedLimit(sql: string, dialect?: ConnectorType): boolean {
     const limit = this.findTopLevelLimit(sql, dialect);
     return limit !== null && limit.value === null;
   }
@@ -111,15 +103,16 @@ export class SQLRowLimiter {
   /**
    * Add or tighten the LIMIT clause of a SQL statement
    */
-  static applyLimitToQuery(sql: string, maxRows: number, dialect?: ConnectorType): string {
+  private static applyLimitToQuery(sql: string, maxRows: number, dialect?: ConnectorType): string {
     const limit = this.findTopLevelLimit(sql, dialect);
 
     if (limit !== null && limit.value !== null) {
       // Splice at the clause's own position rather than replacing the first
       // LIMIT found textually, which on a CTE would rewrite the CTE's cap and
-      // leave the statement itself uncapped.
+      // leave the statement itself uncapped. Only the count is replaced, so
+      // the offset of `LIMIT offset, count` is preserved.
       const effectiveLimit = Math.min(limit.value, maxRows);
-      return `${sql.slice(0, limit.index)}LIMIT ${effectiveLimit}${sql.slice(limit.index + limit.length)}`;
+      return `${sql.slice(0, limit.index)}${effectiveLimit}${sql.slice(limit.index + limit.length)}`;
     }
 
     // Add LIMIT clause to the end of the query
@@ -173,22 +166,34 @@ export class SQLRowLimiter {
     return found;
   }
 
-  /** The statement's own LIMIT clause, literal or parameterized ($1, ?, @p1). */
+  /**
+   * The statement's own LIMIT clause, in either form: `LIMIT count` or the
+   * MySQL/MariaDB/SQLite `LIMIT offset, count`, where the first operand is the
+   * offset and must never be read (or rewritten) as the row count.
+   *
+   * `value` is the literal row count, or null when the count is not a literal:
+   * a parameter placeholder ($1, ?, @p1), or, after a comma, anything else
+   * (`LIMIT 5, :n`). `index`/`length` span a literal count only, so it can be
+   * tightened in place while an offset before it stays exactly as written.
+   */
   private static findTopLevelLimit(sql: string, dialect?: ConnectorType): TopLevelClause | null {
     const match = this.findTopLevelMatch(
       sql,
-      /\(|\)|\blimit\s+(?:(\d+)|\$\d+|\?|@p\d+)/gi,
+      /\(|\)|\blimit\s+(?:(\d+)|\$\d+|\?|@p\d+)(\s*,\s*(\d+)?)?/gi,
       "last",
       dialect
     );
     if (match === null) {
       return null;
     }
-    return {
-      index: match.index,
-      length: match[0].length,
-      value: match[1] !== undefined ? parseInt(match[1], 10) : null,
-    };
+    const hasOffset = match[2] !== undefined;
+    const count: string | undefined = hasOffset ? match[3] : match[1];
+    const end = match.index + match[0].length;
+    if (count === undefined) {
+      return { index: end, length: 0, value: null };
+    }
+    // A literal count is always the last thing the pattern matched.
+    return { index: end - count.length, length: count.length, value: parseInt(count, 10) };
   }
 
   /**
@@ -336,7 +341,7 @@ export class SQLRowLimiter {
    * (UNION [ALL], INTERSECT, EXCEPT) at the top level — i.e. not nested
    * inside a subquery already wrapped in parentheses.
    */
-  static hasSetOperator(sql: string): boolean {
+  private static hasSetOperator(sql: string): boolean {
     return (
       this.findTopLevelMatch(sql, /\(|\)|\bunion\b|\bintersect\b|\bexcept\b/gi, "first", "sqlserver") !==
       null
@@ -355,7 +360,7 @@ export class SQLRowLimiter {
   /**
    * Add or modify TOP clause in a SQL statement (SQL Server)
    */
-  static applyTopToQuery(sql: string, maxRows: number): string {
+  private static applyTopToQuery(sql: string, maxRows: number): string {
     // T-SQL rejects TOP in a query that has OFFSET, so cap through the
     // FETCH count instead: tighten a literal one, append one when missing,
     // and wrap when the count is a parameter or the clause has an unusual

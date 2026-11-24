@@ -1,8 +1,25 @@
 import { describe, it, expect } from "vitest";
 import { SQLRowLimiter } from "../sql-row-limiter.js";
 
+/**
+ * One statement through a plain entry point and its truncation-probe twin, both
+ * at a cap of 100: [what the case shows, sql, capped, probed].
+ *
+ * `capped` is the plain rewrite. `probed` is the SQL the probe variant sends
+ * instead (the same rewrite at cap + 1 = 101), or null when the statement's own
+ * cap is already within 100: the cap cannot fire then, so the probe variant
+ * returns the statement exactly as written, with probeApplied: false.
+ */
+type CapAndProbeCase = [name: string, sql: string, capped: string, probed: string | null];
+
+const probeResult = (sql: string, probed: string | null) =>
+  probed === null ? { sql, probeApplied: false } : { sql: probed, probeApplied: true };
+
 describe("SQLRowLimiter", () => {
-  describe("hasLimitClause - edge cases with comments and strings", () => {
+  describe("LIMIT detection - edge cases with comments and strings", () => {
+    // `true`: the statement has its own LIMIT 10, within the cap, so it is left
+    // alone. `false`: the word only appears in a string or comment, so the
+    // statement has no LIMIT and gets the cap appended.
     it.each([
       ["inside single-quoted string", "SELECT 'show limit 10 records' AS msg FROM users", false],
       ["inside double-quoted identifier", 'SELECT "limit 10" AS col FROM users', false],
@@ -11,30 +28,8 @@ describe("SQLRowLimiter", () => {
       ["inside string with escaped quotes", "SELECT 'it''s limit 10' AS msg FROM users", false],
       ["real LIMIT after string containing 'limit'", "SELECT 'limit' AS word FROM users LIMIT 10", true],
       ["real LIMIT after comment containing 'limit'", "SELECT * FROM users /* show limit */ LIMIT 10", true],
-    ])("LIMIT %s -> %s", (_label, sql, expected) => {
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(expected);
-    });
-  });
-
-  describe("hasLimitClause", () => {
-    it("should detect LIMIT with literal number", () => {
-      const sql = "SELECT * FROM users LIMIT 10";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
-    });
-
-    // Note: @p style parameters with LIMIT is not valid SQL Server syntax
-    // (SQL Server uses TOP, not LIMIT). That case tests the regex pattern only.
-    it.each([
-      ["PostgreSQL parameter ($1, $2, etc.)", "SELECT * FROM users WHERE name = $1 LIMIT $2"],
-      ["MySQL/SQLite parameter (?)", "SELECT * FROM users WHERE name = ? LIMIT ?"],
-      ["named parameter (@p1, @p2, etc.)", "SELECT * FROM users WHERE name = @p1 LIMIT @p2"],
-    ])("should detect LIMIT with %s", (_label, sql) => {
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(true);
-    });
-
-    it("should return false when no LIMIT clause exists", () => {
-      const sql = "SELECT * FROM users WHERE active = true";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
+    ])("LIMIT %s -> %s", (_label, sql, hasOwnLimit) => {
+      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(hasOwnLimit ? sql : `${sql}\nLIMIT 100`);
     });
   });
 
@@ -67,13 +62,103 @@ describe("SQLRowLimiter", () => {
     });
   });
 
-  describe("applyMaxRows", () => {
-    it("should add LIMIT when none exists", () => {
-      const sql = "SELECT * FROM users";
-      const result = SQLRowLimiter.applyMaxRows(sql, 100);
-      expect(result).toBe("SELECT * FROM users\nLIMIT 100");
+  describe("applyMaxRows and applyMaxRowsWithTruncationProbe", () => {
+    it.each<CapAndProbeCase>([
+      ["adds a LIMIT when none exists", "SELECT * FROM users", "SELECT * FROM users\nLIMIT 100", "SELECT * FROM users\nLIMIT 101"],
+      ["keeps a LIMIT below the cap", "SELECT * FROM users LIMIT 50", "SELECT * FROM users LIMIT 50", null],
+      // The user asked for exactly maxRows rows — that's their limit firing,
+      // not the cap, so no probe and never a truncated flag.
+      ["keeps a LIMIT equal to the cap", "SELECT * FROM users LIMIT 100", "SELECT * FROM users LIMIT 100", null],
+      ["tightens a LIMIT above the cap", "SELECT * FROM users LIMIT 200", "SELECT * FROM users LIMIT 100", "SELECT * FROM users LIMIT 101"],
+      [
+        "wraps a parameterized LIMIT in a subquery",
+        "SELECT * FROM users LIMIT $1",
+        "SELECT * FROM (SELECT * FROM users LIMIT $1\n) AS subq LIMIT 100",
+        "SELECT * FROM (SELECT * FROM users LIMIT $1\n) AS subq LIMIT 101",
+      ],
+      // A nested LIMIT caps only its own query; the statement can still return
+      // far more rows than that (here via the join), so it needs a cap of its
+      // own, and the inner LIMIT must not be mistaken for a user cap already
+      // within maxRows.
+      [
+        "appends its own LIMIT instead of tightening a CTE's inner LIMIT",
+        "WITH recent AS (SELECT * FROM orders LIMIT 5) SELECT * FROM recent JOIN big ON true",
+        "WITH recent AS (SELECT * FROM orders LIMIT 5) SELECT * FROM recent JOIN big ON true\nLIMIT 100",
+        "WITH recent AS (SELECT * FROM orders LIMIT 5) SELECT * FROM recent JOIN big ON true\nLIMIT 101",
+      ],
+      [
+        "appends its own LIMIT instead of tightening a subquery's LIMIT",
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) s",
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) s\nLIMIT 100",
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) s\nLIMIT 101",
+      ],
+      [
+        "appends its own LIMIT instead of wrapping for a CTE's parameterized LIMIT",
+        "WITH x AS (SELECT * FROM t LIMIT $1) SELECT * FROM x",
+        "WITH x AS (SELECT * FROM t LIMIT $1) SELECT * FROM x\nLIMIT 100",
+        "WITH x AS (SELECT * FROM t LIMIT $1) SELECT * FROM x\nLIMIT 101",
+      ],
+    ])("%s", (_name, sql, capped, probed) => {
+      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(capped);
+      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual(probeResult(sql, probed));
     });
 
+    // MySQL, MariaDB and SQLite accept `LIMIT offset, count`: the first number
+    // is the offset, so the cap applies to the second and the offset is kept
+    // exactly as written.
+    it.each<CapAndProbeCase>([
+      [
+        "tightens the count, not the offset",
+        "SELECT * FROM users LIMIT 500, 200",
+        "SELECT * FROM users LIMIT 500, 100",
+        "SELECT * FROM users LIMIT 500, 101",
+      ],
+      [
+        "tightens a count above the cap behind an offset below it",
+        "SELECT * FROM users LIMIT 5, 200",
+        "SELECT * FROM users LIMIT 5, 100",
+        "SELECT * FROM users LIMIT 5, 101",
+      ],
+      ["keeps a count below the cap behind an offset above it", "SELECT * FROM users LIMIT 500, 50", "SELECT * FROM users LIMIT 500, 50", null],
+      ["keeps a count equal to the cap", "SELECT * FROM users LIMIT 500, 100", "SELECT * FROM users LIMIT 500, 100", null],
+      [
+        "tightens the count without spaces around the comma",
+        "SELECT * FROM users LIMIT 500,200;",
+        "SELECT * FROM users LIMIT 500,100;",
+        "SELECT * FROM users LIMIT 500,101;",
+      ],
+      [
+        "tightens the count behind a parameterized offset",
+        "SELECT * FROM users LIMIT ?, 200",
+        "SELECT * FROM users LIMIT ?, 100",
+        "SELECT * FROM users LIMIT ?, 101",
+      ],
+      [
+        "wraps a parameterized count",
+        "SELECT * FROM users LIMIT 500, ?",
+        "SELECT * FROM (SELECT * FROM users LIMIT 500, ?\n) AS subq LIMIT 100",
+        "SELECT * FROM (SELECT * FROM users LIMIT 500, ?\n) AS subq LIMIT 101",
+      ],
+      // SQLite named parameter: not a literal, so the count is unknown
+      [
+        "wraps a count that is not a literal number",
+        "SELECT * FROM users LIMIT 5, :count",
+        "SELECT * FROM (SELECT * FROM users LIMIT 5, :count\n) AS subq LIMIT 100",
+        "SELECT * FROM (SELECT * FROM users LIMIT 5, :count\n) AS subq LIMIT 101",
+      ],
+      [
+        "tightens LIMIT count OFFSET offset, leaving the offset alone",
+        "SELECT * FROM users LIMIT 200 OFFSET 500",
+        "SELECT * FROM users LIMIT 100 OFFSET 500",
+        "SELECT * FROM users LIMIT 101 OFFSET 500",
+      ],
+    ])("LIMIT offset, count: %s", (_name, sql, capped, probed) => {
+      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(capped);
+      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual(probeResult(sql, probed));
+    });
+  });
+
+  describe("applyMaxRows", () => {
     // Note: @p style parameters with LIMIT is not valid SQL Server syntax
     // (SQL Server uses TOP, not LIMIT). The @p cases test the regex pattern only.
     it.each([
@@ -90,18 +175,6 @@ describe("SQLRowLimiter", () => {
       expect(result).toBe(
         `SELECT * FROM (SELECT * FROM users WHERE name = ${p1} LIMIT ${p2}\n) AS subq LIMIT 1000${semi}`
       );
-    });
-
-    it("should use minimum of existing LIMIT and maxRows", () => {
-      const sql = "SELECT * FROM users LIMIT 50";
-      const result = SQLRowLimiter.applyMaxRows(sql, 100);
-      expect(result).toBe("SELECT * FROM users LIMIT 50");
-    });
-
-    it("should replace existing LIMIT when maxRows is smaller", () => {
-      const sql = "SELECT * FROM users LIMIT 200";
-      const result = SQLRowLimiter.applyMaxRows(sql, 100);
-      expect(result).toBe("SELECT * FROM users LIMIT 100");
     });
 
     it("should preserve semicolon at end when adding LIMIT", () => {
@@ -145,23 +218,6 @@ describe("SQLRowLimiter", () => {
   });
 
   describe("applyMaxRows - CTEs", () => {
-    it("caps a WITH ... SELECT query", () => {
-      const sql = "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
-        "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent\nLIMIT 100"
-      );
-    });
-
-    it("appends its own LIMIT instead of tightening a CTE's inner LIMIT", () => {
-      // The CTE's LIMIT caps only the CTE; the statement can still return far
-      // more rows than that (here via the join), so it needs a cap of its own.
-      const sql =
-        "WITH recent AS (SELECT * FROM orders LIMIT 5) SELECT * FROM recent JOIN big ON true";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
-        "WITH recent AS (SELECT * FROM orders LIMIT 5) SELECT * FROM recent JOIN big ON true\nLIMIT 100"
-      );
-    });
-
     it("tightens the statement's own LIMIT on a CTE query", () => {
       const sql = "WITH recent AS (SELECT * FROM orders LIMIT 5) SELECT * FROM recent LIMIT 500";
       expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
@@ -187,7 +243,7 @@ describe("SQLRowLimiter", () => {
     });
   });
 
-  describe("applyMaxRows - set operations and nesting", () => {
+  describe("applyMaxRows - set operations", () => {
     it("caps a parenthesised set operation", () => {
       const sql = "(SELECT id FROM a) UNION (SELECT id FROM b)";
       expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
@@ -201,35 +257,23 @@ describe("SQLRowLimiter", () => {
         "SELECT id FROM a UNION ALL SELECT id FROM b\nLIMIT 100"
       );
     });
-
-    it("appends its own LIMIT instead of tightening a subquery's LIMIT", () => {
-      const sql = "SELECT * FROM (SELECT * FROM t LIMIT 5) s";
-      expect(SQLRowLimiter.applyMaxRows(sql, 100)).toBe(
-        "SELECT * FROM (SELECT * FROM t LIMIT 5) s\nLIMIT 100"
-      );
-    });
-  });
-
-  describe("clause detection ignores nested clauses", () => {
-    it("does not report a subquery's LIMIT as the statement's own", () => {
-      const sql = "SELECT * FROM (SELECT * FROM t LIMIT 5) s";
-      expect(SQLRowLimiter.hasLimitClause(sql)).toBe(false);
-      expect(SQLRowLimiter.extractLimitValue(sql)).toBe(null);
-    });
-
-    it("does not report a CTE's parameterized LIMIT as the statement's own", () => {
-      const sql = "WITH x AS (SELECT * FROM t LIMIT $1) SELECT * FROM x";
-      expect(SQLRowLimiter.hasParameterizedLimit(sql)).toBe(false);
-    });
-
-    it("does not report a CTE's TOP as the statement's own", () => {
-      const sql = "WITH x AS (SELECT TOP 5 id FROM t) SELECT * FROM x";
-      expect(SQLRowLimiter.hasTopClause(sql)).toBe(false);
-      expect(SQLRowLimiter.extractTopValue(sql)).toBe(null);
-    });
   });
 
   describe("dialect-aware scanning", () => {
+    it("caps a PostgreSQL SELECT whatever it calls, and one the parser cannot read", () => {
+      // A restricted function changes what a read-only tool allows, not whether rows come back.
+      const restricted = "SELECT pg_ls_dir('.')";
+      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(restricted, 10, "postgres")).toEqual({
+        sql: `${restricted}\nLIMIT 11`,
+        probeApplied: true,
+      });
+      // Another engine's syntax behind a postgres:// DSN: the keyword heuristic still applies.
+      const foreign = "SELECT * FROM t AS OF SYSTEM TIME '-10s'";
+      expect(SQLRowLimiter.applyMaxRows(foreign, 10, "postgres")).toBe(`${foreign}\nLIMIT 10`);
+      const foreignWrite = "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d AS OF SYSTEM TIME '-10s'";
+      expect(SQLRowLimiter.applyMaxRows(foreignWrite, 10, "postgres")).toBe(foreignWrite);
+    });
+
     it("does not mistake a PostgreSQL dollar-quoted literal for a data-modifying CTE", () => {
       const sql = "WITH x AS (SELECT $$DELETE FROM t$$ AS s) SELECT * FROM x";
       expect(SQLRowLimiter.applyMaxRows(sql, 100, "postgres")).toBe(`${sql}\nLIMIT 100`);
@@ -257,10 +301,17 @@ describe("SQLRowLimiter", () => {
   });
 
   describe("applyMaxRowsForOracle", () => {
-    it("wraps a SELECT in an inline view capped with FETCH FIRST", () => {
+    it("wraps a SELECT in an inline view capped with FETCH FIRST, probing with one extra row", () => {
       expect(SQLRowLimiter.applyMaxRowsForOracle("SELECT * FROM users", 100)).toBe(
         "SELECT * FROM (SELECT * FROM users\n) FETCH FIRST 100 ROWS ONLY"
       );
+      // The cap always wraps, so the probe applies to every row-returning statement.
+      expect(
+        SQLRowLimiter.applyMaxRowsForOracleWithTruncationProbe("SELECT * FROM users", 100)
+      ).toEqual({
+        sql: "SELECT * FROM (SELECT * FROM users\n) FETCH FIRST 101 ROWS ONLY",
+        probeApplied: true,
+      });
     });
 
     it("drops the trailing semicolon, which Oracle rejects on a plain statement", () => {
@@ -293,14 +344,107 @@ describe("SQLRowLimiter", () => {
       // ... but not one that only mentions it inside a string or subquery.
       expect(SQLRowLimiter.applyMaxRowsForOracle("SELECT 'for update' AS s FROM dual", 10)).toContain("FETCH FIRST 10");
     });
+  });
 
-    it("applies the truncation probe to every row-returning statement", () => {
-      expect(
-        SQLRowLimiter.applyMaxRowsForOracleWithTruncationProbe("SELECT * FROM users", 100)
-      ).toEqual({
-        sql: "SELECT * FROM (SELECT * FROM users\n) FETCH FIRST 101 ROWS ONLY",
-        probeApplied: true,
-      });
+  describe("applyMaxRowsForSQLServer and applyMaxRowsForSQLServerWithTruncationProbe", () => {
+    it.each<CapAndProbeCase>([
+      ["adds TOP when none exists", "SELECT * FROM users", "SELECT TOP 100 * FROM users", "SELECT TOP 101 * FROM users"],
+      ["keeps a TOP within the cap", "SELECT TOP 50 * FROM users", "SELECT TOP 50 * FROM users", null],
+      ["tightens a TOP above the cap", "SELECT TOP 200 * FROM users", "SELECT TOP 100 * FROM users", "SELECT TOP 101 * FROM users"],
+      // A parenthesised literal is the statement's own TOP (issue #453): it is
+      // tightened to min(3, 100) = 3, i.e. the user's own cap, not given a second TOP.
+      ["recognises TOP (3)", "SELECT TOP (3) name FROM users ORDER BY name", "SELECT TOP 3 name FROM users ORDER BY name", null],
+      ["recognises TOP(3)", "SELECT TOP(3) name FROM users ORDER BY name", "SELECT TOP 3 name FROM users ORDER BY name", null],
+      ["recognises TOP ( 3 )", "SELECT TOP ( 3 ) name FROM users ORDER BY name", "SELECT TOP 3 name FROM users ORDER BY name", null],
+      // T-SQL requires `SELECT DISTINCT TOP n`; `SELECT TOP n DISTINCT` is a syntax error.
+      ["inserts TOP after SELECT DISTINCT", "SELECT DISTINCT status FROM orders", "SELECT DISTINCT TOP 100 status FROM orders", "SELECT DISTINCT TOP 101 status FROM orders"],
+      ["inserts TOP after SELECT ALL", "SELECT ALL status FROM orders", "SELECT ALL TOP 100 status FROM orders", "SELECT ALL TOP 101 status FROM orders"],
+      [
+        "leaves a CTE's own TOP alone and caps the final SELECT",
+        "WITH x AS (SELECT TOP 5 id FROM t) SELECT * FROM x",
+        "WITH x AS (SELECT TOP 5 id FROM t) SELECT TOP 100 * FROM x",
+        "WITH x AS (SELECT TOP 5 id FROM t) SELECT TOP 101 * FROM x",
+      ],
+      // TOP 1 WITH TIES / TOP 1 PERCENT can return thousands of rows, and a
+      // parameter is not known until runtime, so a literal within the cap must
+      // not be taken as the user's own limit: the statement is always wrapped
+      // and probed.
+      [
+        "wraps a TOP n WITH TIES, which is not a row bound",
+        "SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount",
+        "SELECT TOP 100 * FROM (SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount\n) AS subq",
+        "SELECT TOP 101 * FROM (SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount\n) AS subq",
+      ],
+      [
+        "wraps a TOP n PERCENT, which is not a row bound",
+        "SELECT TOP 1 PERCENT id FROM orders",
+        "SELECT TOP 100 * FROM (SELECT TOP 1 PERCENT id FROM orders\n) AS subq",
+        "SELECT TOP 101 * FROM (SELECT TOP 1 PERCENT id FROM orders\n) AS subq",
+      ],
+      [
+        "wraps a TOP (@p1), which is not a row bound",
+        "SELECT TOP (@p1) id FROM orders",
+        "SELECT TOP 100 * FROM (SELECT TOP (@p1) id FROM orders\n) AS subq",
+        "SELECT TOP 101 * FROM (SELECT TOP (@p1) id FROM orders\n) AS subq",
+      ],
+      [
+        "recognises PERCENT with no whitespace after a parenthesised operand",
+        "SELECT TOP(1)PERCENT x FROM t",
+        "SELECT TOP 100 * FROM (SELECT TOP(1)PERCENT x FROM t\n) AS subq",
+        "SELECT TOP 101 * FROM (SELECT TOP(1)PERCENT x FROM t\n) AS subq",
+      ],
+      [
+        "recognises WITH TIES with no whitespace after a parenthesised operand",
+        "SELECT TOP(1)WITH TIES x FROM t ORDER BY x",
+        "SELECT TOP 100 * FROM (SELECT TOP(1)WITH TIES x FROM t ORDER BY x\n) AS subq",
+        "SELECT TOP 101 * FROM (SELECT TOP(1)WITH TIES x FROM t ORDER BY x\n) AS subq",
+      ],
+      // T-SQL: "A TOP can not be used in the same query or sub-query as a OFFSET."
+      [
+        "caps an OFFSET ... FETCH query through its FETCH count, never with TOP",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3000 ROWS ONLY",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 101 ROWS ONLY",
+      ],
+      [
+        "leaves an OFFSET ... FETCH FIRST query alone when its FETCH count is within the cap",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH FIRST 3 ROWS ONLY",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH FIRST 3 ROWS ONLY",
+        null,
+      ],
+      [
+        "leaves an OFFSET ... FETCH NEXT query alone when its FETCH count is within the cap",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY",
+        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY",
+        null,
+      ],
+      // The OFFSET applies to the combined output, and hoisting it next to
+      // an outer TOP would be rejected (TOP and OFFSET on the same query).
+      [
+        "caps a set-operator query with OFFSET ... FETCH through its FETCH count",
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY",
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY",
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 101 ROWS ONLY",
+      ],
+      [
+        "leaves a set-operator query alone when its FETCH count is within the cap",
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+        null,
+      ],
+      // A branch-level TOP caps only that branch, so the whole statement is
+      // wrapped and the probe applies to the combined output.
+      [
+        "wraps and probes a set-operator query even when a branch has its own TOP within the cap",
+        "SELECT TOP 2 id FROM a UNION ALL SELECT id FROM b",
+        "SELECT TOP 100 * FROM (SELECT TOP 2 id FROM a UNION ALL SELECT id FROM b\n) AS subq",
+        "SELECT TOP 101 * FROM (SELECT TOP 2 id FROM a UNION ALL SELECT id FROM b\n) AS subq",
+      ],
+    ])("%s", (_name, sql, capped, probed) => {
+      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(capped);
+      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual(
+        probeResult(sql, probed)
+      );
     });
   });
 
@@ -312,24 +456,10 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it("caps a CTE introduced by the T-SQL `;WITH` convention", () => {
+    it("caps a CTE introduced by the T-SQL `;WITH` convention, on the statement's own SELECT", () => {
       const sql = ";WITH x AS (SELECT id FROM t) SELECT * FROM x";
       expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
         ";WITH x AS (SELECT id FROM t) SELECT TOP 100 * FROM x"
-      );
-    });
-
-    it("puts TOP on the statement's own SELECT, not on the CTE's", () => {
-      const sql = "WITH x AS (SELECT id FROM t) SELECT * FROM x";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
-        "WITH x AS (SELECT id FROM t) SELECT TOP 100 * FROM x"
-      );
-    });
-
-    it("leaves a CTE's own TOP alone and caps the final SELECT", () => {
-      const sql = "WITH x AS (SELECT TOP 5 id FROM t) SELECT * FROM x";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
-        "WITH x AS (SELECT TOP 5 id FROM t) SELECT TOP 100 * FROM x"
       );
     });
 
@@ -348,39 +478,7 @@ describe("SQLRowLimiter", () => {
     });
   });
 
-  describe("truncation probe - CTEs", () => {
-    it("probes a CTE query, ignoring the CTE's inner LIMIT", () => {
-      // The inner LIMIT 5 is not the statement's own, so it must not be
-      // mistaken for a user cap already within maxRows.
-      const sql = "WITH x AS (SELECT * FROM t LIMIT 5) SELECT * FROM x JOIN y ON true";
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual({
-        sql: `${sql}\nLIMIT 101`,
-        probeApplied: true,
-      });
-    });
-
-    it("probes a CTE query on SQL Server, ignoring the CTE's inner TOP", () => {
-      const sql = "WITH x AS (SELECT TOP 5 id FROM t) SELECT * FROM x";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-        sql: "WITH x AS (SELECT TOP 5 id FROM t) SELECT TOP 101 * FROM x",
-        probeApplied: true,
-      });
-    });
-  });
-
-  describe("applyMaxRowsForSQLServer", () => {
-    it("should add TOP when none exists", () => {
-      const sql = "SELECT * FROM users";
-      const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100);
-      expect(result).toBe("SELECT TOP 100 * FROM users");
-    });
-
-    it("should use minimum of existing TOP and maxRows", () => {
-      const sql = "SELECT TOP 50 * FROM users";
-      const result = SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100);
-      expect(result).toBe("SELECT TOP 50 * FROM users");
-    });
-
+  describe("applyMaxRowsForSQLServer - set operations", () => {
     it("should wrap UNION ALL queries so TOP caps the combined result set (issue #387)", () => {
       const sql =
         "SELECT 1 AS dbhub_row_cap_probe\nUNION ALL SELECT 2\nUNION ALL SELECT 3\nUNION ALL SELECT 4";
@@ -449,12 +547,6 @@ describe("SQLRowLimiter", () => {
   });
 
   describe("applyMaxRowsForSQLServer - DISTINCT, TOP (n), OFFSET, PERCENT, WITH TIES (issue #453)", () => {
-    it.each(["DISTINCT", "ALL"])("should insert TOP after SELECT %s", (modifier) => {
-      // T-SQL requires `SELECT DISTINCT TOP n`; `SELECT TOP n DISTINCT` is a syntax error.
-      const result = SQLRowLimiter.applyMaxRowsForSQLServer(`SELECT ${modifier} status FROM orders`, 100);
-      expect(result).toBe(`SELECT ${modifier} TOP 100 status FROM orders`);
-    });
-
     it("should insert TOP after the final SELECT DISTINCT of a CTE", () => {
       const sql = "WITH q AS (SELECT DISTINCT a FROM t) SELECT DISTINCT * FROM q";
       expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
@@ -468,13 +560,6 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it.each(["TOP (3)", "TOP(3)", "TOP ( 3 )"])("should recognise a parenthesised %s as the statement's own TOP", (top) => {
-      const sql = `SELECT ${top} name FROM users ORDER BY name`;
-      expect(SQLRowLimiter.extractTopValue(sql)).toBe(3);
-      // Tightened to min(3, 100) = 3, i.e. the user's own cap, not a second TOP.
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe("SELECT TOP 3 name FROM users ORDER BY name");
-    });
-
     it("should tighten a parenthesised TOP that exceeds the cap", () => {
       expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT TOP (3000) name FROM users", 100)).toBe(
         "SELECT TOP 100 name FROM users"
@@ -485,19 +570,6 @@ describe("SQLRowLimiter", () => {
       expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT DISTINCT TOP 3000 name FROM users", 100)).toBe(
         "SELECT DISTINCT TOP 100 name FROM users"
       );
-    });
-
-    it("should cap an OFFSET ... FETCH query through its FETCH count, never with TOP", () => {
-      // T-SQL: "A TOP can not be used in the same query or sub-query as a OFFSET."
-      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3000 ROWS ONLY";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
-        "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
-      );
-    });
-
-    it("should leave an OFFSET ... FETCH query alone when its FETCH count is within the cap", () => {
-      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH FIRST 3 ROWS ONLY";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(sql);
     });
 
     it("should append a FETCH to an OFFSET query that has none", () => {
@@ -529,21 +601,6 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it("should wrap a TOP n WITH TIES query, keeping its ORDER BY inside", () => {
-      // WITH TIES can return far more than n rows, so n is not a bound.
-      const sql = "SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
-        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
-      );
-    });
-
-    it("should wrap a TOP n PERCENT query", () => {
-      const sql = "SELECT TOP 1 PERCENT id FROM orders";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
-        `SELECT TOP 100 * FROM (${sql}\n) AS subq`
-      );
-    });
-
     it("should wrap a TOP whose count is a parameter or expression", () => {
       const sql = "SELECT TOP (@p1) id FROM orders ORDER BY id;";
       expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
@@ -572,31 +629,6 @@ describe("SQLRowLimiter", () => {
       );
     });
 
-    it("should cap a set-operator query with OFFSET ... FETCH through its FETCH count", () => {
-      // The OFFSET applies to the combined output, and hoisting it next to
-      // an outer TOP would be rejected (TOP and OFFSET on the same query).
-      const sql = "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServer(sql, 100)).toBe(
-        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
-      );
-      expect(
-        SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
-          "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
-          100
-        ).probeApplied
-      ).toBe(false);
-    });
-
-    it.each(["SELECT TOP(1)PERCENT x FROM t", "SELECT TOP(1)WITH TIES x FROM t ORDER BY x"])(
-      "should recognise a modifier with no whitespace after a parenthesised operand: %s",
-      (sql) => {
-        expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-          sql: `SELECT TOP 101 * FROM (${sql}\n) AS subq`,
-          probeApplied: true,
-        });
-      }
-    );
-
     it("should keep a statement-level OPTION hint outside the wrap", () => {
       // OPTION is only allowed on the outermost statement.
       expect(
@@ -614,136 +646,6 @@ describe("SQLRowLimiter", () => {
       expect(SQLRowLimiter.applyMaxRowsForSQLServer("SELECT 'top (3)' AS s FROM t", 100)).toBe(
         "SELECT TOP 100 'top (3)' AS s FROM t"
       );
-    });
-  });
-
-  describe("applyMaxRowsWithTruncationProbe", () => {
-    it("should add a probe LIMIT of maxRows + 1 when no LIMIT exists", () => {
-      const result = SQLRowLimiter.applyMaxRowsWithTruncationProbe("SELECT * FROM users", 100);
-      expect(result).toEqual({ sql: "SELECT * FROM users\nLIMIT 101", probeApplied: true });
-    });
-
-    it("should not probe when the query's own LIMIT is below the cap", () => {
-      const sql = "SELECT * FROM users LIMIT 50";
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should not probe when the query's own LIMIT equals the cap", () => {
-      // The user asked for exactly maxRows rows — that's their limit firing,
-      // not the cap, so no probe and never a truncated flag.
-      const sql = "SELECT * FROM users LIMIT 100";
-      expect(SQLRowLimiter.applyMaxRowsWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should probe with maxRows + 1 when the query's LIMIT exceeds the cap", () => {
-      const result = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
-        "SELECT * FROM users LIMIT 200",
-        100
-      );
-      expect(result).toEqual({ sql: "SELECT * FROM users LIMIT 101", probeApplied: true });
-    });
-
-    it("should probe by wrapping a parameterized LIMIT in a subquery", () => {
-      const result = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
-        "SELECT * FROM users LIMIT $1",
-        100
-      );
-      expect(result).toEqual({
-        sql: "SELECT * FROM (SELECT * FROM users LIMIT $1\n) AS subq LIMIT 101",
-        probeApplied: true,
-      });
-    });
-  });
-
-  describe("applyMaxRowsForSQLServerWithTruncationProbe", () => {
-    it("should add a probe TOP of maxRows + 1 when no TOP exists", () => {
-      const result = SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
-        "SELECT * FROM users",
-        100
-      );
-      expect(result).toEqual({ sql: "SELECT TOP 101 * FROM users", probeApplied: true });
-    });
-
-    it("should not probe when the query's own TOP is within the cap", () => {
-      const sql = "SELECT TOP 50 * FROM users";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should probe with maxRows + 1 when the query's TOP exceeds the cap", () => {
-      const result = SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
-        "SELECT TOP 200 * FROM users",
-        100
-      );
-      expect(result).toEqual({ sql: "SELECT TOP 101 * FROM users", probeApplied: true });
-    });
-
-    it("should probe a set-operator query even when a branch has its own TOP", () => {
-      // A branch-level TOP caps only that branch, so the whole statement is
-      // wrapped and the probe applies to the combined output.
-      const result = SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
-        "SELECT TOP 2 id FROM a UNION ALL SELECT id FROM b",
-        5
-      );
-      expect(result).toEqual({
-        sql: "SELECT TOP 6 * FROM (SELECT TOP 2 id FROM a UNION ALL SELECT id FROM b\n) AS subq",
-        probeApplied: true,
-      });
-    });
-
-    it("should not probe when the query's own parenthesised TOP is within the cap", () => {
-      const sql = "SELECT TOP (3) name FROM users ORDER BY name";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should not probe when the query's own FETCH count is within the cap", () => {
-      const sql = "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY";
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-        sql,
-        probeApplied: false,
-      });
-    });
-
-    it("should probe through the FETCH count when it exceeds the cap", () => {
-      expect(
-        SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(
-          "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 3000 ROWS ONLY",
-          100
-        )
-      ).toEqual({
-        sql: "SELECT name FROM users ORDER BY name OFFSET 0 ROWS FETCH NEXT 101 ROWS ONLY",
-        probeApplied: true,
-      });
-    });
-
-    it.each([
-      "SELECT TOP 1 WITH TIES id FROM orders ORDER BY discount",
-      "SELECT TOP 1 PERCENT id FROM orders",
-      "SELECT TOP (@p1) id FROM orders",
-    ])("should always probe a TOP that is not a row bound: %s", (sql) => {
-      // TOP 1 WITH TIES / TOP 1 PERCENT can return thousands of rows, so a
-      // literal within the cap must not be taken as the user's own limit.
-      expect(SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe(sql, 100)).toEqual({
-        sql: `SELECT TOP 101 * FROM (${sql}\n) AS subq`,
-        probeApplied: true,
-      });
-    });
-
-    it("should probe a SELECT DISTINCT by inserting TOP after DISTINCT", () => {
-      expect(
-        SQLRowLimiter.applyMaxRowsForSQLServerWithTruncationProbe("SELECT DISTINCT status FROM orders", 100)
-      ).toEqual({ sql: "SELECT DISTINCT TOP 101 status FROM orders", probeApplied: true });
     });
   });
 

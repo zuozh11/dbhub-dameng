@@ -1,147 +1,255 @@
 ---
-title: "Introduction"
+title: "DBHub — Universal database MCP. Minimal context overhead."
+sidebarTitle: "Home"
+description: "Connect your AI assistant to PostgreSQL, MySQL, SQL Server, MariaDB, Oracle, ClickHouse, and SQLite with a minimal, token-efficient MCP server."
+mode: "custom"
 ---
 
-<img
-  className="block dark:hidden"
-  src="/images/logo/full-light.svg"
-  alt="DBHub"
-/>
+import { FeaturedBlog } from "/snippets/featured-blog.jsx";
 
-<img
-  className="hidden dark:block"
-  src="/images/logo/full-dark.svg"
-  alt="DBHub"
-/>
+<div className="dbhub-home">
+<section className="dbhub-hero" aria-labelledby="dbhub-heading">
+  <div className="not-prose dbhub-hero-copy">
+    <FeaturedBlog />
+    <h1 id="dbhub-heading">Universal database MCP.<br />Minimal context overhead.</h1>
+    <p className="dbhub-hero-description">Connect your AI assistant to your databases with just two tools and 0.5k tokens of context. Explore schemas, write SQL, and debug data without crowding your context window.</p>
+    <div className="dbhub-hero-actions">
+      <a className="dbhub-primary-link" href="/quickstart">Get started <span aria-hidden="true">→</span></a>
+      <a className="not-prose dbhub-featured" href="https://code.claude.com/docs/en/mcp#example-query-your-postgresql-database">
+        <img className="block dark:hidden" src="/images/featured-by-claude-code-light.svg" alt="Featured in the official Claude Code docs" width={290} height={44} />
+        <img className="hidden dark:block" src="/images/featured-by-claude-code-dark.svg" alt="Featured in the official Claude Code docs" width={290} height={44} />
+      </a>
+    </div>
+  </div>
+  <div className="dbhub-install" aria-label="Install DBHub">
 
-DBHub is a minimal MCP server: token-efficient, zero-dependency, and just two tools by default with opt-in extras. This lightweight gateway allows MCP-compatible clients to connect to and explore different databases.
+<div className="dbhub-code-panel">
+<Tabs>
 
-```
- +------------------+    +--------------+    +------------------+
- |                  |    |              |    |                  |
- |  Claude Desktop  +--->+              +--->+    PostgreSQL    |
- |                  |    |              |    |                  |
- |  Claude Code     +--->+              +--->+    SQL Server    |
- |                  |    |              |    |                  |
- |  Cursor          +--->+    DBHub     +--->+    Oracle        |
- |                  |    |              |    |                  |
- |  VS Code         +--->+              +--->+    SQLite        |
- |                  |    |              |    |                  |
- |  Other Clients   +--->+              +--->+    MySQL         |
- |                  |    |              |    |                  |
- |                  |    |              +--->+    MariaDB       |
- |                  |    |              |    |                  |
- +------------------+    +--------------+    +------------------+
-     MCP Clients           MCP Server             Databases
+<Tab title="npx">
+
+```bash
+npx -y @bytebase/dbhub@latest \
+  --transport http \
+  --port 8080 \
+  --demo
 ```
 
-> DBHub is the official example in the [Claude Code docs](https://code.claude.com/docs/en/mcp#example-query-your-postgresql-database) for connecting to PostgreSQL via MCP.
+</Tab>
 
-## Token Efficiency
+<Tab title="Docker">
 
-DBHub loads just 2 tools by default at **0.5k tokens** — 16-25x fewer than alternatives — keeping the context window open for your actual work.
-
-| MCP Server | Default Config | Default Tools |
-|------------|---------------|--------------|
-| **DBHub** | **0.5k** | 2 (`execute_sql`, `search_objects`) |
-| MCP Toolbox | 7.7k | 29 |
-| Supabase MCP | 11.6k | 36 |
-
-## Use Cases
-
-- **Local Development**: Schema exploration, query validation, and data debugging with Claude Code, VS Code, Cursor, etc.
-- **Non-Technical Access**: Expose curated, read-only views to non-technical staff via Claude Desktop, VS Code, Cursor, etc.
-- **Multi-Database Consolidation**: Replace separate MCP servers for each database with a single DBHub process
-- **Production Troubleshooting**: Read-only diagnostics with guardrails against runaway queries
-
-<Note>
-Read-only mode is a guardrail, not a permission boundary. Always connect with a least-privilege, read-only database user. See [Read-Only Mode](/config/read-only-mode).
-</Note>
-
-## Supported Databases
-
-PostgreSQL, MySQL, SQL Server, MariaDB, Oracle, and SQLite.
-
-## Why DBHub?
-
-DBHub brings powerful database capabilities to AI coding assistants:
-
-- **Minimal**: Zero dependency, token efficient with a minimal set of MCP tools to maximize context window
-- **Multi-Database**: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, and SQLite through a single interface
-- **Multi-Connection**: Connect to multiple databases simultaneously with TOML configuration
-- **Guardrails**: Read-only mode, row limiting, and query timeout to prevent runaway operations
-- **Secure Access**: SSH tunneling and SSL/TLS encryption
-
-## Key Features
-
-### MCP Tools
-
-DBHub provides AI assistants with direct database access through these tools:
-- **[execute_sql](/tools/execute-sql)**: Run queries with transaction support and safety controls
-- **[search_objects](/tools/search-objects)**: Explore schemas, tables, columns, indexes, and procedures
-- **[explain_sql](/tools/explain-sql)** (opt-in): Show a query's execution plan without running it
-- **[health_check](/tools/health-check)** (opt-in): Report connection pool state and buffer cache hit ratio
-- **[Custom Tools](/tools/custom-tools)**: Define reusable, parameterized SQL operations
-
-### Workbench
-
-A [web-based interface](/workbench/overview) for running database tools and viewing request traces without requiring an MCP client.
-
-## Architecture
-
-```mermaid
-flowchart TB
-    %% Human User
-    User["Human User"]
-
-    %% Workbench
-    WB["DBHub Workbench"]
-
-    %% AI Agent with MCP Client
-    subgraph Agent["AI Agent"]
-        MC["MCP Client"]
-    end
-
-    %% Configuration
-    Config["dbhub.toml"]
-
-    %% DBHub Server
-    subgraph DBHub["DBHub Server"]
-        MCP["/mcp endpoint"]
-        subgraph Tools["MCP Tools"]
-            ES["execute_sql"]
-            SO["search_objects"]
-            EX["explain_sql (opt-in)"]
-            HC["health_check (opt-in)"]
-            CT["custom tools"]
-        end
-    end
-
-    %% Databases
-    Databases["PostgreSQL, MySQL, SQL Server, MariaDB, Oracle, SQLite"]
-
-    %% Connections
-    User --> WB
-    WB --> DBHub
-
-    Agent --> MC
-    MC --> MCP
-    MCP --> Tools
-
-    Config -.->|loads| DBHub
-    Tools --> Databases
+```bash
+docker run --rm --init --publish 8080:8080 \
+  bytebase/dbhub \
+  --transport http \
+  --port 8080 --demo
 ```
 
-DBHub acts as a gateway between databases and AI agents. AI agents access databases through the `/mcp` endpoint using MCP tools, while the Workbench provides direct browser-based access for humans.
+</Tab>
 
-## Getting Started
+<Tab title="Claude Code">
 
-<CardGroup cols={2}>
-  <Card title="Installation" icon="download" href="/installation">
-    Install DBHub using Docker, NPM, the MCP Bundle, or the Claude Code plugin
-  </Card>
+```text
+/plugin marketplace add bytebase/dbhub
+/plugin install dbhub@dbhub
+```
 
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Get DBHub running with your first database connection
-  </Card>
-</CardGroup>
+</Tab>
+
+<Tab title="Claude Desktop">
+
+<div className="not-prose dbhub-client-install">
+  <a className="dbhub-client-button" href="https://github.com/bytebase/dbhub/releases/latest">Download for Claude Desktop</a>
+  <a className="dbhub-client-guide" href="/mcpb#install">Setup guide <span aria-hidden="true">→</span></a>
+  <p>Download the .mcpb bundle, open it, and enter your database connection.</p>
+</div>
+
+</Tab>
+
+<Tab title="Codex">
+
+```bash
+export DBHUB_DSN="postgres://user:password@localhost:5432/dbname"
+codex plugin marketplace add bytebase/dbhub
+codex plugin add dbhub@dbhub
+```
+
+</Tab>
+
+<Tab title="VS Code">
+
+<div className="not-prose dbhub-client-install">
+  <a className="dbhub-client-button" href="vscode:mcp/install?%7B%22name%22%3A%22dbhub%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40bytebase%2Fdbhub%40latest%22%2C%22--transport%22%2C%22stdio%22%2C%22--demo%22%5D%7D">Install in VS Code</a>
+  <a className="dbhub-client-guide" href="/installation#vs-code">VS Code setup guide <span aria-hidden="true">→</span></a>
+  <p>Try the demo database. Requires Node.js 22.5+.</p>
+</div>
+
+</Tab>
+
+</Tabs>
+</div>
+
+<div className="not-prose dbhub-databases" aria-label="Supported databases">
+  <ul>
+    <li><span className="dbhub-database-logo" data-database="postgresql"><img src="/images/databases/postgresql.svg" alt="" width={48} height={48} noZoom /></span><span>PostgreSQL</span></li>
+    <li><span className="dbhub-database-logo" data-database="microsoftsqlserver"><img src="/images/databases/microsoftsqlserver.svg" alt="" width={48} height={48} noZoom /></span><span>SQL Server</span></li>
+    <li><span className="dbhub-database-logo" data-database="oracle"><img src="/images/databases/oracle.svg" alt="" width={48} height={48} noZoom /></span><span>Oracle</span></li>
+    <li><span className="dbhub-database-logo" data-database="mysql"><img src="/images/databases/mysql.svg" alt="" width={48} height={48} noZoom /></span><span>MySQL</span></li>
+    <li><span className="dbhub-database-logo" data-database="mariadb"><img src="/images/databases/mariadb.svg" alt="" width={48} height={48} noZoom /></span><span>MariaDB</span></li>
+    <li><span className="dbhub-database-logo" data-database="sqlite"><img src="/images/databases/sqlite.svg" alt="" width={48} height={48} noZoom /></span><span>SQLite</span></li>
+    <li><span className="dbhub-database-logo" data-database="clickhouse"><img src="/images/databases/clickhouse.svg" alt="" width={48} height={48} noZoom /></span><span>ClickHouse</span></li>
+  </ul>
+</div>
+
+
+  </div>
+</section>
+
+
+
+<section className="not-prose dbhub-token-comparison" aria-labelledby="token-comparison-heading">
+  <div className="dbhub-comparison-intro">
+  <h2 id="token-comparison-heading">Small tool definitions. More context for your work.</h2>
+  <p className="dbhub-comparison-subtitle">261 tokens for DBHub’s two built-in tools.</p>
+  </div>
+  <div className="dbhub-token-chart" role="img" aria-label="Tool-definition tokens using cl100k_base: DBHub 261, MCP Toolbox 3,901, Supabase MCP 6,982. Bars share a zero baseline and a scale of 6,982 tokens.">
+    <div className="dbhub-token-row dbhub-token-row-primary">
+      <div className="dbhub-token-label"><span>DBHub <small>2.0.1 · 2 tools</small></span><strong>261</strong></div>
+      <div className="dbhub-token-track"><div className="dbhub-token-bar" style={{ width: "3.74%" }} /></div>
+    </div>
+    <div className="dbhub-token-row">
+      <div className="dbhub-token-label"><span>MCP Toolbox <small>1.18.0 · 29 tools</small></span><strong>3,901 <small>14.9×</small></strong></div>
+      <div className="dbhub-token-track"><div className="dbhub-token-bar" style={{ width: "55.87%" }} /></div>
+    </div>
+    <div className="dbhub-token-row">
+      <div className="dbhub-token-label"><span>Supabase MCP <small>0.19.0 · 36 tools</small></span><strong>6,982 <small>26.8×</small></strong></div>
+      <div className="dbhub-token-track"><div className="dbhub-token-bar" style={{ width: "100%" }} /></div>
+    </div>
+  </div>
+  <p className="dbhub-comparison-note">Full tool definitions, counted with cl100k_base · Nov 21, 2026. Actual session usage varies by client. <a href="/blog/database-mcp-server-token-benchmark-2026">Methodology and caveats</a>.</p>
+</section>
+
+<section className="not-prose dbhub-community" aria-labelledby="community-heading">
+  <h2 id="community-heading">Our community includes developers from</h2>
+  <ul className="dbhub-community-grid">
+    <li style={{ "--logo-width": "136px", "--logo-height": "32px" }}><img src="/images/community/microsoft.svg" alt="Microsoft" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "130px", "--logo-height": "28px" }}><img src="/images/community/nvidia.svg" alt="NVIDIA" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "112px", "--logo-height": "36px" }}><img src="/images/community/amazon.svg" alt="Amazon" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "32px" }}><img src="/images/community/cloudflare.svg" alt="Cloudflare" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "30px" }}><img src="/images/community/atlassian.svg" alt="Atlassian" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "128px", "--logo-height": "32px" }}><img src="/images/community/docker.svg" alt="Docker" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "128px", "--logo-height": "28px" }}><img src="/images/community/coinbase.svg" alt="Coinbase" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "108px", "--logo-height": "36px" }}><img src="/images/community/plaid.svg" alt="Plaid" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "90px", "--logo-height": "38px" }}><img src="/images/community/cisco.svg" alt="Cisco" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "132px", "--logo-height": "24px" }}><img src="/images/community/oracle.svg" alt="Oracle" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "132px", "--logo-height": "32px" }}><img src="/images/community/red-hat.svg" alt="Red Hat" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "30px" }}><img src="/images/community/bytedance.svg" alt="ByteDance" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "124px", "--logo-height": "30px" }}><img src="/images/community/tencent-english.svg" alt="Tencent" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "140px", "--logo-height": "30px" }}><img src="/images/community/alibaba.svg" alt="Alibaba" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "34px", "--logo-height": "40px" }}><img src="/images/community/apple.svg" alt="Apple" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "132px", "--logo-height": "38px" }}><img src="/images/community/riot-games-wordmark.svg" alt="Riot Games" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "112px", "--logo-height": "36px" }}><img src="/images/community/google.svg" alt="Google" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "94px", "--logo-height": "36px" }}><img src="/images/community/ibm.svg" alt="IBM" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "90px", "--logo-height": "36px" }}><img src="/images/community/intel.svg" alt="Intel" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "124px", "--logo-height": "36px" }}><img src="/images/community/shopify.svg" alt="Shopify" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "104px", "--logo-height": "32px" }}><img src="/images/community/github.svg" alt="GitHub" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "116px", "--logo-height": "32px" }}><img src="/images/community/paypal-wordmark.svg" alt="PayPal" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "108px", "--logo-height": "32px" }}><img src="/images/community/zoom.svg" alt="Zoom" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "30px" }}><img src="/images/community/thoughtworks.png" alt="Thoughtworks" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "124px", "--logo-height": "28px" }}><img src="/images/community/vercel.svg" alt="Vercel" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "32px" }}><img src="/images/community/maersk.svg" alt="Maersk" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "120px", "--logo-height": "34px" }}><img src="/images/community/yahoo.svg" alt="Yahoo" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "132px", "--logo-height": "28px" }}><img src="/images/community/hitachi.svg" alt="Hitachi" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "140px", "--logo-height": "32px" }}><img src="/images/community/target.svg" alt="Target" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "124px", "--logo-height": "36px" }}><img src="/images/community/rakuten.svg" alt="Rakuten" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "140px", "--logo-height": "44px" }}><img src="/images/community/university-of-oxford.svg" alt="University of Oxford" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "148px", "--logo-height": "60px" }}><img src="/images/community/cornell-university-lockup.svg" alt="Cornell University" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "108px", "--logo-height": "40px" }}><img src="/images/community/duke-university.svg" alt="Duke University" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "148px", "--logo-height": "56px" }}><img src="/images/community/university-of-zurich.svg" alt="University of Zurich" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "108px", "--logo-height": "40px" }}><img src="/images/community/tel-aviv-university.svg" alt="Tel Aviv University" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "44px" }}><img src="/images/community/tsinghua-university.svg" alt="Tsinghua University" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "44px" }}><img src="/images/community/peking-university-wordmark.png" alt="Peking University" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "112px", "--logo-height": "40px" }}><img src="/images/community/kaist.svg" alt="KAIST" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "148px", "--logo-height": "52px" }}><img src="/images/community/university-of-british-columbia.svg" alt="University of British Columbia" width={140} height={52} loading="lazy" noZoom /></li>
+    <li style={{ "--logo-width": "144px", "--logo-height": "44px" }}><img src="/images/community/waseda-university.png" alt="Waseda University" width={140} height={52} loading="lazy" noZoom /></li>
+  </ul>
+</section>
+
+<section className="not-prose dbhub-use-cases" aria-labelledby="use-cases-heading">
+  <div className="dbhub-use-cases-intro">
+    <p className="dbhub-section-label">Use cases</p>
+    <h2 id="use-cases-heading">Bring your data into the conversation.</h2>
+    <p>From your first local query to the databases your team relies on.</p>
+  </div>
+  <div className="dbhub-use-case-grid">
+    <div className="dbhub-use-case">
+      <div className="dbhub-use-case-art" aria-hidden="true">
+        <img src="/images/illustrations/diving-mask.svg" alt="" width={264} height={176} loading="lazy" noZoom />
+      </div>
+      <div className="dbhub-use-case-body">
+        <h3>Local Development</h3>
+        <p>Explore schemas, validate queries, and debug data with Claude Code, VS Code, Cursor, and other AI assistants.</p>
+        <a href="/quickstart">Connect your coding assistant <span aria-hidden="true">→</span></a>
+      </div>
+    </div>
+    <div className="dbhub-use-case">
+      <div className="dbhub-use-case-art" aria-hidden="true">
+        <img src="/images/illustrations/pearl.svg" alt="" width={264} height={176} loading="lazy" noZoom />
+      </div>
+      <div className="dbhub-use-case-body">
+        <h3>Non-Technical Access</h3>
+        <p>Expose curated, read-only views to non-technical staff through Claude Desktop, VS Code, Cursor, and other AI clients.</p>
+        <a href="/mcpb">Set up the desktop bundle <span aria-hidden="true">→</span></a>
+      </div>
+    </div>
+    <div className="dbhub-use-case">
+      <div className="dbhub-use-case-art" aria-hidden="true">
+        <img src="/images/illustrations/coral.svg" alt="" width={264} height={176} loading="lazy" noZoom />
+      </div>
+      <div className="dbhub-use-case-body">
+        <h3>Multi-Database Consolidation</h3>
+        <p>Replace separate MCP servers for each database with a single DBHub process.</p>
+        <a href="/config/toml">Configure multiple sources <span aria-hidden="true">→</span></a>
+      </div>
+    </div>
+    <div className="dbhub-use-case">
+      <div className="dbhub-use-case-art" aria-hidden="true">
+        <img src="/images/illustrations/pressure-gauge.svg" alt="" width={264} height={176} loading="lazy" noZoom />
+      </div>
+      <div className="dbhub-use-case-body">
+        <h3>Production Troubleshooting</h3>
+        <p>Run read-only diagnostics with guardrails against runaway queries. Use a read-only database account, row limits, and query timeouts.</p>
+        <a href="/config/read-only-mode">Explore read-only guardrails <span aria-hidden="true">→</span></a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section className="not-prose dbhub-resources" aria-labelledby="resources-heading">
+  <p className="dbhub-section-label">Resources</p>
+  <h2 id="resources-heading">Start building with DBHub</h2>
+  <div className="dbhub-resource-grid">
+    <a className="dbhub-resource" href="/introduction">
+      <h3>Intro to DBHub</h3>
+      <p>How DBHub connects AI to your databases.</p>
+      <img className="dbhub-resource-icon" src="/images/illustrations/seastar.svg" alt="" width="132" height="88" />
+    </a>
+    <a className="dbhub-resource" href="/quickstart">
+      <h3>Quickstart</h3>
+      <p>Run the demo and connect your first client.</p>
+      <img className="dbhub-resource-icon" src="/images/illustrations/sailboat.svg" alt="" width="132" height="88" />
+    </a>
+    <a className="dbhub-resource" href="/tools/overview">
+      <h3>MCP tools</h3>
+      <p>Explore schemas, run SQL, and define tools.</p>
+      <img className="dbhub-resource-icon" src="/images/illustrations/octopus.svg" alt="" width="132" height="88" />
+    </a>
+    <a className="dbhub-resource" href="/workbench/overview">
+      <h3>Workbench</h3>
+      <p>Run tools and inspect requests in your browser.</p>
+      <img className="dbhub-resource-icon" src="/images/illustrations/harbor.svg" alt="" width="132" height="88" />
+    </a>
+  </div>
+</section>
+</div>

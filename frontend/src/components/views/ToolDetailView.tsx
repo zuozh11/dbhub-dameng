@@ -9,7 +9,7 @@ import { SqlEditor, ParameterForm, RunButton, ResultsTabs, type ResultTab, type 
 import { parseParameterValues, validateParameterInput, type ParameterValues } from '../tool/ParameterForm';
 import { Button } from '../ui/button';
 import { PageLoading, PageLoadError } from '../WorkbenchState';
-import LockIcon from '../icons/LockIcon';
+import { Lock, PencilLine } from 'lucide-react';
 import CopyIcon from '../icons/CopyIcon';
 import CheckIcon from '../icons/CheckIcon';
 
@@ -33,6 +33,7 @@ export default function ToolDetailView() {
   const [resultTabs, setResultTabs] = useState<ResultTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  const [justCompleted, setJustCompleted] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState('');
   const [sqlError, setSqlError] = useState('');
@@ -41,6 +42,12 @@ export default function ToolDetailView() {
   const runGeneration = useRef(0);
   const syncedSearch = useRef<string | null>(null);
   const hydratedTool = useRef<Tool | null>(null);
+
+  useEffect(() => {
+    if (!justCompleted) return;
+    const timer = setTimeout(() => setJustCompleted(false), 2500);
+    return () => clearTimeout(timer);
+  }, [justCompleted]);
 
   useEffect(() => {
     if (!copied) return;
@@ -55,6 +62,7 @@ export default function ToolDetailView() {
     runGeneration.current++;
     runningRef.current = false;
     setIsRunning(false);
+    setJustCompleted(false);
     setIsLoading(true);
     setError(null);
     // Reset result state when switching tools
@@ -217,6 +225,7 @@ export default function ToolDetailView() {
     }
     runningRef.current = true;
     setIsRunning(true);
+    setJustCompleted(false);
 
     const startTime = performance.now();
     const generation = runGeneration.current;
@@ -255,6 +264,7 @@ export default function ToolDetailView() {
       }));
       setResultTabs(prev => [...newTabs, ...prev]);
       setActiveTabId(newTabs[0]?.id ?? null);
+      setJustCompleted(true);
     } catch (err) {
       if (generation !== runGeneration.current) return;
       const errorTab: ResultTab = {
@@ -327,14 +337,9 @@ export default function ToolDetailView() {
     return (
       <div className="container mx-auto px-4 py-6 sm:px-8 sm:py-10 max-w-4xl">
         <div className="space-y-4">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <h1 className="min-w-0 text-page text-foreground font-mono tracking-normal [overflow-wrap:anywhere]">{tool.name}</h1>
-            {tool.readonly && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full whitespace-nowrap text-xs font-medium bg-warning/10 text-warning-foreground">
-                <LockIcon className="w-3 h-3" />
-                Read-Only
-              </span>
-            )}
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-2">
+            <h1 className="min-w-0 text-page text-foreground [overflow-wrap:anywhere]">{tool.name}</h1>
+            <ToolAccessBadge readonly={tool.readonly} />
           </div>
           <p className="text-body text-muted-foreground max-w-prose text-pretty [overflow-wrap:anywhere]">{tool.description}</p>
           <div className="border border-border rounded-lg bg-card p-8 text-center">
@@ -352,24 +357,19 @@ export default function ToolDetailView() {
       <div className="space-y-6">
         {/* Header */}
         <div className="space-y-2">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <h1 className="min-w-0 text-page text-foreground font-mono tracking-normal [overflow-wrap:anywhere]">{tool.name}</h1>
-            {tool.readonly && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full whitespace-nowrap text-xs font-medium bg-warning/10 text-warning-foreground">
-                <LockIcon className="w-3 h-3" />
-                Read-Only
-              </span>
-            )}
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-2">
+            <h1 className="min-w-0 text-page text-foreground [overflow-wrap:anywhere]">{tool.name}</h1>
+            <ToolAccessBadge readonly={tool.readonly} />
           </div>
           <p className="text-body text-muted-foreground max-w-prose text-pretty [overflow-wrap:anywhere]">{tool.description}</p>
         </div>
 
-        <form ref={formRef} noValidate onSubmit={event => { event.preventDefault(); void handleRun(); }} className="space-y-6">
+        <form ref={formRef} noValidate onSubmit={event => { event.preventDefault(); void handleRun(); }} className="space-y-4">
           {/* Parameter Form (custom tools only, show before SQL) */}
           {toolType === 'custom' && tool.parameters.length > 0 && (
             <div className="space-y-2">
               <h2 className="text-label text-foreground">Parameters</h2>
-              <div className="rounded-xl bg-card p-4 shadow-sm sm:p-6">
+              <div className="rounded-xl border border-border bg-card p-4 sm:p-6">
                 <ParameterForm
                   key={`${sourceId}/${toolName}`}
                   parameters={tool.parameters}
@@ -384,13 +384,13 @@ export default function ToolDetailView() {
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <h2 id="sql-statement-label" className="text-label text-foreground">
-                SQL Statement
+                SQL statement
               </h2>
               <Button
                 type="button"
                 variant="ghost"
                 onClick={handleCopy}
-                className="min-h-11 min-w-24 text-muted-foreground"
+                className="min-h-9 min-w-20 pointer-coarse:min-h-11 text-muted-foreground"
                 aria-label={copied ? 'SQL copied' : 'Copy SQL'}
                 title="Copy SQL"
               >
@@ -428,10 +428,15 @@ export default function ToolDetailView() {
           </div>
 
           {/* Run Button */}
-          <RunButton
-            onShortcut={handleRun}
-            loading={isRunning}
-          />
+          <div className="flex flex-wrap items-center gap-3">
+            <RunButton
+              onShortcut={handleRun}
+              loading={isRunning}
+            />
+            <span role="status" className="flex items-center gap-1.5 text-caption text-muted-foreground">
+              {justCompleted && <><span aria-hidden="true" className="text-query-complete"><CheckIcon /></span>Query completed</>}
+            </span>
+          </div>
 
         </form>
 
@@ -450,5 +455,20 @@ export default function ToolDetailView() {
         />
       </div>
     </div>
+  );
+}
+
+function ToolAccessBadge({ readonly }: { readonly?: boolean }) {
+  const isReadOnly = readonly === true;
+  const Icon = isReadOnly ? Lock : PencilLine;
+
+  return (
+    <span
+      title={isReadOnly ? 'This tool is restricted to read-only operations.' : 'This tool allows write operations, subject to database permissions.'}
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap ${isReadOnly ? 'bg-muted text-muted-foreground' : 'bg-warning/10 text-warning-foreground'}`}
+    >
+      <Icon className="size-3 shrink-0" aria-hidden="true" />
+      {isReadOnly ? 'Read-only' : 'Write access'}
+    </span>
   );
 }

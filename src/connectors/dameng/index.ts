@@ -13,10 +13,10 @@ import {
 } from "../interface.js";
 import { SafeURL } from "../../utils/safe-url.js";
 import { closeQuietly } from "../../utils/resource-cleanup.js";
-import { splitPLSQLStatements, LEADING_SQL_NOISE } from "../../utils/sql-parser.js";
+import { splitSQLStatements, LEADING_SQL_NOISE } from "../../utils/sql-parser.js";
 import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
 
-import { OracleCatalog, type CatalogQuery } from "../oracle-catalog.js";
+import { DamengCatalog } from "./catalog.js";
 import { computeHitRatioPct } from "../health-check-utils.js";
 import { isReadOnlySQL } from "../../utils/allowed-keywords.js";
 import { policyFromReadonly, sqlVerdict } from "../../utils/sql-access-policy.js";
@@ -54,7 +54,7 @@ class DamengDSNParser implements DSNParser {
   }
 }
 
-export class DamengConnector extends OracleCatalog implements Connector {
+export class DamengConnector extends DamengCatalog implements Connector {
   id: ConnectorType = "dameng";
   name = "Dameng";
   dsnParser = new DamengDSNParser();
@@ -82,7 +82,7 @@ export class DamengConnector extends OracleCatalog implements Connector {
         );
         this.defaultSchema = result.rows![0].SCHEMA_NAME;
         if (initScript) {
-          for (const sql of splitPLSQLStatements(initScript, "dameng")) {
+          for (const sql of splitSQLStatements(initScript, "dameng")) {
             await conn.execute(sql, [], { autoCommit: true });
           }
         }
@@ -114,20 +114,13 @@ export class DamengConnector extends OracleCatalog implements Connector {
     }
   }
 
-  private async query<T>(sql: string, parameters: Record<string, string> = {}): Promise<T[]> {
+  protected async query<T>(sql: string, parameters: Record<string, string> = {}): Promise<T[]> {
     return this.withConnection(async (conn) => {
       const result = await conn.execute<T>(sql, parameters, {
         outFormat: dmdb.OUT_FORMAT_OBJECT,
       });
       return result.rows ?? [];
     });
-  }
-
-  protected withCatalogQuery<T>(
-    _action: string,
-    run: (query: CatalogQuery) => Promise<T>
-  ): Promise<T> {
-    return run((sql, binds) => this.query(sql, binds));
   }
 
   protected schemaOrDefault(schema?: string): string {
@@ -147,15 +140,6 @@ export class DamengConnector extends OracleCatalog implements Connector {
       { schema: this.schemaOrDefault(schema) }
     );
     return rows.map((row) => row.TABLE_NAME);
-  }
-
-  async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    const rows = await this.query<CatalogRow>(
-      `SELECT COUNT(*) AS CNT FROM ALL_OBJECTS
-       WHERE OWNER = :schema AND OBJECT_NAME = :name AND OBJECT_TYPE IN ('TABLE', 'VIEW')`,
-      { schema: this.schemaOrDefault(schema), name: tableName }
-    );
-    return Number(rows[0].CNT) > 0;
   }
 
   async getHealthCheck(): Promise<HealthCheckResult> {
@@ -212,7 +196,7 @@ export class DamengConnector extends OracleCatalog implements Connector {
   }
 
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
-    const statements = splitPLSQLStatements(sql, "dameng");
+    const statements = splitSQLStatements(sql, "dameng");
     if (options.readonly && sqlVerdict(policyFromReadonly(true), sql, "dameng") !== "allow") {
       throw new Error("Read-only mode: statement is not allowed");
     }

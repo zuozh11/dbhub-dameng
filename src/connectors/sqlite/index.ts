@@ -314,17 +314,13 @@ export class SQLiteConnector implements Connector {
     // SQLite has a single namespace for tables within a database file
     // You could use 'schema.table' syntax if you have attached databases, but we're
     // accessing the 'main' database by default
-    try {
-      const rows = this.queryAll<SQLiteTableNameRow>(`
-        SELECT name FROM sqlite_master
-        WHERE type='table' AND name NOT LIKE 'sqlite_%'
-        ORDER BY name
-      `);
+    const rows = this.queryAll<SQLiteTableNameRow>(`
+      SELECT name FROM sqlite_master
+      WHERE type='table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `);
 
-      return rows.map((row) => row.name);
-    } catch (error) {
-      throw error;
-    }
+    return rows.map((row) => row.name);
   }
 
   async getViews(schema?: string): Promise<string[]> {
@@ -333,39 +329,13 @@ export class SQLiteConnector implements Connector {
     }
 
     // In SQLite, schema parameter is ignored since SQLite doesn't have schemas like PostgreSQL
-    try {
-      const rows = this.queryAll<SQLiteTableNameRow>(`
-        SELECT name FROM sqlite_master
-        WHERE type='view' AND name NOT LIKE 'sqlite_%'
-        ORDER BY name
-      `);
+    const rows = this.queryAll<SQLiteTableNameRow>(`
+      SELECT name FROM sqlite_master
+      WHERE type='view' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `);
 
-      return rows.map((row) => row.name);
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    if (!this.db) {
-      throw new Error("Not connected to SQLite database");
-    }
-
-    // In SQLite, schema parameter is ignored since there's only one schema per database file
-    // All tables exist in a single namespace within the SQLite database
-    try {
-      const row = this.queryOne<SQLiteTableNameRow>(
-        `
-        SELECT name FROM sqlite_master
-        WHERE type='table' AND name = ?
-      `,
-        tableName
-      );
-
-      return !!row;
-    } catch (error) {
-      throw error;
-    }
+    return rows.map((row) => row.name);
   }
 
   async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
@@ -374,72 +344,68 @@ export class SQLiteConnector implements Connector {
     }
 
     // In SQLite, schema parameter is ignored (no schema concept)
-    try {
-      // Get all indexes for the specified table
-      const indexInfoRows = this.queryAll<{ index_name: string; is_unique: number }>(
-        `
-        SELECT
-          name as index_name,
-          0 as is_unique
-        FROM sqlite_master
-        WHERE type = 'index'
-        AND tbl_name = ?
-      `,
-        tableName
-      );
+    // Get all indexes for the specified table
+    const indexInfoRows = this.queryAll<{ index_name: string; is_unique: number }>(
+      `
+      SELECT
+        name as index_name,
+        0 as is_unique
+      FROM sqlite_master
+      WHERE type = 'index'
+      AND tbl_name = ?
+    `,
+      tableName
+    );
 
-      // Get unique info from PRAGMA index_list which provides the unique flag
-      // Note: PRAGMA commands require proper identifier quoting for special characters
-      const quotedTableName = quoteIdentifier(tableName, "sqlite");
-      const indexListRows = this.queryAll<{ name: string; unique: number }>(
-        `PRAGMA index_list(${quotedTableName})`
-      );
+    // Get unique info from PRAGMA index_list which provides the unique flag
+    // Note: PRAGMA commands require proper identifier quoting for special characters
+    const quotedTableName = quoteIdentifier(tableName, "sqlite");
+    const indexListRows = this.queryAll<{ name: string; unique: number }>(
+      `PRAGMA index_list(${quotedTableName})`
+    );
 
-      // Create a map of index names to unique status
-      const indexUniqueMap = new Map<string, boolean>();
-      for (const indexListRow of indexListRows) {
-        indexUniqueMap.set(indexListRow.name, indexListRow.unique === 1);
-      }
-
-      // Get the primary key info
-      const tableInfo = this.queryAll<SQLiteTableInfo>(`PRAGMA table_info(${quotedTableName})`);
-
-      // Find primary key columns
-      const pkColumns = tableInfo.filter((col) => col.pk > 0).map((col) => col.name);
-
-      const results: TableIndex[] = [];
-
-      // Add regular indexes
-      for (const indexInfo of indexInfoRows) {
-        // Get the columns for this index
-        const quotedIndexName = quoteIdentifier(indexInfo.index_name, "sqlite");
-        const indexDetailRows = this.queryAll<{ name: string }>(
-          `PRAGMA index_info(${quotedIndexName})`
-        );
-        const columnNames = indexDetailRows.map((row) => row.name);
-
-        results.push({
-          index_name: indexInfo.index_name,
-          column_names: columnNames,
-          is_unique: indexUniqueMap.get(indexInfo.index_name) || false,
-          is_primary: false,
-        });
-      }
-
-      // Add primary key if it exists
-      if (pkColumns.length > 0) {
-        results.push({
-          index_name: "PRIMARY",
-          column_names: pkColumns,
-          is_unique: true,
-          is_primary: true,
-        });
-      }
-
-      return results;
-    } catch (error) {
-      throw error;
+    // Create a map of index names to unique status
+    const indexUniqueMap = new Map<string, boolean>();
+    for (const indexListRow of indexListRows) {
+      indexUniqueMap.set(indexListRow.name, indexListRow.unique === 1);
     }
+
+    // Get the primary key info
+    const tableInfo = this.queryAll<SQLiteTableInfo>(`PRAGMA table_info(${quotedTableName})`);
+
+    // Find primary key columns
+    const pkColumns = tableInfo.filter((col) => col.pk > 0).map((col) => col.name);
+
+    const results: TableIndex[] = [];
+
+    // Add regular indexes
+    for (const indexInfo of indexInfoRows) {
+      // Get the columns for this index
+      const quotedIndexName = quoteIdentifier(indexInfo.index_name, "sqlite");
+      const indexDetailRows = this.queryAll<{ name: string }>(
+        `PRAGMA index_info(${quotedIndexName})`
+      );
+      const columnNames = indexDetailRows.map((row) => row.name);
+
+      results.push({
+        index_name: indexInfo.index_name,
+        column_names: columnNames,
+        is_unique: indexUniqueMap.get(indexInfo.index_name) || false,
+        is_primary: false,
+      });
+    }
+
+    // Add primary key if it exists
+    if (pkColumns.length > 0) {
+      results.push({
+        index_name: "PRIMARY",
+        column_names: pkColumns,
+        is_unique: true,
+        is_primary: true,
+      });
+    }
+
+    return results;
   }
 
   async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
@@ -451,29 +417,25 @@ export class SQLiteConnector implements Connector {
     // 1. SQLite doesn't have schemas in the same way as PostgreSQL or MySQL
     // 2. Each SQLite database file is its own separate namespace
     // 3. The PRAGMA commands operate on the current database connection
-    try {
-      const quotedTableName = quoteIdentifier(tableName, "sqlite");
-      // table_info omits generated columns. Keep them, but exclude virtual-table
-      // implementation columns (hidden=1) exposed by table_xinfo.
-      const rows = this.queryAll<SQLiteTableInfo & { hidden: number }>(
-        `PRAGMA table_xinfo(${quotedTableName})`
-      ).filter((row) => row.hidden !== 1);
+    const quotedTableName = quoteIdentifier(tableName, "sqlite");
+    // table_info omits generated columns. Keep them, but exclude virtual-table
+    // implementation columns (hidden=1) exposed by table_xinfo.
+    const rows = this.queryAll<SQLiteTableInfo & { hidden: number }>(
+      `PRAGMA table_xinfo(${quotedTableName})`
+    ).filter((row) => row.hidden !== 1);
 
-      // Convert SQLite schema format to our standard TableColumn format
-      // SQLite does not support column comments, so description is always null
-      const columns = rows.map((row) => ({
-        column_name: row.name,
-        data_type: row.type,
-        // In SQLite, primary key columns are automatically NOT NULL even if notnull=0
-        is_nullable: (row.notnull === 1 || row.pk > 0) ? "NO" : "YES",
-        column_default: row.dflt_value,
-        description: null,
-      }));
+    // Convert SQLite schema format to our standard TableColumn format
+    // SQLite does not support column comments, so description is always null
+    const columns = rows.map((row) => ({
+      column_name: row.name,
+      data_type: row.type,
+      // In SQLite, primary key columns are automatically NOT NULL even if notnull=0
+      is_nullable: (row.notnull === 1 || row.pk > 0) ? "NO" : "YES",
+      column_default: row.dflt_value,
+      description: null,
+    }));
 
-      return columns;
-    } catch (error) {
-      throw error;
-    }
+    return columns;
   }
 
   async getStoredProcedures(schema?: string, routineType?: "procedure" | "function"): Promise<string[]> {
@@ -513,21 +475,36 @@ export class SQLiteConnector implements Connector {
 
   /**
    * Whether a statement returns rows (and so must run via `all()` rather than
-   * `run()`). Classified on the comment/string-stripped text so a leading
-   * attribution comment cannot hide a SELECT, matching the row limiter and the
-   * read-only classifier.
+   * `run()`).
+   *
+   * The prepared statement's own column list is the driver's answer and is
+   * used where the runtime exposes it (`columns()`, Node 22.17+/24+): it covers
+   * every pragma that reports a value (`PRAGMA user_version`,
+   * `PRAGMA table_xinfo(t)`, ...) and `INSERT ... RETURNING`, none of which a
+   * keyword list can enumerate.
+   *
+   * The keyword check stays as the fallback for older supported runtimes
+   * (Node 22.5 - 22.16 have no `columns()`) and for statements that have always
+   * been read through `all()` despite having no columns (ANALYZE). It is
+   * classified on the comment/string-stripped text so a leading attribution
+   * comment cannot hide a SELECT, matching the row limiter and the read-only
+   * classifier. Every PRAGMA counts: `all()` runs a pragma that reports nothing
+   * just as well, returning no rows. A DML statement counts when it carries a
+   * RETURNING clause; the stripped text has no strings, comments or quoted
+   * identifiers left, so the word can only be the keyword.
    */
-  private returnsRows(statement: string): boolean {
+  private returnsRows(prepared: StatementSync, statement: string): boolean {
+    const withColumns = prepared as unknown as { columns?: () => unknown[] };
+    if (typeof withColumns.columns === "function" && withColumns.columns().length > 0) {
+      return true;
+    }
     const stripped = stripCommentsAndStrings(statement, "sqlite").toLowerCase().trim();
     return stripped.startsWith('select') ||
            stripped.startsWith('with') ||
            stripped.startsWith('explain') ||
            stripped.startsWith('analyze') ||
-           (stripped.startsWith('pragma') &&
-            (stripped.includes('table_info') ||
-             stripped.includes('index_info') ||
-             stripped.includes('index_list') ||
-             stripped.includes('foreign_key_list')));
+           stripped.startsWith('pragma') ||
+           (/^(?:insert|update|delete|replace)\b/.test(stripped) && /\breturning\b/.test(stripped));
   }
 
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
@@ -545,83 +522,51 @@ export class SQLiteConnector implements Connector {
     }
 
     try {
-      // Check if this is a multi-statement query
       const statements = splitSQLStatements(sql, "sqlite");
+      const isSingleStatement = statements.length === 1;
 
-      if (statements.length === 1) {
-        // Single statement - determine if it returns data
-        let processedStatement = statements[0];
-        const isReadStatement = this.returnsRows(statements[0]);
+      // Parameters are not supported for multi-statement queries
+      if (!isSingleStatement && parameters && parameters.length > 0) {
+        throw new Error("Parameters are not supported for multi-statement queries in SQLite");
+      }
+      const statementParameters = isSingleStatement ? (parameters ?? []) : [];
+
+      // Execute each statement individually, in source order, so a later
+      // statement sees the effects of earlier ones and result sets line up
+      // with the batch as written.
+      const resultSets: SQLResultSet[] = [];
+      for (const statement of statements) {
+        // Re-assert the read-only backstop before each statement so an earlier
+        // statement in the batch (e.g. `PRAGMA query_only = OFF` / `query_only(0)`)
+        // cannot disable it for the ones that follow.
+        if (options.readonly) {
+          this.db.exec("PRAGMA query_only = ON");
+        }
 
         // Apply maxRows limit (with a truncation probe row) to SELECT queries
         // if specified (not PRAGMA/ANALYZE)
-        let probeApplied = false;
-        if (options.maxRows) {
-          const rewrite = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
-            processedStatement,
-            options.maxRows,
-            "sqlite"
-          );
-          processedStatement = rewrite.sql;
-          probeApplied = rewrite.probeApplied;
-        }
+        const { sql: processedStatement, probeApplied } = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
+          statement,
+          options.maxRows,
+          "sqlite"
+        );
 
-        if (isReadStatement) {
-          // Pass parameters if provided
-          const rows = this.readRows(this.prepare(processedStatement), parameters ?? []);
-          const resultSet: SQLResultSet = { sql: statements[0], rows, rowCount: rows.length };
+        const prepared = this.prepare(processedStatement);
+        if (this.returnsRows(prepared, statement)) {
+          const rows = this.readRows(prepared, statementParameters);
+          const resultSet: SQLResultSet = { sql: statement, rows, rowCount: rows.length };
           SQLRowLimiter.flagTruncation(resultSet, options.maxRows, probeApplied);
-          return { resultSets: [resultSet] };
+          resultSets.push(resultSet);
         } else {
-          // Use run() for statements that don't return data
-          let result;
-          if (parameters && parameters.length > 0) {
-            result = this.prepare(processedStatement).run(...parameters);
-          } else {
-            result = this.prepare(processedStatement).run();
-          }
+          // Use run() for statements that don't return data.
           // node:sqlite returns `changes` as BigInt when BigInt reads are
           // enabled; normalize to a number to match the SQLResult contract.
-          return {
-            resultSets: [{ sql: statements[0], rows: [], rowCount: Number(result.changes) }],
-          };
+          const result = prepared.run(...statementParameters);
+          resultSets.push({ sql: statement, rows: [], rowCount: Number(result.changes) });
         }
-      } else {
-        // Multiple statements - parameters not supported for multi-statement queries
-        if (parameters && parameters.length > 0) {
-          throw new Error("Parameters are not supported for multi-statement queries in SQLite");
-        }
-
-        // Execute each statement individually, in source order, so a later
-        // statement sees the effects of earlier ones and result sets line up
-        // with the batch as written.
-        const resultSets: SQLResultSet[] = [];
-        for (const statement of statements) {
-          // Re-assert the read-only backstop before each statement so an earlier
-          // statement in the batch (e.g. `PRAGMA query_only = OFF` / `query_only(0)`)
-          // cannot disable it for the ones that follow.
-          if (options.readonly) {
-            this.db.exec("PRAGMA query_only = ON");
-          }
-          if (this.returnsRows(statement)) {
-            // Apply maxRows limit (with a truncation probe row) to SELECT queries if specified
-            const { sql: processedStatement, probeApplied } = SQLRowLimiter.applyMaxRowsWithTruncationProbe(
-              statement,
-              options.maxRows,
-              "sqlite"
-            );
-            const rows = this.readRows(this.prepare(processedStatement), []);
-            const resultSet: SQLResultSet = { sql: statement, rows, rowCount: rows.length };
-            SQLRowLimiter.flagTruncation(resultSet, options.maxRows, probeApplied);
-            resultSets.push(resultSet);
-          } else {
-            const result = this.prepare(statement).run();
-            resultSets.push({ sql: statement, rows: [], rowCount: Number(result.changes) });
-          }
-        }
-
-        return { resultSets };
       }
+
+      return { resultSets };
     } finally {
       // Restore the connection to writable so non-read-only tools on the same
       // shared connection are unaffected. Best-effort: if this throws it must not

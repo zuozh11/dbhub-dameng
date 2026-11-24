@@ -3,7 +3,15 @@ import type { SessionSettings } from "../utils/session-settings.js";
 /**
  * Type definition for supported database connector types
  */
-export type ConnectorType = "postgres" | "mysql" | "mariadb" | "sqlite" | "sqlserver" | "oracle" | "dameng";
+export type ConnectorType =
+  | "dameng"
+  | "postgres"
+  | "mysql"
+  | "mariadb"
+  | "sqlite"
+  | "sqlserver"
+  | "oracle"
+  | "clickhouse";
 
 /**
  * Database Connector Interface
@@ -57,7 +65,10 @@ export interface SQLResult {
    * only care about that should read `resultSets[0]`.
    */
   resultSets: SQLResultSet[];
-  /** Informational messages from the database (e.g. SQL Server STATISTICS TIME/IO, PRINT output) */
+  /**
+   * Informational messages from the database (e.g. SQL Server STATISTICS
+   * TIME/IO, PRINT output; ClickHouse rows and bytes read per statement)
+   */
   messages?: DatabaseMessage[];
 }
 
@@ -72,6 +83,8 @@ export interface TableColumn {
 export interface TableIndex {
   index_name: string;
   column_names: string[];
+  /** Non-key INCLUDE columns, when reported by the connector. */
+  included_columns?: string[];
   is_unique: boolean;
   is_primary: boolean;
 }
@@ -142,9 +155,9 @@ export interface ExecuteOptions {
 export interface ConnectorConfig {
   /** Password resolved for each new physical connection (PostgreSQL). */
   password?: () => Promise<string>;
-  /** Connection timeout in seconds (PostgreSQL, MySQL, MariaDB, SQL Server) */
+  /** Connection timeout in seconds (PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse) */
   connectionTimeoutSeconds?: number;
-  /** Query timeout in seconds (PostgreSQL, MySQL, MariaDB, SQL Server) */
+  /** Query timeout in seconds (PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse) */
   queryTimeoutSeconds?: number;
   /** Maximum connections in a source pool (PostgreSQL, MySQL) */
   poolMaxConnections?: number;
@@ -184,8 +197,10 @@ export interface ConnectorConfig {
    */
   collation?: string;
   /**
-   * Per-source session settings from `[sources.session]` (MySQL, PostgreSQL),
-   * applied once to every new connection. Validated by the TOML loader.
+   * Per-source session settings from `[sources.session]` (MySQL, PostgreSQL,
+   * ClickHouse). MySQL and PostgreSQL apply them once to every new connection;
+   * ClickHouse, whose HTTP interface has no connection state, sends them with
+   * every request. Validated by the TOML loader.
    */
   sessionSettings?: SessionSettings;
 }
@@ -204,6 +219,7 @@ export interface DSNParser {
    * - MariaDB: "mariadb://user:password@localhost:3306/dbname"
    * - MySQL: "mysql://user:password@localhost:3306/dbname"
    * - SQLite: "sqlite:///path/to/database.db" or "sqlite:///:memory:"
+   * - ClickHouse: "clickhouse://user:password@localhost:8123/dbname"
    */
   parse(dsn: string, config?: ConnectorConfig): Promise<any>;
 
@@ -291,15 +307,6 @@ export interface Connector {
   getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]>;
 
   /**
-   * Check if a table exists
-   * @param tableName The name of the table to check
-   * @param schema Optional schema name. If not provided, implementation should use the default schema
-   *   as described in getTables method.
-   * @returns Promise with boolean indicating if table exists
-   */
-  tableExists(tableName: string, schema?: string): Promise<boolean>;
-
-  /**
    * Get indexes for a specific table
    * @param tableName The name of the table to get indexes for
    * @param schema Optional schema name. If not provided, implementation should use the default schema
@@ -365,13 +372,6 @@ export class ConnectorRegistry {
   }
 
   /**
-   * Get a connector by ID
-   */
-  static getConnector(id: ConnectorType): Connector | null {
-    return ConnectorRegistry.connectors.get(id) || null;
-  }
-
-  /**
    * Get connector for a DSN string
    * Tries to find a connector that can handle the given DSN format
    */
@@ -382,22 +382,6 @@ export class ConnectorRegistry {
       }
     }
     return null;
-  }
-
-  /**
-   * Get all available connector IDs
-   */
-  static getAvailableConnectors(): ConnectorType[] {
-    return Array.from(ConnectorRegistry.connectors.keys());
-  }
-
-  /**
-   * Get sample DSN for a specific connector
-   */
-  static getSampleDSN(connectorType: ConnectorType): string | null {
-    const connector = ConnectorRegistry.getConnector(connectorType);
-    if (!connector) return null;
-    return connector.dsnParser.getSampleDSN();
   }
 
   /**

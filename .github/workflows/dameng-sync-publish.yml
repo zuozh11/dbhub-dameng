@@ -36,10 +36,15 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch https://github.com/bytebase/dbhub.git main
-          if ! git -c rerere.enabled=false merge --no-ff --no-commit FETCH_HEAD; then
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          echo "Merging Bytebase DBHub ${upstream_sha} into $(git rev-parse HEAD)"
+          if ! git -c rerere.enabled=false merge --no-ff --no-commit "$upstream_sha"; then
             conflicts=$(git diff --name-only --diff-filter=U)
             if ! git rev-parse --verify -q MERGE_HEAD >/dev/null || [ "$conflicts" != README.md ]; then
-              echo "::error::Upstream merge requires manual review. See the conflicts above."
+              echo "::error::Merge of Bytebase DBHub ${upstream_sha} requires manual review."
+              if [ -n "$conflicts" ]; then
+                printf 'Conflicting files:\n%s\n' "$conflicts"
+              fi
               exit 1
             fi
           fi

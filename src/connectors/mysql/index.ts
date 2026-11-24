@@ -5,23 +5,16 @@ import {
   ConnectorRegistry,
   DSNParser,
   SQLResult,
-  TableColumn,
-  TableIndex,
-  StoredProcedure,
   ExecuteOptions,
   ConnectorConfig,
-  HealthCheckResult,
 } from "../interface.js";
-import { getMySQLFamilyHealthCheck } from "../mysql-family-health-check.js";
-import * as introspection from "../mysql-family-introspection.js";
+import { MySQLFamilyConnector } from "../mysql-family-connector.js";
 import type { MySQLFamilyQuery } from "../mysql-family-introspection.js";
+import { readMySQLFamilySslMode, type MySQLFamilySslMode } from "../mysql-family-ssl.js";
 import { SafeURL } from "../../utils/safe-url.js";
 import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
 import { requireDatabaseInDSN, MissingDatabaseError } from "../../utils/dsn-database.js";
-import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
-import { parseQueryResultSets } from "../../utils/multi-statement-result-parser.js";
 import { buildMySQLSessionStatement } from "../../utils/session-settings.js";
-import { splitSQLStatements } from "../../utils/sql-parser.js";
 import {
   withReadOnlyTransaction,
   detectReadOnlyBackstop,
@@ -37,12 +30,31 @@ import {
 import { closeQuietly } from "../../utils/resource-cleanup.js";
 
 /**
+ * mysql2 `ssl` option for an sslmode. mysql2 verifies the certificate chain by
+ * default but checks the host name only with `verifyIdentity`. A fresh object
+ * per call: the driver writes defaults back onto the one it is given.
+ */
+function mysqlSslOptions(mode: MySQLFamilySslMode): mysql.PoolOptions["ssl"] {
+  switch (mode) {
+    case "disable":
+      return undefined;
+    case "require":
+      return { rejectUnauthorized: false };
+    case "verify-ca":
+      return { rejectUnauthorized: true };
+    case "verify-full":
+      return { rejectUnauthorized: true, verifyIdentity: true };
+  }
+}
+
+/**
  * MySQL DSN Parser
  * Handles DSN strings like: mysql://user:password@localhost:3306/dbname?sslmode=require
- * Supported SSL modes:
+ * Supported SSL modes (anything else is rejected):
  * - sslmode=disable: No SSL connection
  * - sslmode=require: SSL connection without certificate verification
- * - Any other value: Standard SSL connection with certificate verification
+ * - sslmode=verify-ca: SSL connection, certificate chain verified
+ * - sslmode=verify-full: verify-ca plus the certificate must match the host name
  */
 class MySQLDSNParser implements DSNParser {
   async parse(dsn: string, config?: ConnectorConfig): Promise<mysql.PoolOptions> {
@@ -79,19 +91,12 @@ class MySQLDSNParser implements DSNParser {
         supportBigNumbers: true, // Return BIGINT as string when value exceeds Number.MAX_SAFE_INTEGER
       };
 
-      // Handle query parameters
-      url.forEachSearchParam((value, key) => {
-        if (key === "sslmode") {
-          if (value === "disable") {
-            config.ssl = undefined;
-          } else if (value === "require") {
-            config.ssl = { rejectUnauthorized: false };
-          } else {
-            config.ssl = {};
-          }
-        }
-        // Add other parameters as needed
-      });
+      // Read from the raw DSN: a present-but-empty sslmode must be rejected,
+      // and SafeURL would have dropped it (see readMySQLFamilySslMode)
+      const sslmode = readMySQLFamilySslMode(dsn);
+      if (sslmode !== undefined) {
+        config.ssl = mysqlSslOptions(sslmode);
+      }
 
       // Apply connection timeout if specified
       if (connectionTimeoutSeconds !== undefined) {
@@ -232,15 +237,15 @@ export async function getConnectionWithin(
 /**
  * MySQL Connector Implementation
  */
-export class MySQLConnector implements Connector {
+export class MySQLConnector extends MySQLFamilyConnector {
   id: ConnectorType = "mysql";
   name = "MySQL";
   dsnParser = new MySQLDSNParser();
 
   private pool: mysql.Pool | null = null;
-  // Source ID is set by ConnectorManager after cloning
-  private sourceId: string = "default";
-  private queryTimeoutMs?: number;
+  // Client-side fallback deadline, which trails the server-side limit (see
+  // query-timeout.ts).
+  private clientQueryTimeoutMs?: number;
   // connection_timeout also bounds the wait for a free pool connection
   private connectionTimeoutMs?: number;
   // How the read-only backstop takes effect on this server (which session
@@ -250,10 +255,6 @@ export class MySQLConnector implements Connector {
   // are special-cased here only: the MariaDB connector does no such detection.
   private readOnlyBackstop: ReadOnlyBackstop = { kind: "session", variable: "transaction_read_only" };
 
-  getId(): string {
-    return this.sourceId;
-  }
-
   clone(): Connector {
     return new MySQLConnector();
   }
@@ -261,16 +262,24 @@ export class MySQLConnector implements Connector {
   async connect(dsn: string, initScript?: string, config?: ConnectorConfig): Promise<void> {
     try {
       const connectionOptions = await this.dsnParser.parse(dsn, config);
+      const queryTimeoutMs =
+        config?.queryTimeoutSeconds !== undefined
+          ? Math.ceil(config.queryTimeoutSeconds * 1000)
+          : undefined;
+      // Client-side fallback, applied per query (see query-timeout.ts).
+      // Resolved before the pool exists: clientQueryTimeoutMs throws on a limit
+      // no timer can represent, and connect() is where that has to surface,
+      // not executeSQL with a connection already checked out.
+      this.clientQueryTimeoutMs =
+        queryTimeoutMs !== undefined ? clientQueryTimeoutMs(queryTimeoutMs) : undefined;
+
       this.pool = mysql.createPool(connectionOptions);
       this.connectionTimeoutMs =
         config?.connectionTimeoutSeconds !== undefined
           ? config.connectionTimeoutSeconds * 1000
           : undefined;
 
-      if (config?.queryTimeoutSeconds !== undefined) {
-        const queryTimeoutMs = Math.ceil(config.queryTimeoutSeconds * 1000);
-        // Client-side fallback, applied per query (see query-timeout.ts).
-        this.queryTimeoutMs = queryTimeoutMs;
+      if (queryTimeoutMs !== undefined) {
         // Server-side limit: have MySQL itself stop a read-only SELECT that
         // runs past the limit, as PostgreSQL (statement_timeout) and MariaDB
         // (max_statement_time) already do. It is a session variable, so it is
@@ -349,7 +358,7 @@ export class MySQLConnector implements Connector {
    * shared functions never see a missing pool. mysql2 resolves to
    * [rows, fields]; only the rows are handed on.
    */
-  private requireQuery(): MySQLFamilyQuery {
+  protected requireQuery(): MySQLFamilyQuery {
     if (!this.pool) {
       throw new Error("Not connected to database");
     }
@@ -363,50 +372,6 @@ export class MySQLConnector implements Connector {
     };
   }
 
-  async getSchemas(): Promise<string[]> {
-    return introspection.getSchemas(this.requireQuery());
-  }
-
-  async getTables(schema?: string): Promise<string[]> {
-    return introspection.getTables(this.requireQuery(), schema);
-  }
-
-  async getViews(schema?: string): Promise<string[]> {
-    return introspection.getViews(this.requireQuery(), schema);
-  }
-
-  async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    return introspection.tableExists(this.requireQuery(), tableName, schema);
-  }
-
-  async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
-    return introspection.getTableIndexes(this.requireQuery(), tableName, schema);
-  }
-
-  async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
-    return introspection.getTableSchema(this.requireQuery(), tableName, schema);
-  }
-
-  async getTableComment(tableName: string, schema?: string): Promise<string | null> {
-    return introspection.getTableComment(this.requireQuery(), tableName, schema);
-  }
-
-  async getHealthCheck(): Promise<HealthCheckResult> {
-    return getMySQLFamilyHealthCheck(this.requireQuery());
-  }
-
-  async getStoredProcedures(schema?: string, routineType?: "procedure" | "function"): Promise<string[]> {
-    return introspection.getStoredProcedures(this.requireQuery(), schema, routineType);
-  }
-
-  async getStoredProcedureDetail(procedureName: string, schema?: string): Promise<StoredProcedure> {
-    return introspection.getStoredProcedureDetail(this.requireQuery(), procedureName, schema);
-  }
-
-  async getDefaultSchema(): Promise<string | null> {
-    return introspection.getDefaultSchema(this.requireQuery());
-  }
-
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
     if (!this.pool) {
       throw new Error("Not connected to database");
@@ -418,9 +383,7 @@ export class MySQLConnector implements Connector {
     // Captured up front, before a timeout can lead to conn.destroy() below.
     const threadId = conn.threadId;
     let isConnectionDiscarded = false;
-    // The client-side deadline trails the server-side one (see query-timeout.ts).
-    const timeout =
-      this.queryTimeoutMs !== undefined ? clientQueryTimeoutMs(this.queryTimeoutMs) : undefined;
+    const timeout = this.clientQueryTimeoutMs;
     try {
       // Engine-level read-only backstop (shared with MariaDB); see
       // withReadOnlyTransaction for the semantics and the TiDB/Doris caveats.
@@ -428,55 +391,19 @@ export class MySQLConnector implements Connector {
         conn,
         options.readonly,
         this.readOnlyBackstop,
-        async () => {
-          // Split up front so the original statement text is available for
-          // attribution below, whether or not maxRows needs to rewrite it.
-          const statements = splitSQLStatements(sql, "mysql");
-          let processedSQL = sql;
-          // Per-statement truncation-probe flags, index-aligned with `statements`
-          let probes: boolean[] = [];
-          if (options.maxRows) {
-            const rewrites = statements.map(statement =>
-              SQLRowLimiter.applyMaxRowsWithTruncationProbe(statement, options.maxRows, "mysql")
-            );
-            probes = rewrites.map(rewrite => rewrite.probeApplied);
-
-            processedSQL = rewrites.map(rewrite => rewrite.sql).join('; ');
-            if (sql.trim().endsWith(';')) {
-              processedSQL += ';';
-            }
-          }
-
-          // Use dedicated connection with multipleStatements: true support
-          // Pass parameters if provided, with optional query timeout.
-          // Rows are fetched positionally (rowsAsArray) and rebuilt from the
-          // field metadata by parseQueryResultSets, so a result with repeated
-          // column names keeps every column (bytebase/dbhub#484).
-          const queryOptions = { sql: processedSQL, timeout, rowsAsArray: true };
-          let results: any;
-          if (parameters && parameters.length > 0) {
-            results = await conn.query(queryOptions, parameters);
-          } else {
-            results = await conn.query(queryOptions);
-          }
-
-          // MySQL2 returns results in format [rows, fields]
-          const [firstResult, fields] = results;
-
-          // Parse results using shared utility that handles both single and multi-statement queries
-          const resultSets = parseQueryResultSets(firstResult, statements, fields);
-
-          // Result sets are per statement in source order, so a length match
-          // means the pairing with the probe flags is exact (same reasoning as
-          // the sql attribution inside parseQueryResultSets).
-          if (resultSets.length === probes.length) {
-            resultSets.forEach((set, index) =>
-              SQLRowLimiter.flagTruncation(set, options.maxRows, probes[index])
-            );
-          }
-
-          return { resultSets };
-        }
+        () =>
+          this.executeStatements(sql, options, (processedSQL) => {
+            // Use dedicated connection with multipleStatements: true support
+            // Pass parameters if provided, with optional query timeout.
+            // Rows are fetched positionally (rowsAsArray); mysql2 resolves to
+            // [rows, fields], which is what executeStatements expects.
+            const queryOptions = { sql: processedSQL, timeout, rowsAsArray: true };
+            return (
+              parameters && parameters.length > 0
+                ? conn.query(queryOptions, parameters)
+                : conn.query(queryOptions)
+            ) as Promise<[any, any]>;
+          })
       );
     } catch (error) {
       if (isClientSideTimeout(error)) {

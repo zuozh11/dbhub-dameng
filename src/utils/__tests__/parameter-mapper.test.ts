@@ -49,10 +49,12 @@ describe("Parameter Mapper", () => {
       ["SELECT * FROM users WHERE id = ?", "mysql"],
       ["SELECT * FROM users WHERE id = @p1", "sqlserver"],
       ["SELECT * FROM users WHERE id = :1", "oracle"],
-      // SQL without parameters is valid for any connector
+      ["SELECT * FROM users WHERE id = {p1:UInt64}", "clickhouse"],
+      // `?` and `:` are the conditional operator in ClickHouse, not placeholders
+      ["SELECT x > 0 ? 1 : 2 FROM t", "clickhouse"],
+      // SQL without parameters is valid for any connector: the style check
+      // returns before the connector is consulted
       ["SELECT * FROM users", "postgres"],
-      ["SELECT * FROM users", "mysql"],
-      ["SELECT * FROM users", "sqlserver"],
     ])("should accept %j for %s", (sql, connector) => {
       expect(() => validateParameterStyle(sql, connector)).not.toThrow();
     });
@@ -63,6 +65,41 @@ describe("Parameter Mapper", () => {
       ["SELECT * FROM users WHERE id = ?", "oracle", /Expected colon style \(:1, :2, :3\)/],
     ])("should reject %j for %s", (sql, connector, message) => {
       expect(() => validateParameterStyle(sql, connector)).toThrow(message);
+    });
+  });
+
+  describe("ClickHouse {pN:Type} placeholders", () => {
+    it("should count placeholders by their highest index, whatever the type", () => {
+      const sql =
+        "SELECT * FROM events WHERE tenant = {p1:String} AND day >= {p2 : Date} " +
+        "AND id IN {p3:Array(UInt32)} AND owner = {p1:String}";
+      expect(detectParameterStyle(sql, "clickhouse")).toBe("braced");
+      expect(countParameters(sql, "clickhouse")).toBe(3);
+    });
+
+    it("should ignore placeholders inside strings and comments, and other dialects' styles", () => {
+      const sql = "SELECT '{p2:String}', a ? b : 1 /* {p3:String} */ FROM t WHERE id = {p1:UInt64} -- $1 @p1";
+      expect(countParameters(sql, "clickhouse")).toBe(1);
+    });
+
+    it("should not read a map literal or a named placeholder as a positional one", () => {
+      expect(detectParameterStyle("SELECT {'p1': 1} AS m, {tenant:String} AS t", "clickhouse")).toBe("none");
+    });
+
+    it("should require placeholders to be sequential from p1", () => {
+      expect(() => countParameters("SELECT {p2:String}", "clickhouse")).toThrow(/missing \{p1/);
+      expect(() => countParameters("SELECT {p0:String}", "clickhouse")).toThrow(/parameter \{p0/);
+    });
+
+    it("should validate the placeholder count against the tool's parameters", () => {
+      const parameters = [{ name: "tenant", type: "string" as const, description: "tenant" }];
+      expect(() =>
+        validateParameters("SELECT * FROM t WHERE tenant = {p1:String}", parameters, "clickhouse")
+      ).not.toThrow();
+      // A `?` is not a placeholder here, so the statement has none to bind.
+      expect(() => validateParameters("SELECT * FROM t WHERE tenant = ?", parameters, "clickhouse")).toThrow(
+        /SQL statement has 0 parameter\(s\), but 1 parameter\(s\) defined/
+      );
     });
   });
 
@@ -77,13 +114,6 @@ describe("Parameter Mapper", () => {
       expect(() => countParameters("SELECT * FROM t WHERE id = $0")).toThrow(/parameter \$0/);
       expect(() => countParameters("SELECT * FROM t WHERE id = @p0")).toThrow(/parameter @p0/);
       expect(() => countParameters("SELECT * FROM t WHERE id = :0", "oracle")).toThrow(/parameter :0/);
-    });
-
-    it("should count and validate Oracle colon-numbered parameters", () => {
-      expect(countParameters("SELECT * FROM users WHERE id = :1 AND x = :2 OR y = :1")).toBe(2);
-      expect(() => countParameters("SELECT * FROM users WHERE id = :1 AND x = :3")).toThrow(
-        /missing :2/
-      );
     });
 
     it.each([
@@ -103,40 +133,26 @@ describe("Parameter Mapper", () => {
       expect(countParameters("SELECT * FROM users")).toBe(0);
     });
 
-    it("should reject non-sequential numbered parameters", () => {
-      // Non-sequential: $1, $3 (missing $2) should throw
-      expect(() => countParameters("SELECT * WHERE a = $1 AND b = $3")).toThrow(
-        /Non-sequential numbered parameters.*missing \$2/
+    // The three indexed styles share one rule: placeholders must run from 1
+    // without gaps, and a reused placeholder counts once.
+    it.each([
+      // [style as named in the error, sigil]
+      ["numbered", "$"],
+      ["named", "@p"],
+      ["colon-numbered", ":"],
+    ])("should require %s parameters to be sequential from 1, counting a reused one once", (style, s) => {
+      expect(countParameters(`SELECT * WHERE id = ${s}1 OR parent_id = ${s}1`)).toBe(1);
+      expect(countParameters(`SELECT * WHERE (id = ${s}1 OR parent_id = ${s}1) AND status = ${s}2`)).toBe(2);
+      // A gap: 1, 3 (missing 2)
+      expect(() => countParameters(`SELECT * WHERE a = ${s}1 AND b = ${s}3`)).toThrow(
+        `Non-sequential ${style} parameters detected. Found placeholders: ${s}1, ${s}3. ` +
+          `Parameters must be sequential starting from ${s}1 (missing ${s}2).`
       );
-      // Starting from $2 instead of $1 should throw
-      expect(() => countParameters("SELECT * WHERE a = $2 AND b = $5 AND c = $7")).toThrow(
-        /Non-sequential numbered parameters.*missing \$1/
+      // Not starting from 1: 2, 5, 7
+      expect(() => countParameters(`SELECT * WHERE a = ${s}2 AND b = ${s}5 AND c = ${s}7`)).toThrow(
+        `Non-sequential ${style} parameters detected. Found placeholders: ${s}2, ${s}5, ${s}7. ` +
+          `Parameters must be sequential starting from ${s}1 (missing ${s}1).`
       );
-    });
-
-    it("should allow reused numbered parameters", () => {
-      // Reused $1 should count as 1 parameter (valid)
-      expect(countParameters("SELECT * WHERE id = $1 OR parent_id = $1")).toBe(1);
-      // Reused $1 and sequential $2 should count as 2 parameters (valid)
-      expect(countParameters("SELECT * WHERE (id = $1 OR parent_id = $1) AND status = $2")).toBe(2);
-    });
-
-    it("should reject non-sequential named parameters", () => {
-      // Non-sequential: @p1, @p3 (missing @p2) should throw
-      expect(() => countParameters("SELECT * WHERE a = @p1 AND b = @p3")).toThrow(
-        /Non-sequential named parameters.*missing @p2/
-      );
-      // Non-sequential: @p2, @p5 (missing @p1, @p3, @p4) should throw
-      expect(() => countParameters("SELECT * WHERE a = @p2 AND b = @p5")).toThrow(
-        /Non-sequential named parameters.*missing @p1/
-      );
-    });
-
-    it("should allow reused named parameters", () => {
-      // Reused @p1 should count as 1 parameter (valid)
-      expect(countParameters("SELECT * WHERE id = @p1 OR parent_id = @p1")).toBe(1);
-      // Reused @p1 and sequential @p2 should count as 2 parameters (valid)
-      expect(countParameters("SELECT * WHERE (id = @p1 OR parent_id = @p1) AND status = @p2")).toBe(2);
     });
   });
 

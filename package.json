@@ -1,8 +1,8 @@
 {
   "name": "dbhub",
-  "version": "1.7.1",
+  "version": "2.1.0",
   "mcpName": "io.github.bytebase/dbhub",
-  "description": "Token-efficient database MCP server for PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, SQLite",
+  "description": "Token-efficient database MCP server for PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse, SQLite",
   "repository": {
     "type": "git",
     "url": "https://github.com/bytebase/dbhub.git"
@@ -25,10 +25,12 @@
     "test:mcpb": "node scripts/smoke-test-mcpb.mjs",
     "start": "node dist/index.js",
     "dev": "concurrently --kill-others \"pnpm run dev:backend\" \"pnpm run dev:frontend\"",
+    "dev:demo": "concurrently --kill-others \"pnpm run dev:backend --demo\" \"pnpm run dev:frontend\"",
     "dev:backend": "NODE_ENV=development tsx src/index.ts --transport=http",
     "dev:frontend": "cd frontend && pnpm run dev",
     "crossdev": "cross-env NODE_ENV=development tsx src/index.ts",
     "generate:api-types": "openapi-typescript src/api/openapi.yaml -o src/api/openapi.d.ts",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
     "test:watch": "vitest",
@@ -36,13 +38,35 @@
     "test:build": "node scripts/smoke-test-build.mjs",
     "sync-version": "node scripts/sync-version.mjs",
     "sync:branding": "node scripts/sync-branding.mjs",
-    "version": "pnpm run sync-version && git add plugin/.claude-plugin/plugin.json plugin/.mcp.json server.json"
+    "sync:featured-blog": "node scripts/sync-featured-blog.mjs",
+    "check:featured-blog": "node scripts/sync-featured-blog.mjs --check",
+    "version": "pnpm run sync-version && git add plugin/.claude-plugin/plugin.json plugin/.codex-plugin/plugin.json plugin/.mcp.json plugin/mcp.codex.json server.json"
   },
   "engines": {
     "node": ">=22.5.0"
   },
   "packageManager": "pnpm@10.17.1",
-  "keywords": [],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "modelcontextprotocol",
+    "database",
+    "sql",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "sqlserver",
+    "mssql",
+    "oracle",
+    "clickhouse",
+    "sqlite",
+    "claude",
+    "cursor",
+    "codex",
+    "ai-agent"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
@@ -51,6 +75,7 @@
     "@modelcontextprotocol/server": "^2.0.0",
     "dotenv": "^16.4.7",
     "express": "^4.18.2",
+    "libpg-query": "18.2.4",
     "ssh-config": "^5.0.3",
     "ssh2": "^1.16.0",
     "zod": "^4.2.0"
@@ -59,6 +84,7 @@
     "@aws-sdk/credential-providers": "^3.1001.0",
     "@aws-sdk/rds-signer": "^3.1001.0",
     "@azure/identity": "^4.8.0",
+    "@clickhouse/client": "^1.25.0",
     "dmdb": "1.0.52452",
     "mariadb": "^3.4.0",
     "mssql": "^11.0.1",
@@ -69,6 +95,7 @@
   "devDependencies": {
     "@anthropic-ai/mcpb": "^2.1.2",
     "@modelcontextprotocol/client": "^2.0.0",
+    "@testcontainers/clickhouse": "^11.14.0",
     "@testcontainers/mariadb": "^11.0.3",
     "@testcontainers/mssqlserver": "^11.0.3",
     "@testcontainers/mysql": "^11.0.3",
@@ -85,22 +112,10 @@
     "openapi-typescript": "^7.10.1",
     "prettier": "^3.5.3",
     "testcontainers": "^11.0.3",
-    "ts-node": "^10.9.2",
     "tsup": "^8.4.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
-    "vitest": "^4.0.6"
-  },
-  "compilerOptions": {
-    "target": "ES2020",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "esModuleInterop": true,
-    "strict": true,
-    "outDir": "dist",
-    "rootDir": "src"
-  },
-  "include": [
-    "src/**/*"
-  ]
+    "vitest": "^4.0.6",
+    "yaml": "2.8.0"
+  }
 }

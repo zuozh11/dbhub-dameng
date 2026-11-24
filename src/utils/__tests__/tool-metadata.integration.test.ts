@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { ConnectorManager } from "../../connectors/manager.js";
 import { setupManagerWithFixture, FIXTURES, loadFixtureConfig } from "../../__fixtures__/helpers.js";
-import { getExecuteSqlMetadata, getSearchObjectsMetadata } from "../tool-metadata.js";
+import {
+  getExecuteSqlMetadata,
+  getExplainSqlMetadata,
+  getHealthCheckMetadata,
+  getSearchObjectsMetadata,
+} from "../tool-metadata.js";
 import { initializeToolRegistry } from "../../tools/registry.js";
 
 // Import SQLite connector to ensure it's registered
@@ -26,49 +31,33 @@ describe("tool-metadata description propagation", () => {
     }
   });
 
-  describe("getExecuteSqlMetadata", () => {
-    it("prepends user description from source config when present", () => {
-      const metadata = getExecuteSqlMetadata("readonly_limited");
+  describe.each([
+    // [tool, metadata builder, how its technical template opens]
+    ["execute_sql", getExecuteSqlMetadata, "Execute SQL queries on the"],
+    ["search_objects", getSearchObjectsMetadata, "Search and list database objects on the"],
+    ["explain_sql", getExplainSqlMetadata, "Show the execution plan for a SQL statement on the"],
+    ["health_check", getHealthCheckMetadata, "Report connection pool and buffer cache health metrics for the"],
+  ])("%s", (_tool, getMetadata, template) => {
+    // The technical template names the source and its type
+    const templateFor = (sourceId: string) => `${template} '${sourceId}' sqlite database`;
 
-      expect(metadata.description).toContain("Read-only database for safe queries");
-      // Original technical context must still be preserved
-      expect(metadata.description).toContain("readonly_limited");
-      expect(metadata.description).toContain("sqlite");
-      expect(metadata.description).toContain("[READ-ONLY MODE]");
+    it("prepends user description from source config when present", () => {
       // User description comes first, technical template follows
-      expect(metadata.description.indexOf("Read-only database for safe queries")).toBeLessThan(
-        metadata.description.indexOf("Execute SQL queries")
-      );
+      expect(
+        getMetadata("readonly_limited").description.startsWith(
+          `Read-only database for safe queries. ${templateFor("readonly_limited")}`
+        )
+      ).toBe(true);
     });
 
     it("omits the prefix entirely when source has no description", () => {
-      const metadata = getExecuteSqlMetadata("writable_limited");
-
       // No extra prefix — description starts with the template
-      expect(metadata.description.startsWith("Execute SQL queries")).toBe(true);
-      expect(metadata.description).toContain("writable_limited");
-      expect(metadata.description).toContain("sqlite");
+      expect(getMetadata("writable_limited").description.startsWith(templateFor("writable_limited"))).toBe(true);
     });
   });
 
-  describe("getSearchObjectsMetadata", () => {
-    it("prepends user description from source config when present", () => {
-      const metadata = getSearchObjectsMetadata("readonly_limited");
-
-      expect(metadata.description).toContain("Read-only database for safe queries");
-      expect(metadata.description).toContain("readonly_limited");
-      expect(metadata.description).toContain("sqlite");
-      expect(metadata.description.indexOf("Read-only database for safe queries")).toBeLessThan(
-        metadata.description.indexOf("Search and list database objects")
-      );
-    });
-
-    it("omits the prefix entirely when source has no description", () => {
-      const metadata = getSearchObjectsMetadata("writable_unlimited");
-
-      expect(metadata.description.startsWith("Search and list database objects")).toBe(true);
-      expect(metadata.description).toContain("writable_unlimited");
-      expect(metadata.description).toContain("sqlite");
-    });
+  it("notes read-only mode in the execute_sql description", () => {
+    expect(getExecuteSqlMetadata("readonly_limited").description).toContain("[READ-ONLY MODE]");
+    expect(getExecuteSqlMetadata("writable_limited").description).not.toContain("[READ-ONLY MODE]");
   });
 });

@@ -36,12 +36,13 @@
   --text-2xl--line-height: 1.25;
   --text-3xl: 1.75rem;
   --text-3xl--line-height: 1.2;
+  /* UI hierarchy: page 24px, section/body 16px, labels/code 14px, captions 13px. */
   --text-page: 1.5rem;
   --text-page--line-height: 1.25;
-  --text-page--letter-spacing: -0.025em;
+  --text-page--letter-spacing: -0.02em;
   --text-page--font-weight: 600;
-  --text-section: 1.125rem;
-  --text-section--line-height: 1.4;
+  --text-section: 1rem;
+  --text-section--line-height: 1.5;
   --text-section--font-weight: 600;
   --text-body: 1rem;
   --text-body--line-height: 1.6;
@@ -49,22 +50,24 @@
   --text-label--line-height: 1.5;
   --text-label--font-weight: 500;
   --text-code: 0.875rem;
-  --text-code--line-height: 1.6;
+  --text-code--line-height: 1.5;
 
   --default-transition-duration: 150ms;
   --default-transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 @theme inline {
+  /* Corners: small controls 4px, navigation 6px, controls 8px, surfaces 12px. */
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-  --radius-2xl: calc(var(--radius) + 8px);
   --shadow-xs: var(--elevation-control);
   --shadow-sm: var(--elevation-raised);
   --shadow-md: var(--elevation-floating);
   --shadow-lg: var(--elevation-floating);
+  --color-brand-accent: var(--brand-accent);
+  --color-query-complete: var(--query-complete);
   --color-canvas: var(--canvas);
   --color-border-subtle: var(--border-subtle);
   --color-selection: var(--selection);
@@ -115,9 +118,11 @@
 }
 
 :root {
-  /* Brand artwork stays exact; UI roles use the supporting Zinc ramp. */
-  --brand-zinc: oklch(0.319 0.007 286);
+  /* Match the Zinc and white brand palette in docs/docs.json. */
+  --brand-zinc: oklch(0.318676 0.007035 285.9938); /* #323236 */
   --brand-white: oklch(1 0 0);
+  --brand-accent: var(--brand-zinc);
+  --query-complete: var(--success-foreground);
   --radius: 0.5rem;
   --border-hairline: 1px;
 
@@ -140,11 +145,12 @@
   --selection-foreground: var(--foreground);
   --muted-foreground: oklch(0.48 0.012 286);
 
-  /* Input edges and focus indicators are stronger than layout dividers. */
+  /* Cards use 1px borders; pane and table dividers use --border-hairline.
+     Input edges stay 1px and stronger than layout dividers in both themes. */
   --border: oklch(0 0 0 / 0.08);
   --border-subtle: oklch(0 0 0 / 0.05);
   --input: oklch(0.65 0.01 286);
-  --ring: var(--color-zinc-600);
+  --ring: var(--brand-accent);
 
   --primary: var(--brand-zinc);
   --primary-foreground: var(--brand-white);
@@ -180,6 +186,8 @@
 }
 
 .dark {
+  --brand-accent: var(--brand-white);
+  --query-complete: var(--success-foreground);
   --canvas: var(--color-zinc-950);
   --background: var(--color-zinc-900);
   --card: var(--color-zinc-900);
@@ -195,7 +203,7 @@
   --border: var(--color-zinc-800);
   --border-subtle: oklch(0.25 0.006 286);
   --input: oklch(0.56 0.012 286);
-  --ring: var(--color-zinc-400);
+  --ring: var(--brand-accent);
   --primary: var(--brand-white);
   --primary-foreground: var(--brand-zinc);
   --disabled: var(--color-zinc-800);
@@ -238,6 +246,10 @@
 
   h1, h2, h3 {
     text-wrap: balance;
+  }
+
+  :is(button, [role="button"]):not(:disabled):not([aria-disabled="true"]):not([data-disabled]) {
+    cursor: pointer;
   }
 
   ::selection {

@@ -1,10 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
   buildDSNFromEnvParams,
-  redactDSN,
   resolveDSN,
   resolveHost,
   resolveId,
@@ -24,7 +23,8 @@ vi.mock('../toml-loader.js', () => ({
 // loading flips `dotenvState.passthrough` to use the real implementation.
 const dotenvState = vi.hoisted(() => ({ passthrough: false }));
 vi.mock('dotenv', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('dotenv')>();
+  // dotenv is CommonJS: under esModuleInterop its exports are the default import
+  const actual = await importOriginal<{ default: typeof import('dotenv') }>();
   return {
     default: {
       ...actual.default,
@@ -48,6 +48,11 @@ describe('Environment Configuration Tests', () => {
     DB_NAME: 'db',
   };
 
+  // process.exit throws instead of exiting, so a test can observe a fatal
+  // startup error; what was printed before it is on errorSpy.
+  let exitSpy: MockInstance;
+  let errorSpy: MockInstance;
+
   beforeEach(() => {
     // Clear relevant environment variables before each test
     delete process.env.DB_TYPE;
@@ -59,12 +64,18 @@ describe('Environment Configuration Tests', () => {
     delete process.env.DSN;
     delete process.env.ID;
     process.argv = ['node', 'script.js'];
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit: ${code}`);
+    }) as never);
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
   afterEach(() => {
     // Restore original environment
     process.env = { ...originalEnv };
     process.argv = originalArgv;
+    exitSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
   describe('buildDSNFromEnvParams', () => {
@@ -76,6 +87,7 @@ describe('Environment Configuration Tests', () => {
       ['mariadb', 'mariadb', 3306],
       ['sqlserver', 'sqlserver', 1433],
       ['oracle', 'oracle', 1521],
+      ['clickhouse', 'clickhouse', 8123],
     ])(
       'should build DB_TYPE=%s as a %s:// DSN with default port %i when DB_PORT is not set',
       (type, protocol, port) => {
@@ -98,16 +110,20 @@ describe('Environment Configuration Tests', () => {
       expect(result?.dsn).toBe('postgres://user:pass@localhost:9999/db');
     });
 
-    it('should build SQLite DSN with only DB_TYPE and DB_NAME', () => {
-      process.env.DB_TYPE = 'sqlite';
-      process.env.DB_NAME = '/path/to/database.db';
+    it.each([
+      ['with only DB_TYPE and DB_NAME', { DB_NAME: '/path/to/database.db' }, 'sqlite:///path/to/database.db'],
+      ['with special characters in the file path', { DB_NAME: '/tmp/test_db@#$.db' }, 'sqlite:///tmp/test_db@#$.db'],
+      // An inherited DB_PORT used to skip the SQLite branch and produce
+      // `sqlite://user:pass@host:5432/shop.db`.
+      [
+        'ignoring DB_HOST, DB_PORT and credentials left in the environment',
+        { DB_NAME: '/path/to/database.db', DB_HOST: 'localhost', DB_PORT: '5432', DB_USER: 'postgres', DB_PASSWORD: 'secret' },
+        'sqlite:///path/to/database.db',
+      ],
+    ])('should build SQLite DSN %s', (_label, env, dsn) => {
+      Object.assign(process.env, { DB_TYPE: 'sqlite' }, env);
 
-      const result = buildDSNFromEnvParams();
-
-      expect(result).toEqual({
-        dsn: 'sqlite:///path/to/database.db',
-        source: 'individual environment variables'
-      });
+      expect(buildDSNFromEnvParams()).toEqual({ dsn, source: 'individual environment variables' });
     });
 
     it('should resolve a relative SQLite DB_NAME against the working directory', () => {
@@ -118,31 +134,6 @@ describe('Environment Configuration Tests', () => {
 
       // Was `sqlite:///data/app.db`, i.e. /data/app.db at the filesystem root
       expect(result?.dsn).toBe(buildSqliteDSN(path.resolve(process.cwd(), 'data', 'app.db')));
-    });
-
-    it('should ignore DB_HOST, DB_PORT and credentials left in the environment for SQLite', () => {
-      // An inherited DB_PORT used to skip the SQLite branch and produce
-      // `sqlite://user:pass@host:5432/shop.db`.
-      process.env.DB_TYPE = 'sqlite';
-      process.env.DB_NAME = '/path/to/database.db';
-      process.env.DB_HOST = 'localhost';
-      process.env.DB_PORT = '5432';
-      process.env.DB_USER = 'postgres';
-      process.env.DB_PASSWORD = 'secret';
-
-      expect(buildDSNFromEnvParams()?.dsn).toBe('sqlite:///path/to/database.db');
-    });
-
-    it('should handle SQLite with special characters in file path', () => {
-      process.env.DB_TYPE = 'sqlite';
-      process.env.DB_NAME = '/tmp/test_db@#$.db';
-
-      const result = buildDSNFromEnvParams();
-
-      expect(result).toEqual({
-        dsn: 'sqlite:///tmp/test_db@#$.db',
-        source: 'individual environment variables'
-      });
     });
 
     it.each([
@@ -179,7 +170,7 @@ describe('Environment Configuration Tests', () => {
       Object.assign(process.env, baseEnv, { DB_TYPE: 'db2' });
 
       expect(() => buildDSNFromEnvParams()).toThrow(
-        'Unsupported DB_TYPE: db2. Supported types: postgres, postgresql, mysql, mariadb, sqlserver, sqlite, oracle'
+        'Unsupported DB_TYPE: db2. Supported types: postgres, postgresql, mysql, mariadb, sqlserver, sqlite, oracle, clickhouse'
       );
     });
   });
@@ -251,6 +242,67 @@ describe('Environment Configuration Tests', () => {
     });
   });
 
+  describe('resolveSourceConfigs with an SSH tunnel', () => {
+    const sshArgs = [
+      '--dsn=postgres://user:pass@db.internal:5432/app',
+      '--ssh-host=target.internal',
+      '--ssh-user=ubuntu',
+      '--ssh-password=secret',
+    ];
+
+    it('should carry --ssh-proxy-jump onto the source', async () => {
+      process.argv = ['node', 'script.js', ...sshArgs, '--ssh-proxy-jump=bastion.example.com'];
+
+      const result = await resolveSourceConfigs();
+
+      expect(result!.sources[0]).toMatchObject({
+        ssh_host: 'target.internal',
+        ssh_proxy_jump: 'bastion.example.com',
+      });
+    });
+
+    it('should carry SSH_PROXY_JUMP onto the source', async () => {
+      process.argv = ['node', 'script.js', ...sshArgs];
+      process.env.SSH_PROXY_JUMP = 'jump1.example.com,admin@jump2.example.com:2222';
+
+      const result = await resolveSourceConfigs();
+
+      expect(result!.sources[0].ssh_proxy_jump).toBe('jump1.example.com,admin@jump2.example.com:2222');
+    });
+  });
+
+  describe('removed READONLY / MAX_ROWS settings', () => {
+    it.each([
+      ['READONLY', 'true', 'readonly = true'],
+      ['READONLY', 'false', 'readonly = true'],
+      ['MAX_ROWS', '100', 'max_rows = 1000'],
+    ])('should reject an exported %s=%s even when no .env file is loaded', async (name, value, tomlLine) => {
+      // --dsn resolves the source before any .env file is looked for, which
+      // used to skip the check and start the server writable.
+      process.argv = ['node', 'script.js', '--dsn=sqlite:///:memory:'];
+      process.env[name] = value;
+
+      await expect(resolveSourceConfigs()).rejects.toThrow('process.exit: 1');
+
+      const output = errorSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+      expect(output).toContain(`${name} environment variable is no longer supported`);
+      expect(output).toContain(tomlLine);
+    });
+
+    it.each([
+      ['--readonly', '--readonly flag', 'readonly = true'],
+      ['--max-rows=100', '--max-rows flag', 'max_rows = 1000'],
+    ])('should reject the %s flag', async (flag, label, tomlLine) => {
+      process.argv = ['node', 'script.js', '--dsn=sqlite:///:memory:', flag];
+
+      await expect(resolveSourceConfigs()).rejects.toThrow('process.exit: 1');
+
+      const output = errorSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+      expect(output).toContain(`${label} is no longer supported`);
+      expect(output).toContain(tomlLine);
+    });
+  });
+
   describe('resolveSourceConfigs with a SQLite DSN', () => {
     it.each([
       ['sqlite:///./shop.db'],
@@ -286,36 +338,16 @@ describe('Environment Configuration Tests', () => {
     });
   });
 
-  describe('redactDSN', () => {
-    // redactDSN delegates to obfuscateDSNPassword; its edge cases are covered
-    // in src/utils/__tests__/dsn-obfuscate.test.ts.
-    it('should replace the password with asterisks', () => {
-      const result = redactDSN('postgres://user:hunter2@localhost:5432/db');
-      expect(result).not.toContain('hunter2');
-      expect(result).toMatch(/^postgres:\/\/user:\*+@localhost:5432\/db$/);
-    });
-  });
-
   describe('resolveId', () => {
     it('should return null when ID is not provided', () => {
-      const result = resolveId();
-
-      expect(result).toBeNull();
+      expect(resolveId()).toBeNull();
     });
 
-    it.each(['prod', 'staging-db-01', '123'])(
-      'should resolve ID %j from environment variable',
-      (id) => {
-        process.env.ID = id;
+    it('should resolve ID from environment variable', () => {
+      process.env.ID = 'staging-db-01';
 
-        const result = resolveId();
-
-        expect(result).toEqual({
-          id,
-          source: 'environment variable'
-        });
-      }
-    );
+      expect(resolveId()).toEqual({ id: 'staging-db-01', source: 'environment variable' });
+    });
   });
 
   describe('resolveHost', () => {
@@ -356,21 +388,6 @@ describe('Environment Configuration Tests', () => {
     });
 
     describe('--host requires a value', () => {
-      let exitSpy: ReturnType<typeof vi.spyOn>;
-      let errorSpy: ReturnType<typeof vi.spyOn>;
-
-      beforeEach(() => {
-        exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
-          throw new Error(`process.exit: ${code}`);
-        }) as never);
-        errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-      });
-
-      afterEach(() => {
-        exitSpy.mockRestore();
-        errorSpy.mockRestore();
-      });
-
       it.each([
         ['--host is provided without a value', ['--host']],
         ['--host is followed by another flag', ['--host', '--port=8080']],
@@ -455,11 +472,7 @@ describe('Environment Configuration Tests', () => {
     it('loads .env before TOML config so ${VAR} interpolation can resolve', async () => {
       // interpolateEnvVars() reads process.env, so the file has to be loaded
       // before the TOML is parsed for `dsn = "${DSN}"` to resolve.
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-before-toml-'));
-      const cwd = process.cwd();
-      fs.writeFileSync(path.join(dir, '.env'), 'DSN_FROM_ENV_FILE=sqlite://interpolated.db\n');
-      process.chdir(dir);
-      process.argv = ['node', 'script.js', '--config', path.join(dir, 'dbhub.toml')];
+      fs.writeFileSync(path.join(tempDir, '.env'), 'DSN_FROM_ENV_FILE=sqlite://interpolated.db\n');
       dotenvState.passthrough = true;
 
       // Capture what the env var looked like at the moment the TOML was
@@ -480,9 +493,6 @@ describe('Environment Configuration Tests', () => {
         expect(dsnSeenAtTomlLoadTime).toBe('sqlite://interpolated.db');
       } finally {
         dotenvState.passthrough = false;
-        process.chdir(cwd);
-        delete process.env.DSN_FROM_ENV_FILE;
-        fs.rmSync(dir, { recursive: true, force: true });
       }
     });
   });

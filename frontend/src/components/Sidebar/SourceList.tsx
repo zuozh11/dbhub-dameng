@@ -24,7 +24,7 @@ export default function SourceList({ sources, isLoading }: SourceListProps) {
   if (isLoading) {
     return (
       <div className="px-6 py-3 text-sm text-muted-foreground">
-        Loading sources...
+        Loading sources…
       </div>
     );
   }
@@ -39,8 +39,8 @@ export default function SourceList({ sources, isLoading }: SourceListProps) {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="px-6 py-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-        Data Sources
+      <div className="px-6 py-2 text-caption font-medium text-muted-foreground">
+        Data sources
       </div>
       {sources.map((source) => {
         const isActive = sourceId === source.id;
@@ -58,9 +58,6 @@ export default function SourceList({ sources, isLoading }: SourceListProps) {
             <span className="flex-1 flex items-center gap-1.5 min-w-0">
               <span className="truncate">{source.id}</span>
             </span>
-            {source.is_default && (
-              <span className="text-xs text-muted-foreground">default</span>
-            )}
           </Link>
         );
       })}

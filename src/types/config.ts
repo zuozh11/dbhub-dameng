@@ -2,6 +2,7 @@
  * Configuration types for TOML-based multi-database setup
  */
 
+import type { ConnectorType } from "../connectors/interface.js";
 import type { SessionSettings } from "../utils/session-settings.js";
 
 /**
@@ -36,7 +37,7 @@ export interface SSHConfig {
  * Database connection parameters (alternative to DSN)
  */
 export interface ConnectionParams {
-  type: "postgres" | "mysql" | "mariadb" | "sqlserver" | "sqlite" | "oracle" | "dameng";
+  type: ConnectorType;
   host?: string;
   port?: number;
   database?: string;
@@ -46,7 +47,7 @@ export interface ConnectionParams {
   aws_region?: string; // AWS region required when aws_iam_auth is enabled
   aws_profile?: string; // Named AWS shared-config profile for RDS IAM auth
   instanceName?: string; // SQL Server named instance support
-  sslmode?: "disable" | "require" | "verify-ca" | "verify-full"; // SSL mode for network databases (not SQLite; verify-ca: PostgreSQL only; verify-full: PostgreSQL, SQL Server, Oracle)
+  sslmode?: "disable" | "require" | "verify-ca" | "verify-full"; // SSL mode for network databases (not SQLite; verify-ca: PostgreSQL, MySQL, MariaDB; verify-full: all but SQLite)
   sslrootcert?: string; // CA certificate path (PostgreSQL only; requires verify-ca or verify-full)
   sslcert?: string; // PEM client certificate path for client certificate authentication (PostgreSQL only; requires sslkey and sslmode require/verify-ca/verify-full)
   sslkey?: string; // PEM private key path for sslcert (PostgreSQL only; unencrypted)
@@ -76,7 +77,7 @@ export interface SourceConfig extends ConnectionParams, SSHConfig {
   timezone?: string; // MySQL/MariaDB: how the driver interprets DATETIME values. "Z" (UTC), "local", or "±HH:MM" (e.g., "+09:00")
   charset?: string; // MySQL/MariaDB: connection character set (e.g., "utf8mb4"). May be combined with collation; when both are set, collation takes precedence (it implies its character set).
   collation?: string; // MySQL/MariaDB: connection collation (e.g., "utf8mb4_0900_ai_ci"). Takes precedence over charset when both are set.
-  session?: SessionSettings; // MySQL/PostgreSQL: [sources.session] settings applied to every new connection (e.g., lock_timeout = "5s")
+  session?: SessionSettings; // MySQL/PostgreSQL: [sources.session] settings applied to every new connection (e.g., lock_timeout = "5s"); ClickHouse: sent with every request (e.g., max_rows_to_read = 1000000000)
   /**
    * Internal, not a TOML option: no tool on this SQLite source can write, so
    * its database file must already exist.
@@ -134,7 +135,7 @@ export interface HealthCheckToolConfig {
  * Custom tool configuration
  */
 export interface CustomToolConfig {
-  name: string; // Must not be "execute_sql" or "search_objects"
+  name: string; // Must not be, or start with, a built-in tool name (see ALL_BUILTIN_TOOL_NAMES)
   source: string;
   description: string;
   statement: string;
@@ -152,6 +153,16 @@ export type ToolConfig =
   | ExplainSqlToolConfig
   | HealthCheckToolConfig
   | CustomToolConfig;
+
+/**
+ * A `[[tools]]` entry as read from the config file, before validation has
+ * established what kind of tool it is: any tool-specific field may or may not
+ * be present. Validation reads this view. Once a tool is known to be custom
+ * (isCustomToolConfig in tools/builtin-tools.ts) or a particular built-in
+ * (ToolRegistry.getBuiltinToolConfig), use the precise type instead.
+ */
+export type UnvalidatedToolConfig = Pick<CustomToolConfig, "name" | "source"> &
+  Partial<Omit<CustomToolConfig, "name" | "source">>;
 
 /**
  * Complete TOML configuration file structure

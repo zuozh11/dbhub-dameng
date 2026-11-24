@@ -5,22 +5,15 @@ import {
   ConnectorRegistry,
   DSNParser,
   SQLResult,
-  TableColumn,
-  TableIndex,
-  StoredProcedure,
   ExecuteOptions,
   ConnectorConfig,
-  HealthCheckResult,
 } from "../interface.js";
-import { getMySQLFamilyHealthCheck } from "../mysql-family-health-check.js";
-import * as introspection from "../mysql-family-introspection.js";
+import { MySQLFamilyConnector } from "../mysql-family-connector.js";
 import type { MySQLFamilyQuery } from "../mysql-family-introspection.js";
+import { readMySQLFamilySslMode, type MySQLFamilySslMode } from "../mysql-family-ssl.js";
 import { SafeURL } from "../../utils/safe-url.js";
 import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
 import { requireDatabaseInDSN, MissingDatabaseError } from "../../utils/dsn-database.js";
-import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
-import { parseQueryResultSets } from "../../utils/multi-statement-result-parser.js";
-import { splitSQLStatements } from "../../utils/sql-parser.js";
 import {
   withReadOnlyTransaction,
   MARIADB_READ_ONLY_BACKSTOP,
@@ -33,12 +26,37 @@ import {
 import { closeQuietly } from "../../utils/resource-cleanup.js";
 
 /**
+ * mariadb driver `ssl` option for an sslmode. With certificate verification
+ * on, the driver also checks the host name unless `checkServerIdentity` is
+ * set — so verify-ca supplies a no-op one, and verify-full leaves it unset.
+ * The driver's typings only declare the secure-context half of the TLS
+ * options, hence the cast; it reads `checkServerIdentity` off this object.
+ * A fresh object per call: the driver writes defaults back onto it.
+ */
+function mariadbSslOptions(mode: MySQLFamilySslMode): mariadb.ConnectionConfig["ssl"] {
+  switch (mode) {
+    case "disable":
+      return undefined;
+    case "require":
+      return { rejectUnauthorized: false };
+    case "verify-ca":
+      return {
+        rejectUnauthorized: true,
+        checkServerIdentity: () => undefined,
+      } as mariadb.ConnectionConfig["ssl"];
+    case "verify-full":
+      return { rejectUnauthorized: true };
+  }
+}
+
+/**
  * MariaDB DSN Parser
  * Handles DSN strings like: mariadb://user:password@localhost:3306/dbname?sslmode=require
- * Supported SSL modes:
+ * Supported SSL modes (anything else is rejected):
  * - sslmode=disable: No SSL connection
  * - sslmode=require: SSL connection without certificate verification
- * - Any other value: Standard SSL connection with certificate verification
+ * - sslmode=verify-ca: SSL connection, certificate chain verified
+ * - sslmode=verify-full: verify-ca plus the certificate must match the host name
  */
 class MariadbDSNParser implements DSNParser {
   async parse(dsn: string, config?: ConnectorConfig): Promise<mariadb.ConnectionConfig> {
@@ -93,19 +111,12 @@ class MariadbDSNParser implements DSNParser {
             : {}),
       };
 
-      // Handle query parameters
-      url.forEachSearchParam((value, key) => {
-        if (key === "sslmode") {
-          if (value === "disable") {
-            connectionConfig.ssl = undefined;
-          } else if (value === "require") {
-            connectionConfig.ssl = { rejectUnauthorized: false };
-          } else {
-            connectionConfig.ssl = {};
-          }
-        }
-        // Add other parameters as needed
-      });
+      // Read from the raw DSN: a present-but-empty sslmode must be rejected,
+      // and SafeURL would have dropped it (see readMySQLFamilySslMode)
+      const sslmode = readMySQLFamilySslMode(dsn);
+      if (sslmode !== undefined) {
+        connectionConfig.ssl = mariadbSslOptions(sslmode);
+      }
 
       // Auto-detect AWS IAM authentication tokens and ensure SSL is enabled
       // AWS RDS IAM tokens are ~800+ character strings containing "X-Amz-Credential"
@@ -146,21 +157,15 @@ class MariadbDSNParser implements DSNParser {
 /**
  * MariaDB Connector Implementation
  */
-export class MariaDBConnector implements Connector {
+export class MariaDBConnector extends MySQLFamilyConnector {
   id: ConnectorType = "mariadb";
   name = "MariaDB";
   dsnParser = new MariadbDSNParser();
 
   private pool: mariadb.Pool | null = null;
-  // Source ID is set by ConnectorManager after cloning
-  private sourceId: string = "default";
   // Client-side fallback deadline; the mariadb driver has no client-side
   // timer of its own (see query-timeout.ts).
   private clientQueryTimeoutMs?: number;
-
-  getId(): string {
-    return this.sourceId;
-  }
 
   clone(): Connector {
     return new MariaDBConnector();
@@ -220,57 +225,13 @@ export class MariaDBConnector implements Connector {
    * shared functions never see a missing pool. The mariadb driver already
    * resolves to the rows themselves.
    */
-  private requireQuery(): MySQLFamilyQuery {
+  protected requireQuery(): MySQLFamilyQuery {
     if (!this.pool) {
       throw new Error("Not connected to database");
     }
     const pool = this.pool;
     return (sql, params) =>
       (params === undefined ? pool.query(sql) : pool.query(sql, params)) as Promise<any[]>;
-  }
-
-  async getSchemas(): Promise<string[]> {
-    return introspection.getSchemas(this.requireQuery());
-  }
-
-  async getTables(schema?: string): Promise<string[]> {
-    return introspection.getTables(this.requireQuery(), schema);
-  }
-
-  async getViews(schema?: string): Promise<string[]> {
-    return introspection.getViews(this.requireQuery(), schema);
-  }
-
-  async tableExists(tableName: string, schema?: string): Promise<boolean> {
-    return introspection.tableExists(this.requireQuery(), tableName, schema);
-  }
-
-  async getTableIndexes(tableName: string, schema?: string): Promise<TableIndex[]> {
-    return introspection.getTableIndexes(this.requireQuery(), tableName, schema);
-  }
-
-  async getTableSchema(tableName: string, schema?: string): Promise<TableColumn[]> {
-    return introspection.getTableSchema(this.requireQuery(), tableName, schema);
-  }
-
-  async getTableComment(tableName: string, schema?: string): Promise<string | null> {
-    return introspection.getTableComment(this.requireQuery(), tableName, schema);
-  }
-
-  async getHealthCheck(): Promise<HealthCheckResult> {
-    return getMySQLFamilyHealthCheck(this.requireQuery());
-  }
-
-  async getStoredProcedures(schema?: string, routineType?: "procedure" | "function"): Promise<string[]> {
-    return introspection.getStoredProcedures(this.requireQuery(), schema, routineType);
-  }
-
-  async getStoredProcedureDetail(procedureName: string, schema?: string): Promise<StoredProcedure> {
-    return introspection.getStoredProcedureDetail(this.requireQuery(), procedureName, schema);
-  }
-
-  async getDefaultSchema(): Promise<string | null> {
-    return introspection.getDefaultSchema(this.requireQuery());
   }
 
   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
@@ -289,55 +250,23 @@ export class MariaDBConnector implements Connector {
         conn,
         options.readonly,
         MARIADB_READ_ONLY_BACKSTOP,
-        async () => {
-          // Split up front so the original statement text is available for
-          // attribution below, whether or not maxRows needs to rewrite it.
-          const statements = splitSQLStatements(sql, "mariadb");
-          let processedSQL = sql;
-          // Per-statement truncation-probe flags, index-aligned with `statements`
-          let probes: boolean[] = [];
-          if (options.maxRows) {
-            const rewrites = statements.map(statement =>
-              SQLRowLimiter.applyMaxRowsWithTruncationProbe(statement, options.maxRows, "mariadb")
-            );
-            probes = rewrites.map(rewrite => rewrite.probeApplied);
-
-            processedSQL = rewrites.map(rewrite => rewrite.sql).join('; ');
-            if (sql.trim().endsWith(';')) {
-              processedSQL += ';';
-            }
-          }
-
-          // Use dedicated connection. Rows are fetched positionally
-          // (rowsAsArray) with the column metadata alongside (metaAsArray:
-          // `[rows, meta]`, per statement for a batch) and rebuilt by
-          // parseQueryResultSets, so a result with repeated column names
-          // keeps every column (bytebase/dbhub#484).
-          // Pass parameters if provided
-          // Bounded by the client-side fallback deadline, which trails the
-          // server-side max_statement_time (see query-timeout.ts).
-          const queryOptions = { sql: processedSQL, rowsAsArray: true, metaAsArray: true };
-          const [results, meta]: [any, any] = await withClientQueryDeadline(
-            parameters && parameters.length > 0
-              ? conn.query(queryOptions, parameters)
-              : conn.query(queryOptions),
-            this.clientQueryTimeoutMs
-          );
-
-          // Parse results using shared utility that handles both single and multi-statement queries
-          const resultSets = parseQueryResultSets(results, statements, meta);
-
-          // Result sets are per statement in source order, so a length match
-          // means the pairing with the probe flags is exact (same reasoning as
-          // the sql attribution inside parseQueryResultSets).
-          if (resultSets.length === probes.length) {
-            resultSets.forEach((set, index) =>
-              SQLRowLimiter.flagTruncation(set, options.maxRows, probes[index])
-            );
-          }
-
-          return { resultSets };
-        }
+        () =>
+          this.executeStatements(sql, options, (processedSQL) => {
+            // Use dedicated connection. Rows are fetched positionally
+            // (rowsAsArray) with the column metadata alongside (metaAsArray:
+            // `[rows, meta]`, per statement for a batch), which is what
+            // executeStatements expects.
+            // Pass parameters if provided
+            // Bounded by the client-side fallback deadline, which trails the
+            // server-side max_statement_time (see query-timeout.ts).
+            const queryOptions = { sql: processedSQL, rowsAsArray: true, metaAsArray: true };
+            return withClientQueryDeadline(
+              parameters && parameters.length > 0
+                ? conn.query(queryOptions, parameters)
+                : conn.query(queryOptions),
+              this.clientQueryTimeoutMs
+            ) as Promise<[any, any]>;
+          })
       );
     } catch (error) {
       if (isClientSideTimeout(error)) {

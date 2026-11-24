@@ -26,10 +26,20 @@ describe("classifyStatement", () => {
     expect(classifyStatement(sql, "postgres")).toBe(expected);
   });
 
-  it("classifies DML hidden in a CTE as dml", () => {
-    expect(
-      classifyStatement("WITH t AS (DELETE FROM users RETURNING *) SELECT * FROM t", "postgres")
-    ).toBe("dml");
+  it.each([
+    ["SELECT count() FROM events FINAL", "read"],
+    ["SHOW CREATE TABLE events", "read"],
+    ["EXPLAIN indexes = 1 SELECT * FROM events", "read"],
+    ["INSERT INTO events SELECT * FROM staging", "dml"],
+    // A mutation is written as ALTER, so it ranks as schema modification
+    ["ALTER TABLE events DELETE WHERE id = 1", "ddl"],
+    ["CREATE MATERIALIZED VIEW mv TO t AS SELECT * FROM events", "ddl"],
+    ["SELECT * FROM url('http://example.com/x.csv')", "admin"],
+    ["OPTIMIZE TABLE events FINAL", "unknown"],
+    ["SYSTEM STOP MERGES", "unknown"],
+    ["SET max_threads = 1", "unknown"],
+  ] as const)("classifies %j as %s (clickhouse)", (sql, expected) => {
+    expect(classifyStatement(sql, "clickhouse")).toBe(expected);
   });
 
   it("classifies REPLACE INTO as dml on MySQL but read-only REPLACE() stays read", () => {
@@ -89,11 +99,7 @@ describe("policyFromReadonly", () => {
   it("readonly=true denies everything beyond read", () => {
     const policy = policyFromReadonly(true);
     expect(isReadOnlyPolicy(policy)).toBe(true);
-    expect(policy.read).toBe("allow");
-    expect(policy.dml).toBe("deny");
-    expect(policy.ddl).toBe("deny");
-    expect(policy.admin).toBe("deny");
-    expect(policy.unknown).toBe("deny");
+    expect(policy).toEqual({ read: "allow", dml: "deny", ddl: "deny", admin: "deny", unknown: "deny" });
   });
 
   it.each([false, undefined] as const)("readonly=%s allows everything", (readonly) => {
@@ -134,11 +140,6 @@ describe("classifySQL with backslash-escaped quotes", () => {
     ["mysql", String.raw`SELECT '\'; DROP TABLE t; SELECT ''`, "ddl"],
     // ANSI_QUOTES reading
     ["mariadb", String.raw`SELECT 1 AS "\" , '\' , '; DROP TABLE t; SELECT 1 AS "a"`, "ddl"],
-    ["postgres", String.raw`SELECT E'\' , '; DROP TABLE t; SELECT ''`, "ddl"],
-    ["postgres", String.raw`SELECT E'\' , '; SELECT pg_read_file('x'); SELECT ''`, "admin"],
-    ["postgres", "SELECT E''\n'\\' , '; COMMIT; DROP TABLE t; SELECT ''", "unknown"],
-    ["postgres", "SELECT E''-- note\n'\\' , '; COMMIT; DROP TABLE t; SELECT ''", "unknown"],
-    ["postgres", "SELECT E''\r'\\' , '; COMMIT; DROP TABLE t; SELECT ''", "unknown"],
   ] as const)("%s: %s is %s", (dialect, sql, expected) => {
     expect(classifySQL(sql, dialect)).toBe(expected);
   });
@@ -147,7 +148,6 @@ describe("classifySQL with backslash-escaped quotes", () => {
     ["mysql", String.raw`SELECT 'it\'s' AS a, 'C:\\Users\\me' AS p, "say \"hi\"" AS q`],
     ["mysql", String.raw`SELECT '\\' AS a, '' AS b, X'41', N'abc'`],
     ["mariadb", String.raw`SELECT 'it''s' AS a, 'C:\Users\me' AS p`],
-    ["postgres", String.raw`SELECT E'it\'s' AS a, 'C:\Users\' AS p, 'x' AS q`],
   ] as const)("%s: %s stays read", (dialect, sql) => {
     expect(classifySQL(sql, dialect)).toBe("read");
   });

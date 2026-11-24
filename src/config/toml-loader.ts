@@ -1,11 +1,16 @@
 import fs from "fs";
 import path from "path";
-import { homedir } from "os";
 import toml from "@iarna/toml";
-import type { SourceConfig, TomlConfig, ToolConfig } from "../types/config.js";
+import type { SourceConfig, TomlConfig, UnvalidatedToolConfig } from "../types/config.js";
 import { parseCommandLineArgs, requireFlagValue } from "./env.js";
-import { parseConnectionInfoFromDSN, getDefaultPortForType } from "../utils/dsn-obfuscate.js";
+import {
+  parseConnectionInfoFromDSN,
+  getDefaultPortForType,
+  protocolToConnectorType,
+  supportedDatabaseProtocols,
+} from "../utils/dsn-obfuscate.js";
 import { SafeURL } from "../utils/safe-url.js";
+import { expandHomeDir } from "../utils/home-dir.js";
 import {
   SQLITE_DSN_PREFIX,
   SQLITE_MEMORY_PATH,
@@ -15,8 +20,8 @@ import {
   resolveSqliteFilePath,
 } from "../utils/sqlite-dsn.js";
 import { MAX_QUERY_TIMEOUT_SECONDS } from "../utils/query-timeout.js";
-import { validateSessionSettings } from "../utils/session-settings.js";
-import { BUILTIN_TOOL_EXECUTE_SQL, BUILTIN_TOOL_SEARCH_OBJECTS, ALL_BUILTIN_TOOL_NAMES, toolsAreReadOnly } from "../tools/builtin-tools.js";
+import { supportsSessionSettings, validateSessionSettings } from "../utils/session-settings.js";
+import { BUILTIN_TOOL_EXECUTE_SQL, isBuiltinToolName, toolsAreReadOnly } from "../tools/builtin-tools.js";
 
 /**
  * Load and parse TOML configuration file
@@ -181,7 +186,7 @@ function validateTomlConfig(config: TomlConfig, configPath: string): void {
  * Validate tools configuration
  */
 function validateToolsConfig(
-  tools: ToolConfig[],
+  tools: UnvalidatedToolConfig[],
   sources: SourceConfig[],
   configPath: string
 ): void {
@@ -218,7 +223,7 @@ function validateToolsConfig(
     }
 
     // Validate based on tool type (built-in vs custom)
-    const isBuiltin = (ALL_BUILTIN_TOOL_NAMES as readonly string[]).includes(tool.name);
+    const isBuiltin = isBuiltinToolName(tool.name);
     const isExecuteSql = tool.name === BUILTIN_TOOL_EXECUTE_SQL;
 
     if (isBuiltin) {
@@ -562,14 +567,12 @@ function validateSourceConfig(source: SourceConfig, configPath: string): void {
   }
 
   // Validate type if provided
-  if (source.type) {
-    const validTypes = ["postgres", "mysql", "mariadb", "sqlserver", "sqlite", "oracle", "dameng"];
-    if (!validTypes.includes(source.type)) {
-      throw new Error(
-        `Configuration file ${configPath}: source '${source.id}' has invalid type '${source.type}'. ` +
-          `Valid types: ${validTypes.join(", ")}`
-      );
-    }
+  if (source.type && protocolToConnectorType(source.type) !== source.type) {
+    const validTypes = supportedDatabaseProtocols.filter((type) => protocolToConnectorType(type) === type);
+    throw new Error(
+      `Configuration file ${configPath}: source '${source.id}' has invalid type '${source.type}'. ` +
+        `Valid types: ${validTypes.join(", ")}`
+    );
   }
 
   // Validate AWS IAM auth fields
@@ -716,12 +719,15 @@ function validateSourceConfig(source: SourceConfig, configPath: string): void {
       );
     }
 
-    // verify-ca is PostgreSQL-only; SQL Server and Oracle also support
-    // verify-full for server certificate and hostname verification.
+    // verify-ca (chain only) is PostgreSQL, MySQL and MariaDB; SQL Server,
+    // Oracle and ClickHouse only offer verify-full (server certificate and hostname).
     const verifyModesByType: Record<string, string[]> = {
       postgres: ["verify-ca", "verify-full"],
+      mysql: ["verify-ca", "verify-full"],
+      mariadb: ["verify-ca", "verify-full"],
       sqlserver: ["verify-full"],
       oracle: ["verify-full"],
+      clickhouse: ["verify-full"],
     };
     if (
       (source.sslmode === "verify-ca" || source.sslmode === "verify-full") &&
@@ -978,11 +984,11 @@ function validateSourceConfig(source: SourceConfig, configPath: string): void {
     }
   }
 
-  // Validate [sources.session] (MySQL/PostgreSQL only)
+  // Validate [sources.session] (MySQL/PostgreSQL/ClickHouse only)
   if (source.session !== undefined) {
-    if (source.type !== "mysql" && source.type !== "postgres") {
+    if (!supportsSessionSettings(source.type)) {
       throw new Error(
-        `Configuration file ${configPath}: source '${source.id}' has [sources.session] but it is only supported for MySQL and PostgreSQL sources.`
+        `Configuration file ${configPath}: source '${source.id}' has [sources.session] but it is only supported for MySQL, PostgreSQL and ClickHouse sources.`
       );
     }
     const problem = validateSessionSettings(source.session, source.type);
@@ -1185,16 +1191,6 @@ export function interpolateEnvVars(value: unknown): unknown {
 }
 
 /**
- * Expand ~ to home directory in paths
- */
-function expandHomeDir(filePath: string): string {
-  if (filePath.startsWith("~/")) {
-    return path.join(homedir(), filePath.substring(2));
-  }
-  return filePath;
-}
-
-/**
  * Merge "dual-home" fields (those that can be expressed either as a TOML field
  * or as a DSN query parameter) into an existing DSN. Only appends a param when
  * the DSN does not already specify it; conflicting values are rejected earlier
@@ -1353,9 +1349,11 @@ export function buildDSNFromSource(source: SourceConfig): string {
   const isAwsIamPasswordless =
     source.aws_iam_auth === true &&
     ["postgres", "mysql", "mariadb"].includes(source.type);
+  // ClickHouse's `default` user has no password out of the box.
   const passwordRequired =
     source.authentication !== "azure-active-directory-access-token" &&
-    !isAwsIamPasswordless;
+    !isAwsIamPasswordless &&
+    source.type !== "clickhouse";
   if (!source.host || !source.user || !source.database) {
     throw new Error(
       `Source '${source.id}': missing required connection parameters. ` +
@@ -1365,13 +1363,13 @@ export function buildDSNFromSource(source: SourceConfig): string {
   if (passwordRequired && !source.password) {
     throw new Error(
       `Source '${source.id}': password is required. ` +
-        `(Password is optional for azure-active-directory-access-token authentication ` +
-        `or when aws_iam_auth=true)`
+        `(Password is optional for azure-active-directory-access-token authentication, ` +
+        `when aws_iam_auth=true, or for ClickHouse)`
     );
   }
 
   // Determine default port if not specified
-  const port = source.port || getDefaultPortForType(source.type);
+  const port = source.port || getDefaultPortForType(source.type, source.sslmode);
 
   if (!port) {
     throw new Error(`Source '${source.id}': unable to determine port`);

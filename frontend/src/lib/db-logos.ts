@@ -1,18 +1,20 @@
 import type { DatabaseType } from '../types/datasource';
+import DamengLogo from '../assets/logos/dameng.svg';
 import PostgresLogo from '../assets/logos/postgres.svg';
 import MySQLLogo from '../assets/logos/mysql.svg';
 import MariaDBLogo from '../assets/logos/mariadb.svg';
 import SQLServerLogo from '../assets/logos/sqlserver.svg';
 import SQLiteLogo from '../assets/logos/sqlite.svg';
 import OracleLogo from '../assets/logos/oracle.svg';
-import DamengLogo from '../assets/logos/dameng.svg';
+import ClickHouseLogo from '../assets/logos/clickhouse.svg';
 
 export const DB_LOGOS: Record<DatabaseType, string> = {
+  dameng: DamengLogo,
   postgres: PostgresLogo,
   mysql: MySQLLogo,
   mariadb: MariaDBLogo,
   sqlserver: SQLServerLogo,
   sqlite: SQLiteLogo,
   oracle: OracleLogo,
-  dameng: DamengLogo,
+  clickhouse: ClickHouseLogo,
 };

@@ -36,13 +36,16 @@ const NETWORK_CODES_BY_TYPE: Partial<Record<ConnectorType, ReadonlySet<string>>>
 
 // Per-connector authentication failure signals. Keyed by code or errno.
 const AUTH_CODES: Record<ConnectorType, ReadonlyArray<string | number>> = {
+  dameng: [-2501], // Invalid username or password
   postgres: ["28P01", "28000"],
   mysql: ["ER_ACCESS_DENIED_ERROR", 1045, 1698],
   mariadb: ["ER_ACCESS_DENIED_ERROR", 1045, 1698],
   sqlserver: ["ELOGIN"],
   // ORA-01017: invalid username/password; ORA-28000: account locked
   oracle: ["ORA-01017", "ORA-28000"],
-  dameng: [-2501], // Invalid username or password
+  // 516 AUTHENTICATION_FAILED; older servers: 192 UNKNOWN_USER, 193 WRONG_PASSWORD,
+  // 194 REQUIRED_PASSWORD. The client reports the code as a string.
+  clickhouse: ["516", "192", "193", "194"],
   sqlite: [], // no network/auth layer
 };
 

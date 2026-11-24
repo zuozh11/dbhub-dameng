@@ -1,14 +1,19 @@
-import { Connector, ConnectorType, ConnectorRegistry, ExecuteOptions, ConnectorConfig } from "./interface.js";
+import { Connector, ConnectorRegistry, ConnectorConfig } from "./interface.js";
 import { SSHTunnel } from "../utils/ssh-tunnel.js";
 import type { SSHTunnelConfig, SSHTunnelInfo } from "../types/ssh.js";
 import type { SourceConfig } from "../types/config.js";
 import { buildDSNFromSource } from "../config/toml-loader.js";
-import { getDatabaseTypeFromDSN, getDefaultPortForType } from "../utils/dsn-obfuscate.js";
-import { redactDSN } from "../config/env.js";
-import { SafeURL } from "../utils/safe-url.js";
+import {
+  getDatabaseTypeFromDSN,
+  getDefaultPortForType,
+  obfuscateDSNPassword,
+} from "../utils/dsn-obfuscate.js";
+import { SafeURL, rawQueryParamValues, replaceDSNHostPort } from "../utils/safe-url.js";
 import { generateRdsAuthToken } from "../utils/aws-rds-signer.js";
 import { parseSSHConfig, looksLikeSSHAlias, getDefaultSSHConfigPath, resolveJumpHosts } from "../utils/ssh-config-parser.js";
 import { TUNNEL_ERROR_MARKER } from "../utils/error-classifier.js";
+import { getMissingDriverHint } from "../utils/module-loader.js";
+import { assertPostgresParserLoaded } from "../utils/postgres-sql.js";
 
 // Singleton instance for global access
 let managerInstance: ConnectorManager | null = null;
@@ -51,6 +56,7 @@ export class ConnectorManager {
     if (sources.length === 0) {
       throw new Error("No sources provided");
     }
+    this.assertPostgresParserFor(sources);
 
     const eagerSources = sources.filter(s => !s.lazy);
     const lazySources = sources.filter(s => s.lazy);
@@ -71,6 +77,21 @@ export class ConnectorManager {
   }
 
   /**
+   * A PostgreSQL source needs the SQL parser its read-only classifier runs on.
+   * Checked when sources are registered, lazy ones included and before any of
+   * them connects, so a parser that failed to load stops startup (or the
+   * reload adding the source) instead of failing that source's first query.
+   */
+  private assertPostgresParserFor(sources: SourceConfig[]): void {
+    const hasPostgres = sources.some(
+      (source) => getDatabaseTypeFromDSN(buildDSNFromSource(source)) === "postgres"
+    );
+    if (hasPostgres) {
+      assertPostgresParserLoaded();
+    }
+  }
+
+  /**
    * Register a lazy source without establishing connection
    * Connection will be established on first use via ensureConnected()
    */
@@ -78,7 +99,7 @@ export class ConnectorManager {
     const sourceId = source.id;
     const dsn = buildDSNFromSource(source);
 
-    console.error(`  - ${sourceId}: ${redactDSN(dsn)} (lazy, will connect on first use)`);
+    console.error(`  - ${sourceId}: ${obfuscateDSNPassword(dsn)} (lazy, will connect on first use)`);
 
     // Store config for later connection
     this.lazySources.set(sourceId, source);
@@ -151,7 +172,7 @@ export class ConnectorManager {
     const config: ConnectorConfig = {};
     // Build DSN from source config
     const dsn = await this.buildConnectionDSN(source, config);
-    console.error(`  - ${sourceId}: ${redactDSN(dsn)}`);
+    console.error(`  - ${sourceId}: ${obfuscateDSNPassword(dsn)}`);
 
     // Setup SSH tunnel if needed
     let actualDSN = dsn;
@@ -215,9 +236,12 @@ export class ConnectorManager {
       }
 
       // Parse DSN to get target host and port
-      const url = new URL(dsn);
+      // SafeURL, like every other DSN consumer: the WHATWG URL parser rejects
+      // DSNs whose password carries raw special characters (e.g. '#'), so a DSN
+      // that connects directly would otherwise fail only once a tunnel is added.
+      const url = new SafeURL(dsn);
       const targetHost = url.hostname;
-      const targetPort = parseInt(url.port) || this.getDefaultPort(dsn);
+      const targetPort = parseInt(url.port, 10) || this.getDefaultPort(dsn);
 
       // Create and establish SSH tunnel
       tunnel = new SSHTunnel();
@@ -235,9 +259,7 @@ export class ConnectorManager {
       }
 
       // Update DSN to use local tunnel endpoint
-      url.hostname = "127.0.0.1";
-      url.port = tunnelInfo.localPort.toString();
-      actualDSN = url.toString();
+      actualDSN = replaceDSNHostPort(dsn, "127.0.0.1", tunnelInfo.localPort);
 
       // Store tunnel for later cleanup
       this.sshTunnels.set(sourceId, tunnel);
@@ -257,8 +279,10 @@ export class ConnectorManager {
       // Find connector prototype for this DSN
       const connectorPrototype = ConnectorRegistry.getConnectorForDSN(actualDSN);
       if (!connectorPrototype) {
+        const hint = getMissingDriverHint(actualDSN);
         throw new Error(
-          `Source '${sourceId}': No connector found for DSN: ${actualDSN}`
+          `Source '${sourceId}': No connector found for DSN: ${obfuscateDSNPassword(actualDSN)}` +
+            (hint ? `. ${hint}` : "")
         );
       }
 
@@ -273,7 +297,7 @@ export class ConnectorManager {
       if (source.connection_timeout !== undefined) {
         config.connectionTimeoutSeconds = source.connection_timeout;
       }
-      // Query timeout is supported by PostgreSQL, MySQL, MariaDB, SQL Server (not SQLite)
+      // Query timeout is supported by every network database (not SQLite)
       if (source.query_timeout !== undefined && connector.id !== 'sqlite') {
         config.queryTimeoutSeconds = source.query_timeout;
       }
@@ -305,7 +329,7 @@ export class ConnectorManager {
       if (source.collation) {
         config.collation = source.collation;
       }
-      // Pass [sources.session] settings for MySQL/PostgreSQL
+      // Pass [sources.session] settings for MySQL/PostgreSQL/ClickHouse
       if (source.session) {
         config.sessionSettings = source.session;
       }
@@ -350,6 +374,7 @@ export class ConnectorManager {
     if (this.sourceIds.includes(source.id)) {
       throw new Error(`Source '${source.id}' already exists`);
     }
+    this.assertPostgresParserFor([source]);
     if (source.lazy) {
       this.registerLazySource(source);
     } else {
@@ -484,20 +509,6 @@ export class ConnectorManager {
   }
 
   /**
-   * Get all available connector types
-   */
-  static getAvailableConnectors(): ConnectorType[] {
-    return ConnectorRegistry.getAvailableConnectors();
-  }
-
-  /**
-   * Get sample DSNs for all available connectors
-   */
-  static getAllSampleDSNs(): { [key in ConnectorType]?: string } {
-    return ConnectorRegistry.getAllSampleDSNs();
-  }
-
-  /**
    * Get the current active connector instance
    * This is used by resource and tool handlers
    * @param sourceId - Optional source ID. If not provided, returns default (first) connector
@@ -581,7 +592,9 @@ export class ConnectorManager {
     if (!type) {
       return 0;
     }
-    return getDefaultPortForType(type) ?? 0;
+    // ClickHouse's default port depends on whether the DSN asks for TLS.
+    const sslmode = type === "clickhouse" ? rawQueryParamValues(dsn, "sslmode").at(-1) : undefined;
+    return getDefaultPortForType(type, sslmode) ?? 0;
   }
 
   private scheduleIamRefresh(source: SourceConfig): void {

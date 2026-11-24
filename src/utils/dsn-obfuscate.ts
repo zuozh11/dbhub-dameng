@@ -1,4 +1,3 @@
-import type { SSHTunnelConfig } from '../types/ssh.js';
 import type { ConnectorType } from '../connectors/interface.js';
 import { SafeURL } from './safe-url.js';
 import { parseSqliteDsnPath } from './sqlite-dsn.js';
@@ -192,33 +191,6 @@ export function obfuscateDSNPassword(dsn: string): string {
 }
 
 /**
- * Obfuscates sensitive information in SSH configuration for logging
- * @param config The SSH tunnel configuration
- * @returns SSH config with sensitive data replaced by asterisks
- */
-export function obfuscateSSHConfig(config: SSHTunnelConfig): Partial<SSHTunnelConfig> {
-  const obfuscated: Partial<SSHTunnelConfig> = {
-    host: config.host,
-    port: config.port,
-    username: config.username,
-  };
-  
-  if (config.password) {
-    obfuscated.password = '*'.repeat(8);
-  }
-  
-  if (config.privateKey) {
-    obfuscated.privateKey = config.privateKey; // Keep path as-is
-  }
-  
-  if (config.passphrase) {
-    obfuscated.passphrase = '*'.repeat(8);
-  }
-  
-  return obfuscated;
-}
-
-/**
  * Extracts the database type from a DSN string
  * @param dsn The DSN string to analyze
  * @returns The database type or undefined if cannot be determined
@@ -232,29 +204,32 @@ export function getDatabaseTypeFromDSN(dsn: string): ConnectorType | undefined {
   return protocolToConnectorType(protocol);
 }
 
-/**
- * Maps a protocol string to a ConnectorType
- */
-function protocolToConnectorType(protocol: string): ConnectorType | undefined {
-  const mapping: Record<string, ConnectorType> = {
-    'dameng': 'dameng',
-    'postgres': 'postgres',
-    'postgresql': 'postgres',
-    'mysql': 'mysql',
-    'mariadb': 'mariadb',
-    'sqlserver': 'sqlserver',
-    'sqlite': 'sqlite',
-    'oracle': 'oracle'
-  };
-  return mapping[protocol];
+const protocolTypes: Readonly<Record<string, ConnectorType>> = {
+  postgres: 'postgres',
+  postgresql: 'postgres',
+  mysql: 'mysql',
+  mariadb: 'mariadb',
+  sqlserver: 'sqlserver',
+  sqlite: 'sqlite',
+  oracle: 'oracle',
+  clickhouse: 'clickhouse',
+  dameng: 'dameng',
+};
+
+export const supportedDatabaseProtocols: readonly string[] = Object.keys(protocolTypes);
+
+export function protocolToConnectorType(protocol: string): ConnectorType | undefined {
+  return Object.prototype.hasOwnProperty.call(protocolTypes, protocol) ? protocolTypes[protocol] : undefined;
 }
 
 /**
  * Get the default port for a database type
  * @param type The database connector type
+ * @param sslmode The source's sslmode, for the one type whose port depends on it:
+ *   ClickHouse serves HTTP on 8123 and HTTPS on 8443
  * @returns The default port or undefined for SQLite
  */
-export function getDefaultPortForType(type: ConnectorType): number | undefined {
+export function getDefaultPortForType(type: ConnectorType, sslmode?: string): number | undefined {
   const ports: Record<ConnectorType, number | undefined> = {
     'dameng': 5236,
     'postgres': 5432,
@@ -262,6 +237,7 @@ export function getDefaultPortForType(type: ConnectorType): number | undefined {
     'mariadb': 3306,
     'sqlserver': 1433,
     'oracle': 1521,
+    'clickhouse': sslmode === 'require' || sslmode === 'verify-full' ? 8443 : 8123,
     'sqlite': undefined,
   };
   return ports[type];

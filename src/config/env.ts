@@ -7,13 +7,67 @@ import type { SSHTunnelConfig } from "../types/ssh.js";
 import { parseSSHConfig, looksLikeSSHAlias, getDefaultSSHConfigPath } from "../utils/ssh-config-parser.js";
 import type { SourceConfig } from "../types/config.js";
 import { loadTomlConfig } from "./toml-loader.js";
-import { obfuscateDSNPassword, parseConnectionInfoFromDSN } from "../utils/dsn-obfuscate.js";
+import {
+  getDefaultPortForType,
+  obfuscateDSNPassword,
+  parseConnectionInfoFromDSN,
+  protocolToConnectorType,
+  supportedDatabaseProtocols,
+} from "../utils/dsn-obfuscate.js";
 import { SafeURL } from "../utils/safe-url.js";
+import { expandHomeDir } from "../utils/home-dir.js";
 import { buildSqliteDSN, normalizeSqliteDsn, resolveSqliteFilePath } from "../utils/sqlite-dsn.js";
 
 // Create __dirname equivalent for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/**
+ * A setting that used to live on the command line / in the environment and is
+ * now configured per tool in dbhub.toml.
+ */
+interface RemovedSetting {
+  /** The `[[tools]]` line that replaces it */
+  tomlLine: string;
+  /** Anchor on https://dbhub.ai/tools/execute-sql describing the replacement */
+  docsAnchor: string;
+}
+
+const REMOVED_READONLY: RemovedSetting = { tomlLine: "readonly = true", docsAnchor: "read-only-mode" };
+const REMOVED_MAX_ROWS: RemovedSetting = { tomlLine: "max_rows = 1000", docsAnchor: "row-limiting" };
+
+/**
+ * Exit with the migration hint for a removed setting. Silently ignoring one
+ * would be worse than failing: someone who set READONLY expects writes to be
+ * rejected.
+ */
+function failRemovedSetting(label: string, setting: RemovedSetting): never {
+  console.error(`\nERROR: ${label} is no longer supported.`);
+  console.error("Use dbhub.toml with [[tools]] configuration instead:\n");
+  console.error("  [[sources]]");
+  console.error("  id = \"default\"");
+  console.error("  dsn = \"...\"\n");
+  console.error("  [[tools]]");
+  console.error("  name = \"execute_sql\"");
+  console.error("  source = \"default\"");
+  console.error(`  ${setting.tomlLine}\n`);
+  console.error(`See https://dbhub.ai/tools/execute-sql#${setting.docsAnchor} for details.\n`);
+  process.exit(1);
+}
+
+/**
+ * Reject the removed READONLY / MAX_ROWS environment variables, whether they
+ * were exported or came from a .env file. Called at startup and again after a
+ * .env file is loaded, so the check does not depend on such a file existing.
+ */
+export function rejectRemovedEnvVars(): void {
+  if (process.env.READONLY !== undefined) {
+    failRemovedSetting("READONLY environment variable", REMOVED_READONLY);
+  }
+  if (process.env.MAX_ROWS !== undefined) {
+    failRemovedSetting("MAX_ROWS environment variable", REMOVED_MAX_ROWS);
+  }
+}
 
 // Parse command line arguments
 export function parseCommandLineArgs() {
@@ -27,33 +81,12 @@ export function parseCommandLineArgs() {
       const parts = arg.substring(2).split("=");
       const key = parts[0];
 
-      // Fail immediately on deprecated flags
+      // Fail immediately on removed flags
       if (key === "readonly") {
-        console.error("\nERROR: --readonly flag is no longer supported.");
-        console.error("Use dbhub.toml with [[tools]] configuration instead:\n");
-        console.error("  [[sources]]");
-        console.error("  id = \"default\"");
-        console.error("  dsn = \"...\"\n");
-        console.error("  [[tools]]");
-        console.error("  name = \"execute_sql\"");
-        console.error("  source = \"default\"");
-        console.error("  readonly = true\n");
-        console.error("See https://dbhub.ai/tools/execute-sql#read-only-mode for details.\n");
-        process.exit(1);
+        failRemovedSetting("--readonly flag", REMOVED_READONLY);
       }
-
       if (key === "max-rows") {
-        console.error("\nERROR: --max-rows flag is no longer supported.");
-        console.error("Use dbhub.toml with [[tools]] configuration instead:\n");
-        console.error("  [[sources]]");
-        console.error("  id = \"default\"");
-        console.error("  dsn = \"...\"\n");
-        console.error("  [[tools]]");
-        console.error("  name = \"execute_sql\"");
-        console.error("  source = \"default\"");
-        console.error("  max_rows = 1000\n");
-        console.error("See https://dbhub.ai/tools/execute-sql#row-limiting for details.\n");
-        process.exit(1);
+        failRemovedSetting("--max-rows flag", REMOVED_MAX_ROWS);
       }
 
       const value = parts.length > 1 ? parts.slice(1).join("=") : undefined;
@@ -117,34 +150,8 @@ export function loadEnvFiles(): string | null {
   if (envPath) {
     dotenv.config({ path: envPath });
 
-    // Check for deprecated environment variables
-    if (process.env.READONLY !== undefined) {
-      console.error("\nERROR: READONLY environment variable is no longer supported.");
-      console.error("Use dbhub.toml with [[tools]] configuration instead:\n");
-      console.error("  [[sources]]");
-      console.error("  id = \"default\"");
-      console.error("  dsn = \"...\"\n");
-      console.error("  [[tools]]");
-      console.error("  name = \"execute_sql\"");
-      console.error("  source = \"default\"");
-      console.error("  readonly = true\n");
-      console.error("See https://dbhub.ai/tools/execute-sql#read-only-mode for details.\n");
-      process.exit(1);
-    }
-
-    if (process.env.MAX_ROWS !== undefined) {
-      console.error("\nERROR: MAX_ROWS environment variable is no longer supported.");
-      console.error("Use dbhub.toml with [[tools]] configuration instead:\n");
-      console.error("  [[sources]]");
-      console.error("  id = \"default\"");
-      console.error("  dsn = \"...\"\n");
-      console.error("  [[tools]]");
-      console.error("  name = \"execute_sql\"");
-      console.error("  source = \"default\"");
-      console.error("  max_rows = 1000\n");
-      console.error("See https://dbhub.ai/tools/execute-sql#row-limiting for details.\n");
-      process.exit(1);
-    }
+    // The file may have just defined a removed variable
+    rejectRemovedEnvVars();
 
     // Return the name of the file that was loaded
     return path.basename(envPath);
@@ -189,16 +196,16 @@ export function buildDSNFromEnvParams(): { dsn: string; source: string } | null 
   }
 
   // Validate supported database types
-  const supportedTypes = ['postgres', 'postgresql', 'mysql', 'mariadb', 'sqlserver', 'sqlite', 'oracle', 'dameng'];
-  if (!supportedTypes.includes(dbType.toLowerCase())) {
-    throw new Error(`Unsupported DB_TYPE: ${dbType}. Supported types: ${supportedTypes.join(', ')}`);
+  const connectorType = protocolToConnectorType(dbType.toLowerCase());
+  if (!connectorType) {
+    throw new Error(`Unsupported DB_TYPE: ${dbType}. Supported types: ${supportedDatabaseProtocols.join(', ')}`);
   }
 
   // SQLite is a file, not a network endpoint: DB_NAME is its path (relative to
   // the working directory unless absolute). Handled before the port logic so a
   // DB_HOST / DB_PORT / DB_USER left over in the environment cannot turn it
   // into a network-style DSN.
-  if (dbType.toLowerCase() === 'sqlite') {
+  if (connectorType === 'sqlite') {
     return {
       dsn: buildSqliteDSN(resolveSqliteFilePath(dbName as string)),
       source: 'individual environment variables'
@@ -206,29 +213,9 @@ export function buildDSNFromEnvParams(): { dsn: string; source: string } | null 
   }
 
   // Determine default port based on database type
-  let port = dbPort;
+  const port = dbPort || getDefaultPortForType(connectorType);
   if (!port) {
-    switch (dbType.toLowerCase()) {
-      case 'postgres':
-      case 'postgresql':
-        port = '5432';
-        break;
-      case 'mysql':
-      case 'mariadb':
-        port = '3306';
-        break;
-      case 'sqlserver':
-        port = '1433';
-        break;
-      case 'oracle':
-        port = '1521';
-        break;
-      case 'dameng':
-        port = '5236';
-        break;
-      default:
-        throw new Error(`Unknown database type for port determination: ${dbType}`);
-    }
+    throw new Error(`Unknown database type for port determination: ${dbType}`);
   }
 
   // At this point, dbUser, dbPassword, and dbName are guaranteed to be non-null due to earlier checks.
@@ -240,8 +227,7 @@ export function buildDSNFromEnvParams(): { dsn: string; source: string } | null 
   const encodedDbName = encodeURIComponent(dbNameStr);
 
   // Construct DSN
-  const protocol = dbType.toLowerCase() === 'postgresql' ? 'postgres' : dbType.toLowerCase();
-  const dsn = `${protocol}://${encodedUser}:${encodedPassword}@${dbHost}:${port}/${encodedDbName}`;
+  const dsn = `${connectorType}://${encodedUser}:${encodedPassword}@${dbHost}:${port}/${encodedDbName}`;
 
   return {
     dsn,
@@ -520,17 +506,6 @@ function splitTokenList(value: string): string[] {
 }
 
 /**
- * Redact sensitive information from a DSN string
- * Replaces the password with asterisks; returns a constant placeholder if the
- * DSN cannot be parsed, so a malformed DSN never leaks its password.
- * @param dsn - The DSN string to redact
- * @returns The sanitized DSN string
- */
-export function redactDSN(dsn: string): string {
-  return obfuscateDSNPassword(dsn);
-}
-
-/**
  * Resolve ID from command line args or environment variables
  * Returns ID or null if not provided
  */
@@ -625,20 +600,12 @@ export function resolveSSHConfig(): { config: SSHTunnelConfig; source: string } 
 
   // SSH Private Key (optional)
   if (args["ssh-key"]) {
-    config.privateKey = args["ssh-key"];
+    config.privateKey = expandHomeDir(args["ssh-key"]);
     config.privateKeyDiscovered = false;
-    // Expand ~ to home directory
-    if (config.privateKey.startsWith("~/")) {
-      config.privateKey = path.join(process.env.HOME || "", config.privateKey.substring(2));
-    }
     sources.push("ssh-key from command line");
   } else if (process.env.SSH_KEY) {
-    config.privateKey = process.env.SSH_KEY;
+    config.privateKey = expandHomeDir(process.env.SSH_KEY);
     config.privateKeyDiscovered = false;
-    // Expand ~ to home directory
-    if (config.privateKey.startsWith("~/")) {
-      config.privateKey = path.join(process.env.HOME || "", config.privateKey.substring(2));
-    }
     sources.push("SSH_KEY from environment");
   }
 
@@ -655,11 +622,7 @@ export function resolveSSHConfig(): { config: SSHTunnelConfig; source: string } 
   // variable and is read by the tunnel itself when no socket is configured
   const cliAgent = requireFlagValue("ssh-agent", args, "~/.ssh/agent.sock");
   if (cliAgent) {
-    config.agent = cliAgent;
-    // Expand ~ to home directory
-    if (config.agent.startsWith("~/")) {
-      config.agent = path.join(process.env.HOME || "", config.agent.substring(2));
-    }
+    config.agent = expandHomeDir(cliAgent);
     sources.push("ssh-agent from command line");
   }
 
@@ -721,6 +684,10 @@ export function resolveSSHConfig(): { config: SSHTunnelConfig; source: string } 
  * Returns array of source configs and the source of the configuration
  */
 export async function resolveSourceConfigs(): Promise<{ sources: SourceConfig[]; tools?: import("../types/config.js").ToolConfig[]; source: string } | null> {
+  // Before anything else: an exported READONLY / MAX_ROWS must stop startup
+  // even when no .env file is ever loaded (e.g. `docker run -e READONLY=true`).
+  rejectRemovedEnvVars();
+
   // Load .env before parsing TOML so `${VAR}` interpolation in the config file
   // resolves against it — keeping credentials in .env and referencing them as
   // `dsn = "${DSN}"` is the recommended pattern, and it only works if the file
@@ -776,34 +743,20 @@ export async function resolveSourceConfigs(): Promise<{ sources: SourceConfig[];
       dsnUrl = new SafeURL(dsnResult.dsn);
     } catch (error) {
       throw new Error(
-        `Invalid DSN format: ${redactDSN(dsnResult.dsn)}. Expected format: protocol://[user[:password]@]host[:port]/database`
+        `Invalid DSN format: ${obfuscateDSNPassword(dsnResult.dsn)}. Expected format: protocol://[user[:password]@]host[:port]/database`
       );
     }
 
     const protocol = dsnUrl.protocol.replace(':', '');
 
-    // Map protocol to database type
-    let dbType: "postgres" | "mysql" | "mariadb" | "sqlserver" | "sqlite" | "oracle" | "dameng";
-    if (protocol === 'postgresql' || protocol === 'postgres') {
-      dbType = 'postgres';
-    } else if (protocol === 'mysql') {
-      dbType = 'mysql';
-    } else if (protocol === 'mariadb') {
-      dbType = 'mariadb';
-    } else if (protocol === 'sqlserver') {
-      dbType = 'sqlserver';
-    } else if (protocol === 'dameng') {
-      dbType = 'dameng';
-    } else if (protocol === 'sqlite') {
-      dbType = 'sqlite';
-    } else if (protocol === 'oracle') {
-      dbType = 'oracle';
-    } else {
+    const dbType = protocolToConnectorType(protocol);
+    if (!dbType) {
       throw new Error(`Unsupported database type in DSN: ${protocol}`);
     }
 
     // Get --id flag value (if specified) to use as source ID
-    // If not specified, use "default" (which will result in no tool name suffix)
+    // If not specified, use "default". Either way a single source keeps the
+    // bare tool names; suffixing depends on the number of sources.
     const idData = resolveId();
     const sourceId = idData?.id || "default";
 
@@ -857,6 +810,7 @@ export async function resolveSourceConfigs(): Promise<{ sources: SourceConfig[];
       source.ssh_key_discovered = sshResult.config.privateKeyDiscovered;
       source.ssh_passphrase = sshResult.config.passphrase;
       source.ssh_agent = sshResult.config.agent;
+      source.ssh_proxy_jump = sshResult.config.proxyJump;
       source.ssh_keepalive_interval = sshResult.config.keepaliveInterval;
       source.ssh_keepalive_count_max = sshResult.config.keepaliveCountMax;
     }

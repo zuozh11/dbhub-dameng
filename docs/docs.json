@@ -11,48 +11,47 @@
     "dark": "#323236"
   },
   "favicon": "/favicon.svg",
+  "banner": {
+    "content": "[Meet us at AWS re:Invent · Nov 30–Dec 4, 2026 · Booth 1634 →](https://www.bytebase.com/events/reinvent26/)",
+    "dismissible": false
+  },
   "navigation": {
-    "tabs": [
+    "pages": [
+      "introduction",
       {
-        "tab": "Docs",
-        "groups": [
-          {
-            "group": "Getting Started",
-            "pages": [
-              "index",
-              {
-                "group": "Installation",
-                "root": "installation",
-                "expanded": true,
-                "pages": ["mcpb", "claude-code-plugin"]
-              },
-              "quickstart"
-            ]
-          },
-          {
-            "group": "MCP Tools",
-            "pages": [
-              "tools/overview",
-              "tools/execute-sql",
-              "tools/search-objects",
-              "tools/explain-sql",
-              "tools/health-check",
-              "tools/custom-tools"
-            ]
-          },
-          {
-            "group": "Workbench",
-            "pages": ["workbench/overview", "workbench/tool-execution", "workbench/request-trace"]
-          },
-          {
-            "group": "Configuration",
-            "pages": ["config/command-line", "config/toml", "config/read-only-mode", "config/debug"]
-          }
+        "group": "Installation",
+        "root": "installation",
+        "expanded": true,
+        "pages": ["mcpb", "claude-code-plugin", "codex-plugin"]
+      },
+      "quickstart",
+      {
+        "group": "MCP Tools",
+        "pages": [
+          "tools/overview",
+          "tools/execute-sql",
+          "tools/search-objects",
+          "tools/explain-sql",
+          "tools/health-check",
+          "tools/custom-tools"
         ]
       },
       {
-        "tab": "Blog",
+        "group": "Workbench",
+        "pages": ["workbench/overview", "workbench/tool-execution", "workbench/request-trace"]
+      },
+      {
+        "group": "Configuration",
+        "pages": ["config/command-line", "config/toml", "config/read-only-mode", "config/debug"]
+      },
+      {
+        "group": "Blog",
+        "hidden": true,
+        "searchable": true,
         "pages": [
+          "blog",
+          "blog/dbhub-2-0-0",
+          "blog/modelcontextprotocol-server-postgres-alternative",
           "blog/database-mcp-server-token-benchmark-2026",
           "blog/dbhub-1-0-0",
           "blog/how-dbhub-adopts-mcp-spec-2026-07-28",
@@ -66,13 +65,24 @@
   },
   "logo": {
     "light": "/images/logo/full-light.svg",
-    "dark": "/images/logo/full-dark.svg"
+    "dark": "/images/logo/full-dark.svg",
+    "href": "/"
   },
   "navbar": {
     "primary": {
       "type": "github",
       "href": "https://github.com/bytebase/dbhub"
-    }
+    },
+    "links": [
+      {
+        "label": "Docs",
+        "href": "/introduction"
+      },
+      {
+        "label": "Blog",
+        "href": "/blog"
+      }
+    ]
   },
   "footer": {
     "socials": {

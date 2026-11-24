@@ -1,3 +1,4 @@
+import { classifyPostgresSQL, postgresExplainOptions } from "./postgres-sql.js";
 import { ConnectorType } from "../connectors/interface.js";
 import { stripCommentsAndStringsVariants } from "./sql-parser.js";
 
@@ -8,7 +9,7 @@ import { stripCommentsAndStringsVariants } from "./sql-parser.js";
  */
 export const allowedKeywords: Record<ConnectorType, string[]> = {
   dameng: ["select", "with", "explain"],
-  postgres: ["select", "with", "explain", "show"],
+  postgres: ["select", "with", "values", "table", "explain", "show"],
   mysql: ["select", "with", "explain", "show", "describe", "desc"],
   mariadb: ["select", "with", "explain", "show", "describe", "desc"],
   sqlite: ["select", "with", "explain", "pragma"],
@@ -20,6 +21,9 @@ export const allowedKeywords: Record<ConnectorType, string[]> = {
   // DBMS_XPLAN (see OracleConnector.explainQuery). EXPLAIN PLAN only parses
   // the statement, it never executes it.
   oracle: ["select", "with", "explain"],
+  // EXPLAIN never executes the statement on ClickHouse (there is no ANALYZE
+  // form); EXISTS is its "does this table exist" statement.
+  clickhouse: ["select", "with", "explain", "show", "describe", "desc", "exists"],
 };
 
 /**
@@ -124,13 +128,6 @@ export const sqlServerPassThroughPattern = new RegExp(
  * - MySQL/MariaDB: LOAD_FILE reads server-side files (FILE privilege);
  *   GET_LOCK / RELEASE_LOCK / RELEASE_ALL_LOCKS take or release server-wide
  *   advisory locks (a session side effect).
- * - PostgreSQL: pg_read_file / pg_read_binary_file / pg_ls_dir read the
- *   server filesystem (pg_read_server_files role; default_transaction_read_only
- *   does not apply). set_config is SET in function form: it rewrites session
- *   state such as the statement_timeout DBHub applies from query_timeout or
- *   the configured search_path, and the change outlives the statement on the
- *   pooled connection (issue #448). current_setting is read-only and stays
- *   allowed.
  * - SQL Server: OPENQUERY / OPENROWSET / OPENDATASOURCE run on a
  *   remote/ad-hoc source outside the local read-only transaction
  *   (sqlServerPassThroughKeywords, reused here as the single source of truth).
@@ -140,6 +137,15 @@ export const sqlServerPassThroughPattern = new RegExp(
  *   UTL_FILE, DBMS_LDAP) or run arbitrary code (DBMS_SQL, DBMS_SCHEDULER,
  *   DBMS_JAVA, DBMS_LOB.FILEOPEN & co), matched on the package prefix in
  *   member-access position (`utl_http.request(`), see escapeHatchCallSuffix.
+ *
+ * - ClickHouse: the table functions (and the `file` function) that read from
+ *   or write to somewhere other than the server's own tables: remote servers,
+ *   object storage, URLs, the server's filesystem, other database systems, an
+ *   executable. The server refuses most of them itself under the
+ *   `readonly = 1` setting the connector sends for read-only tools; this
+ *   covers users whose own profile is `readonly = 2`, where it does not.
+ *   `cluster` / `clusterAllReplicas` are not listed: they read the same
+ *   tables on the cluster's other replicas.
  *
  * This is a best-effort guardrail: name matching is bypassable (quoted
  * identifiers, executable version comments), so least-privilege database
@@ -153,7 +159,6 @@ export const sqlServerPassThroughPattern = new RegExp(
 export const escapeHatchFunctionKeywords: Partial<Record<ConnectorType, readonly string[]>> = {
   mysql: ["load_file", "get_lock", "release_lock", "release_all_locks"],
   mariadb: ["load_file", "get_lock", "release_lock", "release_all_locks"],
-  postgres: ["pg_read_file", "pg_read_binary_file", "pg_ls_dir", "set_config"],
   sqlserver: sqlServerPassThroughKeywords,
   // Oracle packages a SELECT can call to reach outside the database, matched
   // as `package.member(` (see escapeHatchCallSuffix).
@@ -171,10 +176,33 @@ export const escapeHatchFunctionKeywords: Partial<Record<ConnectorType, readonly
     "dbms_xslprocessor",
     "dbms_advisor",
   ],
+  clickhouse: [
+    "url",
+    "urlCluster",
+    "file",
+    "fileCluster",
+    "s3",
+    "s3Cluster",
+    "gcs",
+    "azureBlobStorage",
+    "azureBlobStorageCluster",
+    "hdfs",
+    "hdfsCluster",
+    "remote",
+    "remoteSecure",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "redis",
+    "sqlite",
+    "jdbc",
+    "odbc",
+    "executable",
+    "deltaLake",
+    "iceberg",
+    "hudi",
+  ],
 };
-
-// Dameng exposes Oracle-compatible packages; share the same call-position guard.
-escapeHatchFunctionKeywords.dameng = escapeHatchFunctionKeywords.oracle;
 
 /**
  * What must follow an escape-hatch keyword for it to count as an invocation.
@@ -186,7 +214,6 @@ escapeHatchFunctionKeywords.dameng = escapeHatchFunctionKeywords.oracle;
 const escapeHatchCallSuffix: Partial<Record<ConnectorType, string>> = {
   oracle: "\\s*\\.\\s*[a-z_][a-z0-9_$#]*\\s*\\(",
 };
-escapeHatchCallSuffix.dameng = escapeHatchCallSuffix.oracle;
 const DEFAULT_CALL_SUFFIX = "\\s*\\(";
 
 const escapeHatchFunctionPatterns: Partial<Record<ConnectorType, RegExp>> = Object.fromEntries(
@@ -207,7 +234,9 @@ export function hasEscapeHatchFunction(
   strippedSQL: string,
   connectorType: ConnectorType | string
 ): boolean {
-  const pattern = escapeHatchFunctionPatterns[connectorType as ConnectorType];
+  // Dameng exposes the same package-style calls that Oracle guards.
+  const dialect = connectorType === "dameng" ? "oracle" : connectorType;
+  const pattern = escapeHatchFunctionPatterns[dialect as ConnectorType];
   return pattern !== undefined && pattern.test(strippedSQL);
 }
 
@@ -221,14 +250,13 @@ const mutatingPatternSqlServer = new RegExp(
 );
 
 /** Per-dialect mutating keyword pattern */
-const mutatingPatterns: Record<ConnectorType, RegExp> = {
-  dameng: mutatingPattern,
-  postgres: mutatingPattern,
+const mutatingPatterns: Partial<Record<ConnectorType, RegExp>> = {
   mysql: mutatingPatternWithReplace,
   mariadb: mutatingPatternWithReplace,
   sqlite: mutatingPatternWithReplace,
   sqlserver: mutatingPatternSqlServer,
   oracle: mutatingPattern,
+  clickhouse: mutatingPattern,
 };
 
 /**
@@ -276,19 +304,7 @@ export const explainAnalyzeKeyword = /^analy[sz]e\b/i;
  * an extension, and a quoted name (`"analyze"`), which PostgreSQL honours but
  * stripCommentsAndStrings has already blanked out.
  */
-export const nonExecutingExplainOptions: ReadonlySet<string> = new Set([
-  "verbose",
-  "costs",
-  "settings",
-  "generic_plan",
-  "buffers",
-  "serialize",
-  "wal",
-  "timing",
-  "summary",
-  "memory",
-  "format",
-]);
+export const nonExecutingExplainOptions: ReadonlySet<string> = postgresExplainOptions;
 
 /**
  * A parenthesis that opens a query rather than an EXPLAIN option list, as in
@@ -359,13 +375,15 @@ function statementExecutedByExplain(afterExplain: string): string | null {
 }
 
 /**
- * Check if a SQL query is read-only.
+ * Check if a SQL query is read-only. PostgreSQL uses its native AST parser.
+ * Other dialects use the following keyword checks:
  * 1. Strips comments and string literals before analyzing.
  * 2. Verifies the first keyword is in the allow-list.
  * 3. For WITH/SELECT statements, checks for mutating keywords and SELECT INTO.
  * 4. For EXPLAIN statements, rejects EXPLAIN ANALYZE with DML.
  */
 export function isReadOnlySQL(sql: string, connectorType: ConnectorType | string): boolean {
+  if (connectorType === "postgres") return classifyPostgresSQL(sql) === "read";
   return stripCommentsAndStringsVariants(sql, connectorType as ConnectorType).every((cleaned) =>
     checkReadOnly(cleaned.trim().toLowerCase(), connectorType)
   );

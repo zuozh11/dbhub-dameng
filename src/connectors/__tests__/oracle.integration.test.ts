@@ -34,6 +34,8 @@ class OracleIntegrationTest extends IntegrationTestBase<OracleTestContainer> {
       supportsStoredProcedures: true,
       expectedStoredProcedures: ['GET_USER_COUNT', 'CALCULATE_TOTAL_AGE'],
       supportsComments: true,
+      // A READ ONLY transaction makes the server itself reject DML.
+      readonlyWriteError: /ORA-01456/,
     };
     super(config);
   }
@@ -50,6 +52,10 @@ class OracleIntegrationTest extends IntegrationTestBase<OracleTestContainer> {
 
   createConnector(): Connector {
     return new OracleConnector();
+  }
+
+  protected userLimitedSQL(rows: number): string {
+    return `SELECT * FROM users ORDER BY id FETCH FIRST ${rows} ROWS ONLY`;
   }
 
   async setupTestData(connector: Connector): Promise<void> {
@@ -128,31 +134,19 @@ class OracleIntegrationTest extends IntegrationTestBase<OracleTestContainer> {
 const oracleTest = new OracleIntegrationTest();
 
 describe('Oracle Connector Integration Tests', () => {
-  beforeAll(async () => {
-    await oracleTest.setup();
-  }, 360_000); // image pull + database startup
+  oracleTest.registerLifecycle(360_000); // image pull + database startup
 
-  afterAll(async () => {
-    await oracleTest.cleanup();
-  });
-
-  oracleTest.createConnectionTests();
-  oracleTest.createSchemaTests();
-  oracleTest.createTableTests();
-  oracleTest.createSQLExecutionTests();
-  if (oracleTest.config.supportsStoredProcedures) {
-    oracleTest.createStoredProcedureTests();
-  }
-  oracleTest.createCommentTests();
-  oracleTest.createErrorHandlingTests();
+  oracleTest.createCommonTests();
 
   describe('Oracle-specific: identifier case', () => {
     it('finds tables and columns by their unquoted (lower-case) DDL spelling', async () => {
-      expect(await oracleTest.connector.tableExists('users')).toBe(true);
-      expect(await oracleTest.connector.tableExists('USERS')).toBe(true);
-      expect(await oracleTest.connector.tableExists('users', 'test')).toBe(true);
-      // Mixed case is taken as spelled (a quoted identifier), so this is a different name.
-      expect(await oracleTest.connector.tableExists('Users')).toBe(false);
+      // Mixed case is taken as spelled (a quoted identifier), so 'Users' would
+      // be a different name; the unquoted spellings all resolve to USERS.
+      for (const name of ['users', 'USERS']) {
+        expect((await oracleTest.connector.getTableSchema(name)).length).toBeGreaterThan(0);
+      }
+      expect((await oracleTest.connector.getTableSchema('users', 'test')).length).toBeGreaterThan(0);
+      expect(await oracleTest.connector.getTableSchema('Users')).toEqual([]);
 
       const columns = await oracleTest.connector.getTableSchema('users');
       expect(columns.map((c) => c.column_name)).toEqual(['ID', 'NAME', 'EMAIL', 'AGE']);
@@ -288,15 +282,6 @@ describe('Oracle Connector Integration Tests', () => {
       expect(Number(result.resultSets[2].rows[0].PRICE)).toBe(2);
     });
 
-    it('caps rows with maxRows and flags truncation exactly', async () => {
-      const capped = await oracleTest.connector.executeSQL('SELECT * FROM users ORDER BY id', { maxRows: 2 });
-      expect(capped.resultSets[0].rows).toHaveLength(2);
-      expect(capped.resultSets[0].truncated).toBe(true);
-
-      const uncapped = await oracleTest.connector.executeSQL('SELECT * FROM products ORDER BY id', { maxRows: 50 });
-      expect(uncapped.resultSets[0].truncated).toBeUndefined();
-    });
-
     it('preserves NUMBER integers beyond 2^53 and keeps decimals numeric', async () => {
       const result = await oracleTest.connector.executeSQL(
         'SELECT 9007199254740993 AS big, 42 AS small, 1.5 AS dec, NULL AS none FROM dual',
@@ -313,28 +298,6 @@ describe('Oracle Connector Integration Tests', () => {
     it('keeps a q-quoted literal intact', async () => {
       const result = await oracleTest.connector.executeSQL(`SELECT q'[it's; fine]' AS s FROM dual`, {});
       expect(result.resultSets[0].rows).toEqual([{ S: "it's; fine" }]);
-    });
-  });
-
-  describe('Oracle-specific: read-only backstop', () => {
-    it('rejects DML inside a READ ONLY transaction and persists nothing', async () => {
-      await expect(
-        oracleTest.connector.executeSQL(
-          "INSERT INTO products (name, price) VALUES ('Sneaky', 1)",
-          { readonly: true }
-        )
-      ).rejects.toThrow(/ORA-01456/);
-
-      const check = await oracleTest.connector.executeSQL(
-        "SELECT COUNT(*) AS n FROM products WHERE name = 'Sneaky'",
-        { readonly: true }
-      );
-      expect(Number(check.resultSets[0].rows[0].N)).toBe(0);
-    });
-
-    it('still serves reads with the backstop engaged', async () => {
-      const result = await oracleTest.connector.executeSQL('SELECT COUNT(*) AS n FROM users', { readonly: true, maxRows: 10 });
-      expect(Number(result.resultSets[0].rows[0].N)).toBeGreaterThanOrEqual(3);
     });
   });
 

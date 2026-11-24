@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { expandHomeDir } from './home-dir.js';
 import SSHConfig from 'ssh-config';
 import type { SSHTunnelConfig, JumpHost } from '../types/ssh.js';
 
@@ -26,13 +27,12 @@ const DEFAULT_SSH_KEYS = [
 ];
 
 /**
- * Expand tilde (~) in file paths to home directory
+ * The ssh-config library types every directive as `string | string[]`: a
+ * directive that may repeat (IdentityFile) comes back as a list. Take the
+ * first entry, as `ssh` does for the directives read here.
  */
-function expandTilde(filePath: string): string {
-  if (filePath.startsWith('~/')) {
-    return join(homedir(), filePath.substring(2));
-  }
-  return filePath;
+function firstValue(value: string | string[]): string {
+  return Array.isArray(value) ? value[0] : value;
 }
 
 /**
@@ -43,7 +43,7 @@ function expandTilde(filePath: string): string {
  * @returns The resolved real path, or the expanded path if resolution fails
  */
 export function resolveSymlink(filePath: string): string {
-  const expandedPath = expandTilde(filePath);
+  const expandedPath = expandHomeDir(filePath);
   try {
     return realpathSync(expandedPath);
   } catch {
@@ -147,7 +147,7 @@ export function parseSSHConfig(
 
     // Host (required)
     if (hostConfig.HostName) {
-      sshConfig.host = hostConfig.HostName;
+      sshConfig.host = firstValue(hostConfig.HostName);
     } else {
       // If no HostName specified, use the host alias itself
       sshConfig.host = hostAlias;
@@ -155,20 +155,18 @@ export function parseSSHConfig(
 
     // Port (optional, default will be 22)
     if (hostConfig.Port) {
-      sshConfig.port = parseInt(hostConfig.Port, 10);
+      sshConfig.port = parseInt(firstValue(hostConfig.Port), 10);
     }
 
     // User (required)
     if (hostConfig.User) {
-      sshConfig.username = hostConfig.User;
+      sshConfig.username = firstValue(hostConfig.User);
     }
 
     // IdentityFile (private key)
     if (hostConfig.IdentityFile) {
       // SSH config can have multiple IdentityFile entries, take the first one
-      const identityFile = Array.isArray(hostConfig.IdentityFile)
-        ? hostConfig.IdentityFile[0]
-        : hostConfig.IdentityFile;
+      const identityFile = firstValue(hostConfig.IdentityFile);
 
       // Resolve symlinks (important for Windows where .ssh may be a junction)
       const resolvedPath = resolveSymlink(identityFile);
@@ -190,7 +188,7 @@ export function parseSSHConfig(
 
     // ProxyJump support for multi-hop SSH connections
     if (hostConfig.ProxyJump) {
-      sshConfig.proxyJump = hostConfig.ProxyJump;
+      sshConfig.proxyJump = firstValue(hostConfig.ProxyJump);
     }
 
     // ProxyCommand is not supported (requires shell execution)

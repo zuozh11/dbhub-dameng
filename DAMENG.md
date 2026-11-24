@@ -16,8 +16,8 @@ GitHub 首页与 npm 包使用同一份 README。
 - `connection_timeout`、`query_timeout` 分别传给驱动的 `connectTimeout`、`sessionTimeout`。
 - 自定义工具使用 `?` 占位符，参数仅支持单语句。
 - 初始化脚本只在启动时执行；每条连接的 schema 应通过 DSN 指定。
-- Oracle 与达梦共享 `OracleCatalog` 元数据查询及 PL/SQL 分句器；连接池、超时、
-  结果处理和诊断 SQL 仍由各自驱动负责。达梦对象名保持原样，Oracle 保留原有大小写折叠。
+- 达梦的目录查询和 PL/SQL 分句位于 `src/connectors/dameng/`，复用上游的索引列分组、
+  SQL 扫描和只读策略。达梦对象名保持原样，Oracle 连接器直接随上游同步。
 - 支持 PL/SQL 块，但只读工具拒绝执行块；写入仍逐条自动提交，不承诺批次原子性。
 - 可选 `explain_sql` 使用 `EXPLAIN FOR` 返回计划，只允许单条读查询；
   `dmdb` 在此路径不接受绑定参数，因此明确拒绝而不插值拼接参数。
@@ -57,7 +57,9 @@ pnpm test:build
 这是检查后直接合并的最小流程，不创建自动审批 PR，也不需要长期 PAT。
 
 源码的 `package.json` 版本号、包名和上游发布工作流保持原样。
-同步时保留 fork 的 README，它也是 npm 包说明。只有 README 冲突时可以继续同步；其他文件有冲突时停止并等待手工合并。
+同步时保留 fork 的 README，它也是 npm 包说明。遇到其他文件的冲突时，工作流打印上游提交和冲突文件，然后停止。
+手工合并时先合并 `package.json` 和 `src/api/openapi.yaml`，以该次上游版本的锁文件为底稿，运行 `pnpm install --lockfile-only`
+和 `pnpm run generate:api-types` 重新生成锁文件和 API 类型，再运行上面的检查。
 仅打包时设置 fork 身份，版本为 `<上游版本>-dameng.<提交总数>`，发布到 `latest` 标签。
 例如 `1.2.5-dameng.620`；它是独立 fork 版本，不是 Bytebase 官方发行版。
 每次代码合并都会得到新版本，同一提交重跑使用同一个版本号。

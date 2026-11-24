@@ -116,12 +116,10 @@ source = "production"
 Start DBHub:
 
 ```bash
-# Automatically loads ./dbhub.toml
-npx @bytebase/dbhub@latest --transport http --port 8080
-
-# Or specify custom location
-npx @bytebase/dbhub@latest --config=/path/to/config.toml
+npx @bytebase/dbhub@latest --config ./dbhub.toml --transport http --port 8080
 ```
+
+The file is only loaded when `--config` is given; DBHub does not pick up a `dbhub.toml` from the working directory on its own.
 
 ## Source Options
 
@@ -130,7 +128,7 @@ Sources define database connections. Each source represents a database that DBHu
 ### id
 
 <ParamField path="id" type="string" required>
-  **Required.** Unique identifier for this data source. Used for routing tool calls and in tool names.
+  **Required.** Unique identifier for this data source. It appears as `source_id` in tool output, and when the file defines two or more sources it is appended to each tool name (`execute_sql_production`). A single source keeps the bare tool names — see [Tool Naming](/tools/overview#tool-naming).
 
   ```toml
   [[sources]]
@@ -153,8 +151,8 @@ Sources define database connections. Each source represents a database that DBHu
 
 ### dsn
 
-<ParamField path="dsn" type="string" required>
-  **Required.** Database connection string. Same format as command-line [`--dsn`](/config/command-line#--dsn).
+<ParamField path="dsn" type="string">
+  Database connection string. Same format as command-line [`--dsn`](/config/command-line#param-dsn). Every source needs either a `dsn` or the individual parameters (`type` plus `host`, or `type = "sqlite"` plus `database`) shown in the second tab.
 
   <Tabs>
     <Tab title="Using DSN">
@@ -172,7 +170,7 @@ Sources define database connections. Each source represents a database that DBHu
       dsn = "sqlite:///./dev.db"  # relative to this config file
       ```
 
-      A relative SQLite path (`sqlite:///./dev.db`) is resolved against the directory holding the config file, so the config names the same database wherever DBHub is started from. Without the `./`, the path is absolute: `sqlite:///dev.db` is `/dev.db`. See the [SQLite DSN formats](/config/command-line#--dsn).
+      A relative SQLite path (`sqlite:///./dev.db`) is resolved against the directory holding the config file, so the config names the same database wherever DBHub is started from. Without the `./`, the path is absolute: `sqlite:///dev.db` is `/dev.db`. See the [SQLite DSN formats](/config/command-line#param-dsn).
     </Tab>
 
     <Tab title="Individual Parameters">
@@ -230,12 +228,22 @@ Sources define database connections. Each source represents a database that DBHu
       database = "FREEPDB1"
       user = "app"
       password = "secret"
+
+      # ClickHouse (HTTP interface; port defaults to 8123, or 8443 with sslmode)
+      [[sources]]
+      id = "clickhouse_cloud"
+      type = "clickhouse"
+      host = "abc123.us-east-1.aws.clickhouse.cloud"
+      database = "default"
+      user = "default"
+      password = "secret"
+      sslmode = "verify-full"
       ```
     </Tab>
   </Tabs>
 
   <Note>
-  **Mixing `dsn` with individual fields.** A `dsn` already encodes the connection identity (type, host, port, database, user, password). Fields that can also live in the DSN query string — `sslmode`, `sslrootcert`, `instanceName`, `authentication`, `domain`, `applicationIntent` — may be set alongside a `dsn` and are applied when the DSN omits them.
+  **Mixing `dsn` with individual fields.** A `dsn` already encodes the connection identity (type, host, port, database, user, password). Fields that can also live in the DSN query string — `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `instanceName`, `authentication`, `domain`, `applicationIntent`, and the Oracle `wallet_location`, `wallet_password`, `ssl_server_cert_dn` — may be set alongside a `dsn` and are applied when the DSN omits them.
 
   If such a field is set to a value that **contradicts** the DSN (e.g. `dsn = "...?sslmode=disable"` together with `sslmode = "require"`, or a `host`/`user`/`database` that differs from the DSN), DBHub rejects the configuration at startup rather than silently ignoring the field. Set each value in only one place, or make the two values match.
 
@@ -289,7 +297,7 @@ Sources define database connections. Each source represents a database that DBHu
 
   On PostgreSQL and MySQL it also limits how long a query waits for a free connection when every connection in the pool is in use (see [`pool_max_connections`](#pool_max_connections)); the query then fails instead of waiting. Without it, the query waits until a connection is free.
 
-  Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle (not applicable to SQLite).
+  Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse (not applicable to SQLite).
 
   ```toml
   [[sources]]
@@ -308,15 +316,16 @@ Sources define database connections. Each source represents a database that DBHu
 <ParamField path="query_timeout" type="number">
   Query timeout in seconds. The maximum time to wait for a query to complete before timing out.
 
-  Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle (not applicable to SQLite).
+  Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse (not applicable to SQLite).
 
-  On PostgreSQL, MySQL and MariaDB the limit is applied on the database server, so a timed-out statement stops running there and the connection stays usable:
+  On PostgreSQL, MySQL, MariaDB and ClickHouse the limit is applied on the database server, so a timed-out statement stops running there and the connection stays usable:
 
   | Database | Server-side setting | Covers |
   |----------|---------------------|--------|
   | PostgreSQL | `statement_timeout` | All statements |
   | MySQL | `max_execution_time` | Read-only `SELECT` statements |
   | MariaDB | `max_statement_time` | All statements |
+  | ClickHouse | `max_execution_time` | All statements |
 
   A client-side fallback fires 5 seconds after `query_timeout` for statements the server did not stop, such as a MySQL write or a statement on a connection whose session setting was changed. DBHub then discards that connection and attempts to cancel the statement on the server over a separate connection. The cancellation is best-effort: if it fails or the server does not honor it, the statement may keep running until the server finishes it.
 
@@ -386,12 +395,12 @@ Sources define database connections. Each source represents a database that DBHu
   **Options:**
   - `disable` - No SSL/TLS encryption. Data is transmitted in plaintext.
   - `require` - SSL/TLS encryption enabled, but server certificate is not verified.
-  - `verify-ca` - SSL with CA certificate verification (no hostname check). **PostgreSQL only.**
-  - `verify-full` - SSL with CA certificate and hostname verification. **PostgreSQL, SQL Server, and Oracle.**
+  - `verify-ca` - SSL with CA certificate verification (no hostname check). **PostgreSQL, MySQL, and MariaDB.**
+  - `verify-full` - SSL with CA certificate and hostname verification. **All network databases.**
 
-  Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle (not applicable to SQLite). `verify-ca` is PostgreSQL only; `verify-full` is supported on PostgreSQL, SQL Server and Oracle (Oracle validates the server certificate against the system trust store, and `sslrootcert` is PostgreSQL only).
+  Supported databases: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse (not applicable to SQLite). `verify-ca` is supported on PostgreSQL, MySQL and MariaDB; `verify-full` on every network database (Oracle validates the server certificate against the system trust store, and `sslrootcert` is PostgreSQL only).
 
-  SQL Server `verify-full` uses Node's trust roots. Set `NODE_EXTRA_CA_CERTS` to a PEM CA bundle before process startup if an additional CA is needed.
+  MySQL, MariaDB, SQL Server and ClickHouse verify against Node's trust roots. Set `NODE_EXTRA_CA_CERTS` to a PEM CA bundle before process startup if an additional CA is needed (e.g. the Amazon RDS CA bundle).
 
   ```toml
   # Basic SSL (all network databases)
@@ -400,7 +409,7 @@ Sources define database connections. Each source represents a database that DBHu
   dsn = "postgres://user:pass@localhost:5432/mydb"
   sslmode = "require"
 
-  # Certificate verification (PostgreSQL only)
+  # Certificate verification with a CA file (sslrootcert is PostgreSQL only)
   [[sources]]
   id = "rds_postgres"
   type = "postgres"
@@ -693,7 +702,7 @@ Sources define database connections. Each source represents a database that DBHu
 <ParamField path="[sources.session]" type="table">
   Server settings applied to every new connection, as `name = value` pairs. Keys are the server's own setting names; values are strings, numbers or booleans.
 
-  **MySQL / PostgreSQL only.**
+  **MySQL, PostgreSQL and ClickHouse only.**
 
   ```toml
   [[sources]]
@@ -713,7 +722,7 @@ Sources define database connections. Each source represents a database that DBHu
 
   Place the table directly after the `[[sources]]` entry it belongs to. DBHub checks only the shape; the server decides whether a setting exists and accepts the value, and a rejected setting fails startup rather than being skipped. Settings with a dedicated option are refused here: use `query_timeout` instead of `max_execution_time` or `statement_timeout`, and the `search_path` option instead of a `search_path` entry.
 
-  The settings apply to every tool on the source, read-only and writable alike.
+  The settings apply to every tool on the source, read-only and writable alike. On ClickHouse, which keeps no connection state, they are sent with every request.
 
   <Note>
   This option is **only available via TOML**. It is not supported as a DSN query parameter. On PostgreSQL the settings are sent as connection startup options, which some poolers such as PgBouncer drop.
@@ -723,7 +732,7 @@ Sources define database connections. Each source represents a database that DBHu
 ### SSH Tunnel Options
 
 <ParamField path="ssh_*" type="group">
-  SSH tunnel configuration for connecting to databases through bastion/jump hosts. Available fields: `ssh_host`, `ssh_port`, `ssh_user`, `ssh_password`, `ssh_key`, `ssh_passphrase`, `ssh_agent`, `ssh_proxy_jump`.
+  SSH tunnel configuration for connecting to databases through bastion/jump hosts. Available fields: `ssh_host`, `ssh_port`, `ssh_user`, `ssh_password`, `ssh_key`, `ssh_passphrase`, `ssh_agent`, `ssh_proxy_jump`, `ssh_keepalive_interval`, `ssh_keepalive_count_max`.
 
   ```toml
   [[sources]]
@@ -738,6 +747,8 @@ Sources define database connections. Each source represents a database that DBHu
   ssh_passphrase = "my_key_passphrase"  # Optional
   # ssh_agent = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"  # SSH agent socket (instead of ssh_key)
   ssh_proxy_jump = "jump1.example.com,admin@jump2.internal:2222"
+  # ssh_keepalive_interval = 30   # Seconds between keepalive packets (default: 0 = disabled)
+  # ssh_keepalive_count_max = 3   # Missed responses before the tunnel is dropped (default: 3)
   ```
 
   `ssh_key` accepts either a file path or a base64-encoded private key. DBHub automatically detects the format.
@@ -786,7 +797,7 @@ Tools define MCP tools (like `execute_sql`) with specific execution settings. To
 ### readonly
 
 <ParamField path="readonly" type="boolean" default="false">
-  Restrict SQL execution to read-only operations (SELECT, SHOW, DESCRIBE, EXPLAIN, PRAGMA). Write operations like INSERT, UPDATE, DELETE are blocked.
+  Restrict SQL execution to read-only statements. Write operations like INSERT, UPDATE, DELETE are blocked. The exact allow-list depends on the database — see [Read-Only Mode](/config/read-only-mode#how-it-is-enforced).
 
   ```toml
   [[tools]]
@@ -882,6 +893,7 @@ Tools define MCP tools (like `execute_sql`) with specific execution settings. To
   | SQLite | `?`, `?`, `?` | `WHERE id = ? AND status = ?` |
   | SQL Server | `@p1`, `@p2`, `@p3` | `WHERE id = @p1 AND status = @p2` |
   | Oracle | `:1`, `:2`, `:3` | `WHERE id = :1 AND status = :2` |
+  | ClickHouse | `{p1:Type}`, `{p2:Type}` | `WHERE id = {p1:UInt64} AND status = {p2:String}` |
 
   <Warning>
   The number of parameters must match the number of placeholders in your SQL statement. Validation occurs at server startup.
@@ -1013,7 +1025,13 @@ default = 10
 |-------|------|----------|-------------|
 | `id` | string | ✅ | Unique source identifier |
 | `description` | string | ❌ | Human-readable description of the data source |
-| `dsn` | string | ✅ | Database connection string |
+| `dsn` | string | ✅* | Database connection string (*or the individual parameters below) |
+| `type` | string | ❌ | Database type when not using `dsn`: `postgres`, `mysql`, `mariadb`, `sqlserver`, `oracle`, `clickhouse`, `sqlite` |
+| `host` | string | ❌ | Database host (with `type`) |
+| `port` | number | ❌ | Database port (default: the standard port for `type`) |
+| `database` | string | ❌ | Database name, Oracle service name, or SQLite file path |
+| `user` | string | ❌ | Database username |
+| `password` | string | ❌ | Database password (no URL encoding needed). May be omitted for ClickHouse, whose `default` user has none out of the box |
 | `aws_iam_auth` | boolean | ❌ | Generate AWS RDS IAM authentication tokens (default: `false`) |
 | `aws_region` | string | ❌ | AWS region (required when `aws_iam_auth` is enabled) |
 | `aws_profile` | string | ❌ | Named AWS shared-config profile (requires `aws_iam_auth`) |
@@ -1025,6 +1043,9 @@ default = 10
 | `sslrootcert` | string | ❌ | CA certificate path (PostgreSQL only, requires `verify-ca` or `verify-full`) |
 | `sslcert` | string | ❌ | PEM client certificate path for client certificate authentication (PostgreSQL only, requires `sslkey` and TLS enabled) |
 | `sslkey` | string | ❌ | Unencrypted PEM private key path for `sslcert` (PostgreSQL only) |
+| `wallet_location` | string | ❌ | Oracle: directory holding `ewallet.pem` for mutual TLS |
+| `wallet_password` | string | ❌ | Oracle: password of an encrypted `ewallet.pem` |
+| `ssl_server_cert_dn` | string | ❌ | Oracle: expected server certificate DN |
 | `instanceName` | string | ❌ | SQL Server named instance |
 | `authentication` | string | ❌ | SQL Server auth method |
 | `domain` | string | ❌ | Windows domain (NTLM) |
@@ -1033,7 +1054,7 @@ default = 10
 | `timezone` | string | ❌ | MySQL/MariaDB: `Z`, `local`, or offset like `+09:00` |
 | `charset` | string | ❌ | MySQL/MariaDB: connection character set (`utf8mb4`) |
 | `collation` | string | ❌ | MySQL/MariaDB: connection collation (`utf8mb4_0900_ai_ci`) |
-| `[sources.session]` | table | ❌ | MySQL/PostgreSQL: session settings applied to every new connection |
+| `[sources.session]` | table | ❌ | MySQL/PostgreSQL: session settings applied to every new connection. ClickHouse: settings sent with every request |
 | `ssh_host` | string | ❌ | SSH server hostname |
 | `ssh_port` | number | ❌ | SSH server port (default: 22) |
 | `ssh_user` | string | ❌ | SSH username |
@@ -1042,6 +1063,8 @@ default = 10
 | `ssh_passphrase` | string | ❌ | SSH key passphrase |
 | `ssh_agent` | string | ❌ | SSH agent socket path (default: `SSH_AUTH_SOCK`) |
 | `ssh_proxy_jump` | string | ❌ | ProxyJump hosts |
+| `ssh_keepalive_interval` | number | ❌ | Seconds between SSH keepalive packets (default: `0`, disabled) |
+| `ssh_keepalive_count_max` | number | ❌ | Missed keepalive responses before the tunnel is dropped (default: `3`) |
 
 ### Tool Options
 

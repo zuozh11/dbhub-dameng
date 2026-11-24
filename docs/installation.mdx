@@ -38,7 +38,7 @@ The npm method requires **Node.js >= 22.5.0** (DBHub uses Node's built-in `node:
 
 ### Minimal Installation
 
-By default, DBHub attempts to install drivers for all supported databases (PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, SQLite). If you only need specific databases, you can skip the unnecessary drivers to reduce installation size.
+By default, DBHub attempts to install drivers for all supported databases (PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, ClickHouse, SQLite). If you only need specific databases, you can skip the unnecessary drivers to reduce installation size.
 
 This applies to `npm install` (global or local). When using `npx`, npm will attempt to install all optional dependencies, but some drivers may be skipped if their installation fails, a required transitive dependency is missing, or the platform is not supported.
 
@@ -56,12 +56,31 @@ Available driver packages:
 - `mariadb` — MariaDB
 - `mssql` — SQL Server
 - `oracledb` — Oracle (Thin mode: pure JavaScript, no Oracle Instant Client required)
+- `@clickhouse/client` — ClickHouse (pure JavaScript, over the HTTP interface)
 
 SQLite uses the built-in `node:sqlite` module (Node.js 22.5+), so it requires no driver package or native compilation and is always available.
 
 <Note>
 When a driver is not installed or a required dependency is missing (e.g., a transitive dependency like `@azure/core-client` for the SQL Server driver), DBHub will skip that connector at startup and log a message. All other connectors will work normally. SQLite (including `--demo` mode) needs no extra driver — it relies on the built-in `node:sqlite` module.
 </Note>
+
+### Driver missing after an `npx` upgrade
+
+If a source that used to work fails with `No connector found for DSN` and the log shows `Skipping PostgreSQL connector: driver package "pg" not installed`, npm has dropped the driver from the npx cache. Some npm versions (seen on 11.6.2, bundled with Node.js 24.13; not on 11.16.0) remove the optional `pg` package when `npx @bytebase/dbhub@latest` upgrades a cached install to a new release.
+
+To recover, delete the npx cache and restart your MCP client, so the next start installs everything again:
+
+```bash
+# macOS / Linux
+rm -rf "$(npm config get cache)/_npx"
+```
+
+```powershell
+# Windows (PowerShell)
+Remove-Item -Recurse -Force "$(npm config get cache)\_npx"
+```
+
+Upgrading npm (`npm install -g npm@latest`) prevents it from recurring.
 
 ## MCP Bundle (.mcpb)
 
@@ -70,6 +89,10 @@ The [MCP Bundle](/mcpb) is a one-click install for MCPB-compatible clients — C
 ## Claude Code Plugin
 
 The [Claude Code Plugin](/claude-code-plugin) registers the DBHub MCP server in Claude Code with one install command and adds `/dbhub:setup` and `/dbhub:explore` skills. Claude Code prompts for the connection string and keeps it in secure storage. Read-only by design, like the MCP Bundle.
+
+## Codex Plugin
+
+The [Codex Plugin](/codex-plugin) registers the DBHub MCP server in Codex with two commands and adds `dbhub:setup` and `dbhub:explore` skills. The connection string is read from the `DBHUB_DSN` environment variable. Read-only by design, like the MCP Bundle.
 
 ## Docker
 
@@ -273,7 +296,7 @@ Prefer a one-command, read-only install with a prompted connection string? Use t
     Or manually edit the user configuration file:
 
     <Tabs>
-      <Tab title="MacOS/Linux">
+      <Tab title="macOS/Linux">
         Edit `~/.claude/settings.json` and add to the `mcpServers` section.
       </Tab>
       <Tab title="Windows">
@@ -309,7 +332,7 @@ Prefer a one-click, read-only install with no JSON editing? Use the [MCP Bundle]
 </Note>
 
 <Tabs>
-  <Tab title="MacOS/Linux">
+  <Tab title="macOS/Linux">
     Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
     ```json ~/Library/Application Support/Claude/claude_desktop_config.json
@@ -375,7 +398,7 @@ Prefer a one-click, read-only install with no JSON editing? Use the [MCP Bundle]
 **Troubleshooting:**
 - Verify your DSN connection string is correct
 - Check that the database is accessible from your machine
-- Review Claude Desktop logs: `~/Library/Logs/Claude/mcp*.log` (MacOS)
+- Review Claude Desktop logs: `~/Library/Logs/Claude/mcp*.log` (macOS)
 
 **References:**
 - [Claude Desktop MCP Documentation](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)
@@ -386,19 +409,21 @@ Prefer a one-click, read-only install with no JSON editing? Use the [MCP Bundle]
 
 <Tabs>
   <Tab title="One-Click Install">
-    Click the link below to install DBHub in Cursor:
+    Install DBHub with the built-in demo database to try it without database credentials. Requires **Node.js 22.5+** on your machine.
 
-    <a href="cursor://anysphere.cursor-deeplink/mcp/install?name=dbhub&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyJAYnl0ZWJhc2UvZGJodWIiLCItLXRyYW5zcG9ydCIsInN0ZGlvIiwiLS1kc24iLCJwb3N0Z3JlczovL3VzZXI6cGFzc3dvcmRAbG9jYWxob3N0OjU0MzIvZGJuYW1lIl19">
+    <a href="cursor://anysphere.cursor-deeplink/mcp/install?name=dbhub&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBieXRlYmFzZS9kYmh1YkBsYXRlc3QiLCItLXRyYW5zcG9ydCIsInN0ZGlvIiwiLS1kZW1vIl19">
       <img src="https://cursor.com/deeplink/mcp-install-dark.svg" alt="Install DBHub MCP server in Cursor" height="32" />
     </a>
 
-    After installing, edit the DSN in your Cursor MCP settings to point to your database.
+    Accept the installation prompt in Cursor, then open an Agent chat and ask: **"What tables are in the database?"** Cursor starts DBHub automatically using stdio.
+
+    To connect your own database, edit the `dbhub` entry in your Cursor MCP configuration (`~/.cursor/mcp.json` on macOS/Linux or `%USERPROFILE%\.cursor\mcp.json` on Windows). Replace `"--demo"` in `args` with `"--dsn", "YOUR_CONNECTION_STRING"`. See the **Stdio (Local)** tab for a complete example and [DSN Configuration](/config/command-line#param-dsn) for supported connection strings.
   </Tab>
 
   <Tab title="Stdio (Local)">
     For local database connections, use stdio transport:
 
-    **MacOS/Linux** - Edit `~/.cursor/mcp.json`:
+    **macOS/Linux** - Edit `~/.cursor/mcp.json`:
 
     ```json ~/.cursor/mcp.json
     {
@@ -440,7 +465,7 @@ Prefer a one-click, read-only install with no JSON editing? Use the [MCP Bundle]
   <Tab title="HTTP (Remote)">
     For remote or shared database servers, use HTTP transport:
 
-    **MacOS/Linux** - Edit `~/.cursor/mcp.json`:
+    **macOS/Linux** - Edit `~/.cursor/mcp.json`:
 
     ```json ~/.cursor/mcp.json
     {
@@ -498,11 +523,25 @@ Prefer a one-click, read-only install with no JSON editing? Use the [MCP Bundle]
 
 ### VS Code
 
-VS Code has native MCP support through GitHub Copilot. Create `.vscode/mcp.json` in your project root:
+Connect DBHub to VS Code with the demo install below, or use the manual configuration tabs. The npm setup requires **Node.js 22.5+**.
 
 <Tabs>
+  <Tab title="One-Click Install">
+    Start with the built-in demo database; no database credentials are needed.
+
+    <a href="vscode:mcp/install?%7B%22name%22%3A%22dbhub%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40bytebase%2Fdbhub%40latest%22%2C%22--transport%22%2C%22stdio%22%2C%22--demo%22%5D%7D">Install DBHub in VS Code →</a>
+
+    Review the configuration in VS Code and choose to install it. Open an agent chat and ask: **"What tables are in the database?"**
+
+    To connect your own database, replace `"--demo"` in the server's `args` with `"--dsn", "YOUR_CONNECTION_STRING"`. See **Stdio (Local)** for an example and [DSN Configuration](/config/command-line#param-dsn) for connection strings.
+
+    <Note>
+    The install link and `.vscode/mcp.json` examples use VS Code's editor-managed configuration. For a native Copilot session, run **MCP: Add Server**, choose a stdio command (`npx -y @bytebase/dbhub@latest --transport stdio --demo`), and select **Global → Copilot Global**. Verify the connection with a tool call in your intended session. See [VS Code's configuration guide](https://code.visualstudio.com/docs/agents/reference/mcp-configuration).
+    </Note>
+  </Tab>
+
   <Tab title="Stdio (Local)">
-    For local database connections, use stdio transport:
+    For local database connections, create `.vscode/mcp.json` in your project root:
 
     ```json .vscode/mcp.json
     {
@@ -664,52 +703,78 @@ VS Code has native MCP support through GitHub Copilot. Create `.vscode/mcp.json`
 
 ### Codex
 
+<Note>
+Prefer a read-only install that also adds setup and schema-exploration skills? Use the [Codex Plugin](/codex-plugin). The manual registration below gives full control over flags and TOML configs.
+</Note>
+
+The Codex CLI, desktop app, and IDE extension share the same MCP configuration.
+
 <Tabs>
   <Tab title="CLI">
     ```bash
     # Connect to your database
-    codex mcp add dbhub -- npx @bytebase/dbhub@latest --transport stdio --dsn "postgres://user:password@localhost:5432/dbname"
+    codex mcp add dbhub --env DSN="postgres://user:password@localhost:5432/dbname" -- npx -y @bytebase/dbhub@latest --transport stdio
 
     # Or use demo mode for testing
-    codex mcp add dbhub -- npx @bytebase/dbhub@latest --transport stdio --demo
+    codex mcp add dbhub -- npx -y @bytebase/dbhub@latest --transport stdio --demo
     ```
+
+    `--env` stores the DSN in `~/.codex/config.toml`. To keep credentials out of that file, forward the variable from your shell instead (see the TOML tab).
   </Tab>
 
   <Tab title="TOML">
     ```toml ~/.codex/config.toml
-    # Connect to your database
     [mcp_servers.dbhub]
     command = "npx"
-    args = ["@bytebase/dbhub@latest", "--transport", "stdio", "--dsn", "postgres://user:password@localhost:5432/dbname"]
-
-    # Or use demo mode for testing
-    [mcp_servers.dbhub]
-    command = "npx"
-    args = ["@bytebase/dbhub@latest", "--transport", "stdio", "--demo"]
+    args = ["-y", "@bytebase/dbhub@latest", "--transport", "stdio"]
+    # Forward DSN from the environment Codex is launched in,
+    # so the connection string never lands in this file
+    env_vars = ["DSN"]
+    # The first npx run downloads the package and can take up to a minute;
+    # the 10s default is too short for it
+    startup_timeout_sec = 120
     ```
+
+    Then export the DSN before starting Codex:
+
+    ```bash
+    export DSN="postgres://user:password@localhost:5432/dbname"
+    ```
+
+    To expose only some tools to Codex, add an allow list:
+
+    ```toml
+    enabled_tools = ["search_objects", "execute_sql"]
+    ```
+  </Tab>
+
+  <Tab title="Config File">
+    For multi-database setups, use a [TOML config file](/config/toml):
+
+    ```toml ~/.codex/config.toml
+    [mcp_servers.dbhub]
+    command = "npx"
+    args = ["-y", "@bytebase/dbhub@latest", "--transport", "stdio", "--config", "/path/to/dbhub.toml"]
+    startup_timeout_sec = 120
+    ```
+
+    To scope the server to one repository, put the same table in `.codex/config.toml` at the root of a trusted project.
   </Tab>
 
   <Tab title="Verification">
     ```bash
-    /mcp
+    codex mcp list
 
-    🔌  MCP Tools
-
-      • dbhub
-        • Status: enabled
-        • Auth: Unsupported
-        • Command: npx -y @bytebase/dbhub@latest --demo
-        • Tools: execute_sql
-        • Resources: schemas (db://schemas)
-        • Resource templates: tables_in_schema (db://schemas/{schemaName}/tables), table_structure_in_schema (db://schemas/{schemaName}/
-    tables/{tableName}), indexes_in_table (db://schemas/{schemaName}/tables/{tableName}/indexes), procedures_in_schema (db://schemas/
-    {schemaName}/procedures), procedure_detail_in_schema (db://schemas/{schemaName}/procedures/{procedureName})
+    Name   Command  Args                                         Env        Cwd  Status   Auth
+    dbhub  npx      -y @bytebase/dbhub@latest --transport stdio  DSN=*****  -    enabled  Unsupported
     ```
+
+    Inside a Codex session, run `/mcp` to see the tools DBHub exposes (`execute_sql` and `search_objects` by default).
   </Tab>
 </Tabs>
 
 **References:**
-- [Codex MCP Documentation](https://developers.openai.com/codex/mcp/)
+- [Codex MCP Documentation](https://learn.chatgpt.com/docs/extend/mcp)
 
 ### Dify
 

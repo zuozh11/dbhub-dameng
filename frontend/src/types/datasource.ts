@@ -1,4 +1,4 @@
-export type DatabaseType = 'postgres' | 'mysql' | 'mariadb' | 'sqlserver' | 'sqlite' | 'oracle' | 'dameng';
+export type DatabaseType = 'dameng' | 'postgres' | 'mysql' | 'mariadb' | 'sqlserver' | 'sqlite' | 'oracle' | 'clickhouse';
 
 export interface SSHTunnel {
   enabled: boolean;
@@ -30,7 +30,6 @@ export interface DataSource {
   port?: number;
   database?: string;
   user?: string;
-  is_default: boolean;
   ssh_tunnel?: SSHTunnel;
   tools: Tool[];
 }
